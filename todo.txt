@@ -1,0 +1,120 @@
+AIM Empire Sprint — askaimbot (@askaimbot)
+============================================================
+Order: each phase builds on the one before. Do not skip ahead unless
+the previous phase is working in Telegram.
+
+HOW TO KEEP THIS FILE ACCESSIBLE
+- It lives in this repo: C:\Users\Admin\Desktop\AIMBOT\todo.txt
+- In Cursor chat, type @todo.txt so the AI always sees the latest list
+- Push to GitHub (private repo) so it is backed up on any PC / phone
+- Optional: add a Cursor User Rule: "Before coding AIM, read todo.txt"
+============================================================
+
+FOUNDATION (already working — do not rebuild)
+[x] Telegram bot live (polling, slow-network timeouts)
+[x] Gemini 2.5 Flash-Lite wired to text messages
+[x] Empire tone in system prompt (Citizen, Naija context)
+[x] Group flow: @mention → reply in DM
+[x] Basic commands: /start, /app
+[x] Quota / error messages for Gemini 429 and timeouts
+
+============================================================
+PHASE 1 — Brain & prompts (do first)
+Depends on: Foundation
+Unlocks: Commands, memory, voice, fact-check quality
+============================================================
+[x] 1.1 Naija System Prompt v2 — tighten Empire voice, Citizen rules, when to use Pidgin
+[ ] 1.2 Fact-Check Protocol — Truth Score format in prompt + /truth and /verify behavior
+[ ] 1.3 (Optional but recommended) Real fact-check — Google Search grounding or fetch news URLs
+      so Truth Score is not guesswork (may need paid Gemini tier)
+
+============================================================
+PHASE 2 — Commands & conversation memory (do second)
+Depends on: Phase 1
+Unlocks: Voice, inline, translation, launch messaging
+============================================================
+[ ] 2.1 Slash commands: /truth, /verify, /summarize, /translate (each calls same brain, different mode)
+[ ] 2.2 Per-user chat history — store last N messages per Telegram user_id (SQLite or JSON file)
+[ ] 2.3 Send history with each Gemini call so AIM remembers context in DM
+[ ] 2.4 Command clean-up — help text, /help listing all commands
+
+============================================================
+PHASE 3 — Voice mode (send voice → get voice back)
+Depends on: Phase 2 (needs stable message pipeline + Gemini client)
+Unlocks: Hands-free Citizens, richer group/DM experience
+============================================================
+[ ] 3.1 Handle Telegram voice messages (and audio files) — download .ogg from Telegram API
+[ ] 3.2 Speech-to-text — transcribe with Gemini native audio OR Whisper API
+[ ] 3.3 Run transcribed text through AIM (same system prompt + user memory as text chat)
+[ ] 3.4 Text-to-speech — convert reply to audio (Gemini TTS, Edge TTS, or OpenAI TTS)
+[ ] 3.5 Send voice reply — bot.send_voice() back to user in DM (groups: same DM pattern as text)
+[ ] 3.6 Voice UX — "recording..." placeholder, max length limit, friendly error if mic unclear
+
+============================================================
+PHASE 4 — Documents & media in
+Depends on: Phase 2
+Unlocks: PDF summaries, richer inputs before image gen
+============================================================
+[ ] 4.1 Accept PDF/documents in DM — Telegram document handler
+[ ] 4.2 Extract text — PyMuPDF or Gemini multimodal upload
+[ ] 4.3 Commands or auto-flow: summarize PDF, Q&A on uploaded file
+
+============================================================
+PHASE 5 — Image generation
+Depends on: Phase 2 (file upload patterns from Phase 4 help)
+Unlocks: "draw this" requests, memes, visual Citizen content
+============================================================
+[ ] 5.1 Pick image API — Gemini image model (Imagen) or fallback provider
+[ ] 5.2 Prompt + safety rules for AIM-branded images
+[ ] 5.3 Send generated image via send_photo in Telegram
+[ ] 5.4 Rate limits — cap images per user per day (free tier burns fast)
+
+============================================================
+PHASE 6 — Inline mode (@askaimbot in any chat)
+Depends on: Phase 2 (memory + commands stable in DM first)
+Unlocks: Growth, sharing, "power user" feel
+============================================================
+[ ] 6.1 Enable Inline Mode in @BotFather for @askaimbot
+[ ] 6.2 InlineQueryHandler — short answers in inline results
+[ ] 6.3 Wire inline queries to same Gemini + prompt (shorter max tokens for speed)
+
+============================================================
+PHASE 7 — Translation & groups
+Depends on: Phase 2 commands, Phase 6 optional
+============================================================
+[ ] 7.1 /translate command — detect language, reply in target language
+[ ] 7.2 Group translation middleware — when @askaimbot tagged, offer translate in reply/DM
+[ ] 7.3 Keep existing group rule: only respond when mentioned
+
+============================================================
+PHASE 8 — Web analysis & safety
+Depends on: Phase 1.2 fact-check mindset
+Unlocks: Group Guard, trust
+============================================================
+[ ] 8.1 Web-Link Analyzer — user sends URL, scrape/read page, bias + missing-facts summary
+[ ] 8.2 Group Guard — flag scam/phishing links and dangerous misinformation patterns
+[ ] 8.3 Admin/config list for banned domains or keywords (optional)
+
+============================================================
+PHASE 9 — Empire ID & full memory sync
+Depends on: Phase 2 memory, Phase 6 inline, web app exists
+============================================================
+[ ] 9.1 Logto / Empire ID — Telegram Login Widget or deep link to verify Citizens
+[ ] 9.2 Store verified status per user_id — prompt calls them "Verified Citizen"
+[ ] 9.3 Personal memory sync — same user profile + history in DM, inline, and (later) web app
+      Goal: bot remembers what matters about each Citizen across all surfaces
+
+============================================================
+PHASE 10 — Deploy, test, launch
+Depends on: Phases 1–8 stable enough for real users
+============================================================
+[ ] 10.1 Run bot 24/7 — see DEPLOY-SUPABASE.md (Edge Function + webhook; stop local python when live)
+[ ] 10.2 Load test — 50+ messages; confirm ~30 RPM Gemini limit + queue/retry behavior
+[ ] 10.3 Update /app link to real website
+[ ] 10.4 Public debut — "Founding Citizen" phase announcement
+
+============================================================
+NOTES
+- Free tier: ~30 RPM, ~1k–1.5k requests/day on gemini-2.5-flash-lite
+- Voice + images use more quota; add per-user daily caps before launch
+- Check off [x] as each item is tested in Telegram, not only "coded"

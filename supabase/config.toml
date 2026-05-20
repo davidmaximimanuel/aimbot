@@ -1,0 +1,4 @@
+# Supabase local/dev config — see DEPLOY-SUPABASE.md for deploy steps
+
+[functions.askaimbot]
+verify_jwt = false
