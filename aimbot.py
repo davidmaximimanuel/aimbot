@@ -1,9 +1,13 @@
-import logging
+
+# Create aimbot.py v2.4 — Fix the asyncio event loop crash
+
+aimbot_v24_code = '''import logging
 import os
 import asyncio
 import json
 import secrets
 import re
+import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from telegram import Update, Bot
@@ -46,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── SYSTEM PROMPT (Updated: African Intelligence Model) ───
+# ─── SYSTEM PROMPT (African Intelligence Model) ───
 SYSTEM_PROMPT = """
 You are AIM (African Intelligence Model) — the first true AI built for Africa.
 Created by Empire AI and David Emmanuel. You live on Telegram as @askaimbot.
@@ -147,6 +151,13 @@ def is_memory_search_query(text: str) -> bool:
     text_lower = text.lower()
     return any(re.search(pattern, text_lower) for pattern in MEMORY_SEARCH_PATTERNS)
 
+# ─── EVENT LOOP FIX ───
+# Create a persistent event loop for the thread
+_loop = asyncio.new_event_loop()
+
+def get_loop():
+    return _loop
+
 # ─── HELPER FUNCTIONS ───
 
 def chunk_telegram_text(text: str, max_len: int = TELEGRAM_MAX_CHARS) -> list[str]:
@@ -169,13 +180,13 @@ async def extract_topic(user_message: str, aim_response: str) -> str:
     """Use Gemini to extract topic from conversation."""
     if not client:
         return "general"
-
+    
     try:
         prompt = TOPIC_EXTRACTION_PROMPT.format(
             user_message=user_message[:500],
             aim_response=aim_response[:500]
         )
-
+        
         response = client.models.generate_content(
             model="gemini-2.5-flash-lite",
             contents=prompt,
@@ -184,11 +195,11 @@ async def extract_topic(user_message: str, aim_response: str) -> str:
                 max_output_tokens=20
             ),
         )
-
+        
         topic = response.text.strip().lower() if response.text else "general"
         valid_topics = {"career", "finance", "tech", "sports", "health", 
                        "relationships", "politics", "entertainment", "education", "general"}
-
+        
         return topic if topic in valid_topics else "general"
     except Exception as e:
         logger.error("Topic extraction failed: %s", e)
@@ -201,7 +212,7 @@ def save_chat_sync(user_id: str, username: str | None, message: str,
     if not supabase:
         logger.error("❌ Supabase not connected — cannot save memory")
         return False
-
+    
     try:
         data = {
             "user_id": user_id,
@@ -212,11 +223,11 @@ def save_chat_sync(user_id: str, username: str | None, message: str,
             "topic": topic,
             "created_at": datetime.utcnow().isoformat()
         }
-
+        
         result = supabase.table("chat_memory").insert(data).execute()
         logger.info("✅ Saved chat memory for user %s — topic: %s", user_id, topic)
         return True
-
+        
     except Exception as e:
         logger.error("❌ Failed to save chat memory: %s", e)
         return False
@@ -226,25 +237,32 @@ def update_profile_sync(user_id: str, username: str | None, topic: str) -> bool:
     """Synchronous profile update."""
     if not supabase:
         return False
-
+    
     try:
-        result = supabase.table("user_profiles")            .select("*")            .eq("user_id", user_id)            .execute()
-
+        result = supabase.table("user_profiles")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .execute()
+        
         if result.data:
             profile = result.data[0]
             topic_counts = profile.get("topic_counts", {}) or {}
             if isinstance(topic_counts, str):
                 topic_counts = json.loads(topic_counts)
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
-
-            supabase.table("user_profiles")                .update({
+            
+            supabase.table("user_profiles")\
+                .update({
                     "topic_counts": topic_counts,
                     "last_active": datetime.utcnow().isoformat(),
                     "total_chats": profile.get("total_chats", 0) + 1
-                })                .eq("user_id", user_id)                .execute()
+                })\
+                .eq("user_id", user_id)\
+                .execute()
             logger.info("✅ Updated profile for user %s", user_id)
         else:
-            supabase.table("user_profiles")                .insert({
+            supabase.table("user_profiles")\
+                .insert({
                     "user_id": user_id,
                     "username": username or "anonymous",
                     "topic_counts": {topic: 1},
@@ -253,10 +271,11 @@ def update_profile_sync(user_id: str, username: str | None, topic: str) -> bool:
                     "news_categories": ["general", "technology", "sports"],
                     "created_at": datetime.utcnow().isoformat(),
                     "last_active": datetime.utcnow().isoformat()
-                })                .execute()
+                })\
+                .execute()
             logger.info("✅ Created new profile for user %s", user_id)
         return True
-
+        
     except Exception as e:
         logger.error("❌ Failed to update profile: %s", e)
         return False
@@ -266,14 +285,14 @@ async def save_chat_to_memory(user_id: int, username: str | None,
                                message: str, response: str, chat_type: str) -> None:
     """Save chat with AI-extracted topic."""
     topic = await extract_topic(message, response)
-
+    
     loop = asyncio.get_event_loop()
     user_id_str = str(user_id)
-
+    
     memory_saved = await loop.run_in_executor(
         None, save_chat_sync, user_id_str, username, message, response, chat_type, topic
     )
-
+    
     if memory_saved:
         await loop.run_in_executor(
             None, update_profile_sync, user_id_str, username, topic
@@ -285,17 +304,21 @@ async def get_user_memory(user_id: int, limit: int = 10, topic: str | None = Non
     """Retrieve chat history with optional filters."""
     if not supabase:
         return []
-
+    
     try:
-        query = supabase.table("chat_memory")            .select("*")            .eq("user_id", str(user_id))            .order("created_at", desc=True)            .limit(limit)
-
+        query = supabase.table("chat_memory")\
+            .select("*")\
+            .eq("user_id", str(user_id))\
+            .order("created_at", desc=True)\
+            .limit(limit)
+        
         if topic:
             query = query.eq("topic", topic)
-
+        
         if days:
             cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
             query = query.gte("created_at", cutoff)
-
+        
         result = query.execute()
         return result.data or []
     except Exception as e:
@@ -307,9 +330,12 @@ async def get_user_profile(user_id: int) -> dict | None:
     """Get user profile."""
     if not supabase:
         return None
-
+    
     try:
-        result = supabase.table("user_profiles")            .select("*")            .eq("user_id", str(user_id))            .execute()
+        result = supabase.table("user_profiles")\
+            .select("*")\
+            .eq("user_id", str(user_id))\
+            .execute()
         return result.data[0] if result.data else None
     except Exception as e:
         logger.error("Failed to fetch user profile: %s", e)
@@ -320,50 +346,50 @@ async def build_memory_summary(user_id: int, query: str = "") -> str:
     """Build a natural summary of user's chat history."""
     memory = await get_user_memory(user_id, limit=15)
     profile = await get_user_profile(user_id)
-
+    
     if not memory and not profile:
         return "We haven't chatted much yet, Citizen! Start asking me things and I'll remember. 🧠"
-
+    
     summary_parts = []
-
+    
     # Add topic overview
     if profile and profile.get("topic_counts"):
         topic_counts = profile["topic_counts"]
         if isinstance(topic_counts, str):
             topic_counts = json.loads(topic_counts)
-
+        
         top_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:5]
         topic_list = ", ".join([f"{t[0]} ({t[1]}x)" for t in top_topics])
         summary_parts.append(f"📊 **Your Top Topics:** {topic_list}")
         summary_parts.append(f"💬 **Total Chats:** {profile.get('total_chats', 0)}")
-
+    
     # Add recent conversations
     if memory:
-        summary_parts.append("\n📝 **Recent Conversations:**")
+        summary_parts.append("\\n📝 **Recent Conversations:**")
         for i, m in enumerate(memory[:5], 1):
-            date_str = m.get("created_at", "")[:10]  # Just the date
+            date_str = m.get("created_at", "")[:10]
             topic_emoji = {
                 "career": "💼", "finance": "💰", "tech": "💻",
                 "sports": "⚽", "health": "🏥", "relationships": "❤️",
                 "politics": "🏛️", "entertainment": "🎬", "education": "📚",
                 "general": "💬"
             }.get(m.get("topic", "general"), "💬")
-
+            
             msg_preview = m["message"][:60] + "..." if len(m["message"]) > 60 else m["message"]
             summary_parts.append(f"{i}. {topic_emoji} [{date_str}] {msg_preview}")
-
-    summary_parts.append("\n🇳🇬 Want me to dive deeper into any of these topics? Just ask!")
-
-    return "\n".join(summary_parts)
+    
+    summary_parts.append("\\n🇳🇬 Want me to dive deeper into any of these topics? Just ask!")
+    
+    return "\\n".join(summary_parts)
 
 
 async def get_memory_context(user_id: int, user_message: str) -> str:
     """Build memory context for Gemini prompt."""
     memory = await get_user_memory(user_id, limit=3)
     profile = await get_user_profile(user_id)
-
+    
     context_parts = []
-
+    
     if profile and profile.get("topic_counts"):
         topic_counts = profile["topic_counts"]
         if isinstance(topic_counts, str):
@@ -371,15 +397,15 @@ async def get_memory_context(user_id: int, user_message: str) -> str:
         top_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3]
         interests = ", ".join([t[0] for t in top_topics])
         context_parts.append(f"[User typically discusses: {interests}]")
-
+    
     if memory:
         context_parts.append("[Recent conversations:]")
         for m in memory:
             context_parts.append(f"Q: {m['message'][:100]}...")
             context_parts.append(f"A: {m['response'][:100]}...")
         context_parts.append("[End recent conversations]")
-
-    return "\n".join(context_parts) if context_parts else ""
+    
+    return "\\n".join(context_parts) if context_parts else ""
 
 
 # ─── MESSAGE HANDLER ───
@@ -417,11 +443,11 @@ async def handle_message(update: Update):
 
     # Get memory context for normal chat
     memory_context = await get_memory_context(user.id, user_text)
-
+    
     # Build prompt with memory
     full_prompt = user_text
     if memory_context:
-        full_prompt = f"{memory_context}\n\n--- Current Message ---\n{user_text}"
+        full_prompt = f"{memory_context}\\n\\n--- Current Message ---\\n{user_text}"
 
     try:
         response = client.models.generate_content(
@@ -477,7 +503,7 @@ def health_check():
     return jsonify({
         "status": "AIM Bot is live! 🚀",
         "empire": "rising",
-        "version": "v2.3 - African Intelligence Model + Memory Search",
+        "version": "v2.4 - African Intelligence Model + Event Loop Fix",
         "features": [
             "topic_extraction",
             "user_profiles",
@@ -491,10 +517,16 @@ def health_check():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Receive updates from Telegram."""
-    update = Update.de_json(request.get_json(force=True), bot)
-    asyncio.run(handle_message(update))
-    return "OK", 200
+    """Receive updates from Telegram — FIXED event loop handling."""
+    try:
+        update = Update.de_json(request.get_json(force=True), bot)
+        # Use the persistent loop instead of asyncio.run()
+        future = asyncio.run_coroutine_threadsafe(handle_message(update), _loop)
+        future.result(timeout=30)  # Wait for completion
+        return "OK", 200
+    except Exception as e:
+        logger.error("Webhook error: %s", e)
+        return "Error", 500
 
 
 @app.route("/set-webhook", methods=["GET"])
@@ -502,19 +534,31 @@ def set_webhook():
     """Set Telegram webhook."""
     if not WEBHOOK_URL:
         return jsonify({"error": "WEBHOOK_URL not set"}), 400
-
-    success = asyncio.run(bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"))
-    if success:
-        return jsonify({"status": "Webhook set!", "url": WEBHOOK_URL})
-    return jsonify({"error": "Failed"}), 500
+    
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"), _loop
+        )
+        success = future.result(timeout=30)
+        if success:
+            return jsonify({"status": "Webhook set!", "url": WEBHOOK_URL})
+        return jsonify({"error": "Failed"}), 500
+    except Exception as e:
+        logger.error("Set webhook error: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/delete-webhook", methods=["GET"])
 def delete_webhook():
-    success = asyncio.run(bot.delete_webhook())
-    if success:
-        return jsonify({"status": "Webhook deleted!"})
-    return jsonify({"error": "Failed"}), 500
+    try:
+        future = asyncio.run_coroutine_threadsafe(bot.delete_webhook(), _loop)
+        success = future.result(timeout=30)
+        if success:
+            return jsonify({"status": "Webhook deleted!"})
+        return jsonify({"error": "Failed"}), 500
+    except Exception as e:
+        logger.error("Delete webhook error: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/memory/<user_id>", methods=["GET"])
@@ -522,9 +566,14 @@ def get_memory_api(user_id):
     """View user memory."""
     if not supabase:
         return jsonify({"error": "Supabase not connected"}), 500
-
+    
     try:
-        result = supabase.table("chat_memory")            .select("*")            .eq("user_id", user_id)            .order("created_at", desc=True)            .limit(20)            .execute()
+        result = supabase.table("chat_memory")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .order("created_at", desc=True)\
+            .limit(20)\
+            .execute()
         return jsonify({"user_id": user_id, "count": len(result.data or []), "memory": result.data or []})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -535,9 +584,12 @@ def get_profile_api(user_id):
     """View user profile."""
     if not supabase:
         return jsonify({"error": "Supabase not connected"}), 500
-
+    
     try:
-        result = supabase.table("user_profiles")            .select("*")            .eq("user_id", user_id)            .execute()
+        result = supabase.table("user_profiles")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .execute()
         return jsonify({"user_id": user_id, "profile": result.data[0] if result.data else None})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -554,11 +606,11 @@ def debug_supabase():
                 "SUPABASE_KEY_set": bool(SUPABASE_KEY)
             }
         }), 500
-
+    
     try:
         chat_result = supabase.table("chat_memory").select("count", count="exact").execute()
         profile_result = supabase.table("user_profiles").select("count", count="exact").execute()
-
+        
         return jsonify({
             "status": "connected",
             "chat_memory_rows": getattr(chat_result, 'count', 'unknown'),
@@ -576,9 +628,9 @@ def generate_logto_link(telegram_user_id):
     """Generate Logto sign-in link for Telegram user."""
     if not all([LOGTO_ENDPOINT, LOGTO_CLIENT_ID, WEBHOOK_URL]):
         return jsonify({"error": "Logto not fully configured"}), 500
-
+    
     state = secrets.token_urlsafe(32)
-
+    
     if supabase:
         try:
             supabase.table("auth_states").insert({
@@ -589,7 +641,7 @@ def generate_logto_link(telegram_user_id):
             }).execute()
         except Exception as e:
             logger.error("Failed to store auth state: %s", e)
-
+    
     redirect_uri = f"{WEBHOOK_URL}/auth/callback"
     auth_url = (
         f"{LOGTO_ENDPOINT}/oidc/auth"
@@ -599,7 +651,7 @@ def generate_logto_link(telegram_user_id):
         f"&state={state}"
         f"&scope=openid profile email"
     )
-
+    
     return jsonify({
         "auth_url": auth_url,
         "state": state,
@@ -612,34 +664,44 @@ def logto_callback():
     """Handle Logto OAuth callback."""
     code = request.args.get("code")
     state = request.args.get("state")
-
+    
     if not code or not state:
         return jsonify({"error": "Missing code or state"}), 400
-
+    
     if not supabase:
         return jsonify({"error": "Supabase not connected"}), 500
-
+    
     try:
-        result = supabase.table("auth_states")            .select("*")            .eq("state", state)            .eq("used", False)            .execute()
-
+        result = supabase.table("auth_states")\
+            .select("*")\
+            .eq("state", state)\
+            .eq("used", False)\
+            .execute()
+        
         if not result.data:
             return jsonify({"error": "Invalid or expired state"}), 400
-
+        
         telegram_user_id = result.data[0]["telegram_user_id"]
-
-        supabase.table("auth_states")            .update({"used": True})            .eq("state", state)            .execute()
-
-        supabase.table("user_profiles")            .update({
+        
+        supabase.table("auth_states")\
+            .update({"used": True})\
+            .eq("state", state)\
+            .execute()
+        
+        supabase.table("user_profiles")\
+            .update({
                 "logto_linked": True,
                 "logto_linked_at": datetime.utcnow().isoformat()
-            })            .eq("user_id", telegram_user_id)            .execute()
-
+            })\
+            .eq("user_id", telegram_user_id)\
+            .execute()
+        
         return jsonify({
             "status": "success",
             "message": f"Telegram user {telegram_user_id} linked to Logto! 🎉",
             "next_step": "Return to Telegram and send /verify to confirm"
         })
-
+        
     except Exception as e:
         logger.error("Auth callback error: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -648,5 +710,19 @@ def logto_callback():
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
         raise SystemExit("Set TELEGRAM_TOKEN and GEMINI_API_KEY environment variables.")
-
+    
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+'''
+
+with open("/mnt/agents/output/aimbot.py", "w", encoding="utf-8") as f:
+    f.write(aimbot_v24_code)
+
+print("✅ aimbot.py v2.4 created!")
+print("\n🔧 KEY FIX:")
+print("- Replaced asyncio.run() with asyncio.run_coroutine_threadsafe()")
+print("- Uses persistent event loop (_loop) instead of creating/closing each request")
+print("- This prevents 'Event loop is closed' error in Gunicorn")
+print("\n📋 CHANGES:")
+print("1. Event loop fix for Railway/Gunicorn stability")
+print("2. Name: African Intelligence Model 🇳🇬")
+print("3. Memory Search feature")
