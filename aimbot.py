@@ -3,8 +3,9 @@ import os
 import asyncio
 import json
 import secrets
+import re
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify
 from telegram import Update, Bot
 from telegram.error import Forbidden
 from telegram.request import HTTPXRequest
@@ -45,14 +46,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── SYSTEM PROMPT ───
+# ─── SYSTEM PROMPT (Updated: African Intelligence Model) ───
 SYSTEM_PROMPT = """
-You are AIM (Africa's Intelligence Machine) — the first true AI built for Africa.
+You are AIM (African Intelligence Model) — the first true AI built for Africa.
 Created by Empire AI and David Emmanuel. You live on Telegram as @askaimbot.
 
 WHO YOU ARE
 - A witty, sharp, relatable Nigerian "smart friend" — never a stiff corporate bot.
 - Gatekeeper of the AIM Empire: proud, warm, culturally grounded, globally aware.
+- You are an AFRICAN INTELLIGENCE MODEL — built by Africans, for Africans, representing African excellence in AI.
 
 CITIZENS (how to address users)
 - For now, treat every user as a "Citizen" (full verification is coming later)
@@ -106,6 +108,7 @@ BOUNDARIES
 EMPIRE PROTOCOL
 - You serve Citizens of the AIM Empire with loyalty and humor.
 - Be the smartest friend in the chat — helpful first, personality second.
+- You are the AFRICAN INTELLIGENCE MODEL — represent the continent with pride! 🇳🇬
 """
 
 # ─── TOPIC EXTRACTION PROMPT ───
@@ -123,6 +126,26 @@ User: {user_message}
 AIM: {aim_response}
 
 Topic:"""
+
+# ─── MEMORY SEARCH DETECTION ───
+MEMORY_SEARCH_PATTERNS = [
+    r"what did we talk about",
+    r"what did we discuss",
+    r"remember when",
+    r"do you remember",
+    r"what was our last",
+    r"tell me about my",
+    r"summarize our chats",
+    r"what have we discussed",
+    r"my previous questions",
+    r"topics we covered",
+    r"last week|yesterday|last time",
+]
+
+def is_memory_search_query(text: str) -> bool:
+    """Check if user is asking about past conversations."""
+    text_lower = text.lower()
+    return any(re.search(pattern, text_lower) for pattern in MEMORY_SEARCH_PATTERNS)
 
 # ─── HELPER FUNCTIONS ───
 
@@ -257,8 +280,9 @@ async def save_chat_to_memory(user_id: int, username: str | None,
         )
 
 
-async def get_user_memory(user_id: int, limit: int = 5, topic: str | None = None) -> list[dict]:
-    """Retrieve recent chat history."""
+async def get_user_memory(user_id: int, limit: int = 10, topic: str | None = None,
+                          days: int | None = None) -> list[dict]:
+    """Retrieve chat history with optional filters."""
     if not supabase:
         return []
 
@@ -267,6 +291,10 @@ async def get_user_memory(user_id: int, limit: int = 5, topic: str | None = None
 
         if topic:
             query = query.eq("topic", topic)
+
+        if days:
+            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            query = query.gte("created_at", cutoff)
 
         result = query.execute()
         return result.data or []
@@ -286,6 +314,47 @@ async def get_user_profile(user_id: int) -> dict | None:
     except Exception as e:
         logger.error("Failed to fetch user profile: %s", e)
         return None
+
+
+async def build_memory_summary(user_id: int, query: str = "") -> str:
+    """Build a natural summary of user's chat history."""
+    memory = await get_user_memory(user_id, limit=15)
+    profile = await get_user_profile(user_id)
+
+    if not memory and not profile:
+        return "We haven't chatted much yet, Citizen! Start asking me things and I'll remember. 🧠"
+
+    summary_parts = []
+
+    # Add topic overview
+    if profile and profile.get("topic_counts"):
+        topic_counts = profile["topic_counts"]
+        if isinstance(topic_counts, str):
+            topic_counts = json.loads(topic_counts)
+
+        top_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        topic_list = ", ".join([f"{t[0]} ({t[1]}x)" for t in top_topics])
+        summary_parts.append(f"📊 **Your Top Topics:** {topic_list}")
+        summary_parts.append(f"💬 **Total Chats:** {profile.get('total_chats', 0)}")
+
+    # Add recent conversations
+    if memory:
+        summary_parts.append("\n📝 **Recent Conversations:**")
+        for i, m in enumerate(memory[:5], 1):
+            date_str = m.get("created_at", "")[:10]  # Just the date
+            topic_emoji = {
+                "career": "💼", "finance": "💰", "tech": "💻",
+                "sports": "⚽", "health": "🏥", "relationships": "❤️",
+                "politics": "🏛️", "entertainment": "🎬", "education": "📚",
+                "general": "💬"
+            }.get(m.get("topic", "general"), "💬")
+
+            msg_preview = m["message"][:60] + "..." if len(m["message"]) > 60 else m["message"]
+            summary_parts.append(f"{i}. {topic_emoji} [{date_str}] {msg_preview}")
+
+    summary_parts.append("\n🇳🇬 Want me to dive deeper into any of these topics? Just ask!")
+
+    return "\n".join(summary_parts)
 
 
 async def get_memory_context(user_id: int, user_message: str) -> str:
@@ -339,7 +408,14 @@ async def handle_message(update: Update):
 
     chat_id = update.effective_chat.id
 
-    # Get memory context
+    # Check if user is asking about memory
+    if is_memory_search_query(user_text):
+        logger.info("🔍 Memory search detected for user %s", user.id)
+        memory_summary = await build_memory_summary(user.id, user_text)
+        await send_text_chunks(bot, chat_id, memory_summary)
+        return "OK"
+
+    # Get memory context for normal chat
     memory_context = await get_memory_context(user.id, user_text)
 
     # Build prompt with memory
@@ -356,7 +432,7 @@ async def handle_message(update: Update):
 
         if response.text:
             await send_text_chunks(bot, chat_id, response.text)
-            # Save to memory (properly awaited)
+            # Save to memory
             await save_chat_to_memory(
                 user.id, user.username, user_text, response.text, chat_type
             )
@@ -401,8 +477,14 @@ def health_check():
     return jsonify({
         "status": "AIM Bot is live! 🚀",
         "empire": "rising",
-        "version": "v2.2 - Smart Memory + Logto Ready",
-        "features": ["topic_extraction", "user_profiles", "memory_context", "logto_auth_ready"],
+        "version": "v2.3 - African Intelligence Model + Memory Search",
+        "features": [
+            "topic_extraction",
+            "user_profiles",
+            "memory_context",
+            "memory_search",
+            "logto_auth_ready"
+        ],
         "supabase_connected": supabase is not None
     })
 
@@ -497,7 +579,6 @@ def generate_logto_link(telegram_user_id):
 
     state = secrets.token_urlsafe(32)
 
-    # Store state mapping
     if supabase:
         try:
             supabase.table("auth_states").insert({
@@ -509,7 +590,6 @@ def generate_logto_link(telegram_user_id):
         except Exception as e:
             logger.error("Failed to store auth state: %s", e)
 
-    # Build Logto authorization URL
     redirect_uri = f"{WEBHOOK_URL}/auth/callback"
     auth_url = (
         f"{LOGTO_ENDPOINT}/oidc/auth"
@@ -540,7 +620,6 @@ def logto_callback():
         return jsonify({"error": "Supabase not connected"}), 500
 
     try:
-        # Verify state
         result = supabase.table("auth_states")            .select("*")            .eq("state", state)            .eq("used", False)            .execute()
 
         if not result.data:
@@ -548,11 +627,8 @@ def logto_callback():
 
         telegram_user_id = result.data[0]["telegram_user_id"]
 
-        # Mark state as used
         supabase.table("auth_states")            .update({"used": True})            .eq("state", state)            .execute()
 
-        # TODO: Exchange code for tokens with Logto
-        # For now, mark user as authenticated in profile
         supabase.table("user_profiles")            .update({
                 "logto_linked": True,
                 "logto_linked_at": datetime.utcnow().isoformat()
