@@ -2,8 +2,9 @@ import logging
 import os
 import asyncio
 import json
+import secrets
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from telegram import Update, Bot
 from telegram.error import Forbidden
 from telegram.request import HTTPXRequest
@@ -17,13 +18,20 @@ GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
 WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
+LOGTO_ENDPOINT = (os.getenv("LOGTO_ENDPOINT") or "").strip()
+LOGTO_CLIENT_ID = (os.getenv("LOGTO_CLIENT_ID") or "").strip()
+LOGTO_CLIENT_SECRET = (os.getenv("LOGTO_CLIENT_SECRET") or "").strip()
 
 TELEGRAM_MAX_CHARS = 4096
 
 # ─── SUPABASE CLIENT ───
 supabase: Client | None = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Supabase connected")
+    except Exception as e:
+        print(f"❌ Supabase connection failed: {e}")
 
 # ─── GEMINI CLIENT ───
 client: genai.Client | None = None
@@ -149,7 +157,7 @@ async def extract_topic(user_message: str, aim_response: str) -> str:
             model="gemini-2.5-flash-lite",
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.1,  # Low temperature for consistent classification
+                temperature=0.1,
                 max_output_tokens=20
             ),
         )
@@ -164,61 +172,57 @@ async def extract_topic(user_message: str, aim_response: str) -> str:
         return "general"
 
 
-async def save_chat_to_memory(user_id: int, username: str | None, 
-                               message: str, response: str, chat_type: str) -> None:
-    """Save chat with AI-extracted topic to Supabase."""
+def save_chat_sync(user_id: str, username: str | None, message: str, 
+                   response: str, chat_type: str, topic: str) -> bool:
+    """Synchronous memory save — reliable in Gunicorn."""
     if not supabase:
-        logger.warning("Supabase not connected — skipping memory save")
-        return
+        logger.error("❌ Supabase not connected — cannot save memory")
+        return False
 
     try:
-        # Extract topic using AI
-        topic = await extract_topic(message, response)
-
         data = {
-            "user_id": str(user_id),
+            "user_id": user_id,
             "username": username or "anonymous",
-            "message": message[:2000],  # Limit size
+            "message": message[:2000],
             "response": response[:2000],
             "chat_type": chat_type,
             "topic": topic,
             "created_at": datetime.utcnow().isoformat()
         }
 
-        supabase.table("chat_memory").insert(data).execute()
-        logger.info("Saved chat memory for user %s — topic: %s", user_id, topic)
-
-        # Update user profile with topic frequency
-        await update_user_topic_profile(user_id, username, topic)
+        result = supabase.table("chat_memory").insert(data).execute()
+        logger.info("✅ Saved chat memory for user %s — topic: %s", user_id, topic)
+        return True
 
     except Exception as e:
-        logger.error("Failed to save chat memory: %s", e)
+        logger.error("❌ Failed to save chat memory: %s", e)
+        return False
 
 
-async def update_user_topic_profile(user_id: int, username: str | None, topic: str) -> None:
-    """Track what topics each user talks about most."""
+def update_profile_sync(user_id: str, username: str | None, topic: str) -> bool:
+    """Synchronous profile update."""
     if not supabase:
-        return
+        return False
 
     try:
-        # Check if user profile exists
-        result = supabase.table("user_profiles")            .select("*")            .eq("user_id", str(user_id))            .execute()
+        result = supabase.table("user_profiles")            .select("*")            .eq("user_id", user_id)            .execute()
 
         if result.data:
-            # Update existing profile
             profile = result.data[0]
             topic_counts = profile.get("topic_counts", {}) or {}
+            if isinstance(topic_counts, str):
+                topic_counts = json.loads(topic_counts)
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
 
             supabase.table("user_profiles")                .update({
                     "topic_counts": topic_counts,
                     "last_active": datetime.utcnow().isoformat(),
                     "total_chats": profile.get("total_chats", 0) + 1
-                })                .eq("user_id", str(user_id))                .execute()
+                })                .eq("user_id", user_id)                .execute()
+            logger.info("✅ Updated profile for user %s", user_id)
         else:
-            # Create new profile
             supabase.table("user_profiles")                .insert({
-                    "user_id": str(user_id),
+                    "user_id": user_id,
                     "username": username or "anonymous",
                     "topic_counts": {topic: 1},
                     "total_chats": 1,
@@ -227,13 +231,34 @@ async def update_user_topic_profile(user_id: int, username: str | None, topic: s
                     "created_at": datetime.utcnow().isoformat(),
                     "last_active": datetime.utcnow().isoformat()
                 })                .execute()
+            logger.info("✅ Created new profile for user %s", user_id)
+        return True
 
     except Exception as e:
-        logger.error("Failed to update user profile: %s", e)
+        logger.error("❌ Failed to update profile: %s", e)
+        return False
+
+
+async def save_chat_to_memory(user_id: int, username: str | None, 
+                               message: str, response: str, chat_type: str) -> None:
+    """Save chat with AI-extracted topic."""
+    topic = await extract_topic(message, response)
+
+    loop = asyncio.get_event_loop()
+    user_id_str = str(user_id)
+
+    memory_saved = await loop.run_in_executor(
+        None, save_chat_sync, user_id_str, username, message, response, chat_type, topic
+    )
+
+    if memory_saved:
+        await loop.run_in_executor(
+            None, update_profile_sync, user_id_str, username, topic
+        )
 
 
 async def get_user_memory(user_id: int, limit: int = 5, topic: str | None = None) -> list[dict]:
-    """Retrieve recent chat history, optionally filtered by topic."""
+    """Retrieve recent chat history."""
     if not supabase:
         return []
 
@@ -251,7 +276,7 @@ async def get_user_memory(user_id: int, limit: int = 5, topic: str | None = None
 
 
 async def get_user_profile(user_id: int) -> dict | None:
-    """Get user profile with topic preferences."""
+    """Get user profile."""
     if not supabase:
         return None
 
@@ -264,23 +289,20 @@ async def get_user_profile(user_id: int) -> dict | None:
 
 
 async def get_memory_context(user_id: int, user_message: str) -> str:
-    """Build memory context string for Gemini prompt."""
+    """Build memory context for Gemini prompt."""
     memory = await get_user_memory(user_id, limit=3)
     profile = await get_user_profile(user_id)
 
     context_parts = []
 
-    # Add user interests from profile
     if profile and profile.get("topic_counts"):
-        top_topics = sorted(
-            profile["topic_counts"].items(), 
-            key=lambda x: x[1], 
-            reverse=True
-        )[:3]
+        topic_counts = profile["topic_counts"]
+        if isinstance(topic_counts, str):
+            topic_counts = json.loads(topic_counts)
+        top_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3]
         interests = ", ".join([t[0] for t in top_topics])
         context_parts.append(f"[User typically discusses: {interests}]")
 
-    # Add recent memory
     if memory:
         context_parts.append("[Recent conversations:]")
         for m in memory:
@@ -300,7 +322,7 @@ async def handle_message(update: Update):
     bot_user = (await bot.get_me()).username or ""
 
     logger.info(
-        "Incoming message chat_id=%s user=%s type=%s preview=%r",
+        "📩 Incoming message chat_id=%s user=%s type=%s preview=%r",
         update.effective_chat.id,
         user.id,
         chat_type,
@@ -334,10 +356,10 @@ async def handle_message(update: Update):
 
         if response.text:
             await send_text_chunks(bot, chat_id, response.text)
-            # Save to memory with topic extraction (fire and forget)
-            asyncio.create_task(save_chat_to_memory(
+            # Save to memory (properly awaited)
+            await save_chat_to_memory(
                 user.id, user.username, user_text, response.text, chat_type
-            ))
+            )
         else:
             await bot.send_message(
                 chat_id=chat_id, 
@@ -379,8 +401,9 @@ def health_check():
     return jsonify({
         "status": "AIM Bot is live! 🚀",
         "empire": "rising",
-        "version": "v2.1 - Smart Memory",
-        "features": ["topic_extraction", "user_profiles", "memory_context"]
+        "version": "v2.2 - Smart Memory + Logto Ready",
+        "features": ["topic_extraction", "user_profiles", "memory_context", "logto_auth_ready"],
+        "supabase_connected": supabase is not None
     })
 
 
@@ -394,41 +417,40 @@ def webhook():
 
 @app.route("/set-webhook", methods=["GET"])
 def set_webhook():
-    """Set Telegram webhook to this URL."""
+    """Set Telegram webhook."""
     if not WEBHOOK_URL:
         return jsonify({"error": "WEBHOOK_URL not set"}), 400
 
     success = asyncio.run(bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"))
     if success:
-        return jsonify({"status": "Webhook set successfully!", "url": WEBHOOK_URL})
-    return jsonify({"error": "Failed to set webhook"}), 500
+        return jsonify({"status": "Webhook set!", "url": WEBHOOK_URL})
+    return jsonify({"error": "Failed"}), 500
 
 
 @app.route("/delete-webhook", methods=["GET"])
 def delete_webhook():
-    """Remove webhook."""
     success = asyncio.run(bot.delete_webhook())
     if success:
         return jsonify({"status": "Webhook deleted!"})
-    return jsonify({"error": "Failed to delete webhook"}), 500
+    return jsonify({"error": "Failed"}), 500
 
 
 @app.route("/memory/<user_id>", methods=["GET"])
 def get_memory_api(user_id):
-    """API endpoint to view user memory (for debugging)."""
+    """View user memory."""
     if not supabase:
         return jsonify({"error": "Supabase not connected"}), 500
 
     try:
         result = supabase.table("chat_memory")            .select("*")            .eq("user_id", user_id)            .order("created_at", desc=True)            .limit(20)            .execute()
-        return jsonify({"user_id": user_id, "memory": result.data or []})
+        return jsonify({"user_id": user_id, "count": len(result.data or []), "memory": result.data or []})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/profile/<user_id>", methods=["GET"])
 def get_profile_api(user_id):
-    """API endpoint to view user profile."""
+    """View user profile."""
     if not supabase:
         return jsonify({"error": "Supabase not connected"}), 500
 
@@ -436,6 +458,114 @@ def get_profile_api(user_id):
         result = supabase.table("user_profiles")            .select("*")            .eq("user_id", user_id)            .execute()
         return jsonify({"user_id": user_id, "profile": result.data[0] if result.data else None})
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/debug/supabase", methods=["GET"])
+def debug_supabase():
+    """Check Supabase connection and table counts."""
+    if not supabase:
+        return jsonify({
+            "error": "Supabase not connected",
+            "env_check": {
+                "SUPABASE_URL_set": bool(SUPABASE_URL),
+                "SUPABASE_KEY_set": bool(SUPABASE_KEY)
+            }
+        }), 500
+
+    try:
+        chat_result = supabase.table("chat_memory").select("count", count="exact").execute()
+        profile_result = supabase.table("user_profiles").select("count", count="exact").execute()
+
+        return jsonify({
+            "status": "connected",
+            "chat_memory_rows": getattr(chat_result, 'count', 'unknown'),
+            "user_profiles_rows": getattr(profile_result, 'count', 'unknown'),
+            "tables": ["chat_memory", "user_profiles", "auth_states"]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─── LOGTO AUTH ROUTES ───
+
+@app.route("/auth/link/<telegram_user_id>", methods=["GET"])
+def generate_logto_link(telegram_user_id):
+    """Generate Logto sign-in link for Telegram user."""
+    if not all([LOGTO_ENDPOINT, LOGTO_CLIENT_ID, WEBHOOK_URL]):
+        return jsonify({"error": "Logto not fully configured"}), 500
+
+    state = secrets.token_urlsafe(32)
+
+    # Store state mapping
+    if supabase:
+        try:
+            supabase.table("auth_states").insert({
+                "state": state,
+                "telegram_user_id": telegram_user_id,
+                "created_at": datetime.utcnow().isoformat(),
+                "used": False
+            }).execute()
+        except Exception as e:
+            logger.error("Failed to store auth state: %s", e)
+
+    # Build Logto authorization URL
+    redirect_uri = f"{WEBHOOK_URL}/auth/callback"
+    auth_url = (
+        f"{LOGTO_ENDPOINT}/oidc/auth"
+        f"?response_type=code"
+        f"&client_id={LOGTO_CLIENT_ID}"
+        f"&redirect_uri={redirect_uri}"
+        f"&state={state}"
+        f"&scope=openid profile email"
+    )
+
+    return jsonify({
+        "auth_url": auth_url,
+        "state": state,
+        "instructions": "Open this URL in browser, sign in with Logto, then return to Telegram and send /verify"
+    })
+
+
+@app.route("/auth/callback", methods=["GET"])
+def logto_callback():
+    """Handle Logto OAuth callback."""
+    code = request.args.get("code")
+    state = request.args.get("state")
+
+    if not code or not state:
+        return jsonify({"error": "Missing code or state"}), 400
+
+    if not supabase:
+        return jsonify({"error": "Supabase not connected"}), 500
+
+    try:
+        # Verify state
+        result = supabase.table("auth_states")            .select("*")            .eq("state", state)            .eq("used", False)            .execute()
+
+        if not result.data:
+            return jsonify({"error": "Invalid or expired state"}), 400
+
+        telegram_user_id = result.data[0]["telegram_user_id"]
+
+        # Mark state as used
+        supabase.table("auth_states")            .update({"used": True})            .eq("state", state)            .execute()
+
+        # TODO: Exchange code for tokens with Logto
+        # For now, mark user as authenticated in profile
+        supabase.table("user_profiles")            .update({
+                "logto_linked": True,
+                "logto_linked_at": datetime.utcnow().isoformat()
+            })            .eq("user_id", telegram_user_id)            .execute()
+
+        return jsonify({
+            "status": "success",
+            "message": f"Telegram user {telegram_user_id} linked to Logto! 🎉",
+            "next_step": "Return to Telegram and send /verify to confirm"
+        })
+
+    except Exception as e:
+        logger.error("Auth callback error: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
