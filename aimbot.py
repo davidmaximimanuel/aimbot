@@ -26,6 +26,24 @@ LOGTO_CLIENT_SECRET = (os.getenv("LOGTO_CLIENT_SECRET") or "").strip()
 
 TELEGRAM_MAX_CHARS = 4096
 
+# ─── DUPLICATE PREVENTION ───
+_processed_update_ids: set[int] = set()
+_MAX_PROCESSED_IDS = 200
+
+_lock = threading.Lock()
+
+def is_duplicate_update(update_id: int) -> bool:
+    """Check if we've already processed this Telegram update."""
+    with _lock:
+        if update_id in _processed_update_ids:
+            return True
+        _processed_update_ids.add(update_id)
+        if len(_processed_update_ids) > _MAX_PROCESSED_IDS:
+            ids_to_remove = list(_processed_update_ids)[:_MAX_PROCESSED_IDS // 2]
+            for old_id in ids_to_remove:
+                _processed_update_ids.discard(old_id)
+        return False
+
 # ─── SUPABASE CLIENT ───
 supabase: Client | None = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -372,12 +390,16 @@ def get_memory_context(user_id: int, user_message: str) -> str:
 
 async def handle_message_async(update: Update):
     """Async version of message handler."""
-    user_text = update.message.text if update.message else None
-    chat_type = update.message.chat.type if update.message and update.message.chat else "private"
-    user = update.message.from_user if update.message else None
+    if not update.message:
+        logger.warning("No message in update")
+        return "OK"
 
-    if not user or not update.message:
-        logger.warning("No user or message in update")
+    user_text = update.message.text
+    chat_type = update.message.chat.type if update.message.chat else "private"
+    user = update.message.from_user
+
+    if not user:
+        logger.warning("No user in message")
         return "OK"
 
     # Get bot username (cached to avoid repeated API calls)
@@ -456,17 +478,25 @@ def health_check():
     return jsonify({
         "status": "AIM Bot is live! 🚀",
         "empire": "rising",
-        "version": "v2.5 - African Intelligence Model + Event Loop Fix",
-        "features": ["topic_extraction", "user_profiles", "memory_context", "memory_search", "logto_auth_ready"],
+        "version": "v3.0 - African Intelligence Model + Duplicate Fix",
+        "features": ["topic_extraction", "user_profiles", "memory_context", "memory_search", "duplicate_prevention", "logto_auth_ready"],
         "supabase_connected": supabase is not None
     })
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Receive updates — SYNCHRONOUS handler."""
+    """Receive updates — with duplicate protection."""
     try:
-        update = Update.de_json(request.get_json(force=True), bot)
+        data = request.get_json(force=True)
+        update_id = data.get("update_id")
+
+        # INSTANTLY reject duplicates
+        if update_id and is_duplicate_update(update_id):
+            logger.info("Ignoring duplicate update_id: %s", update_id)
+            return "OK", 200
+
+        update = Update.de_json(data, bot)
         handle_message(update)
         return "OK", 200
     except Exception as e:
@@ -569,6 +599,8 @@ def logto_callback():
         return jsonify({"error": str(e)}), 500
 
 
+# ─── PRIVACY POLICY PAGE ───
+
 @app.route("/privacy", methods=["GET"])
 def privacy_policy():
     try:
@@ -576,7 +608,6 @@ def privacy_policy():
             return f.read(), 200, {'Content-Type': 'text/html'}
     except FileNotFoundError:
         return "<h1>Privacy Policy</h1><p>Coming soon.</p>", 200, {'Content-Type': 'text/html'}
-
 
 
 if __name__ == "__main__":
