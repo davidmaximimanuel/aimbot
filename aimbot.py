@@ -23,6 +23,7 @@ WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
 LOGTO_ENDPOINT = (os.getenv("LOGTO_ENDPOINT") or "").strip()
 LOGTO_CLIENT_ID = (os.getenv("LOGTO_CLIENT_ID") or "").strip()
 LOGTO_CLIENT_SECRET = (os.getenv("LOGTO_CLIENT_SECRET") or "").strip()
+PRIVACY_TEXT = open("privacy.md").read()
 
 TELEGRAM_MAX_CHARS = 4096
 
@@ -567,6 +568,12 @@ def logto_callback():
         return jsonify({"status": "success", "message": f"Linked! 🎉"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/privacy", methods=["GET"])
+def privacy_policy():
+    return PRIVACY_TEXT, 200, {'Content-Type': 'text/plain'}
+
 
 
 if __name__ == "__main__":
