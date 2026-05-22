@@ -23,7 +23,6 @@ WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
 LOGTO_ENDPOINT = (os.getenv("LOGTO_ENDPOINT") or "").strip()
 LOGTO_CLIENT_ID = (os.getenv("LOGTO_CLIENT_ID") or "").strip()
 LOGTO_CLIENT_SECRET = (os.getenv("LOGTO_CLIENT_SECRET") or "").strip()
-PRIVACY_TEXT = open("privacy.md").read()
 
 TELEGRAM_MAX_CHARS = 4096
 
@@ -572,7 +571,11 @@ def logto_callback():
 
 @app.route("/privacy", methods=["GET"])
 def privacy_policy():
-    return PRIVACY_TEXT, 200, {'Content-Type': 'text/plain'}
+    try:
+        with open("privacy.html", "r", encoding="utf-8") as f:
+            return f.read(), 200, {'Content-Type': 'text/html'}
+    except FileNotFoundError:
+        return "<h1>Privacy Policy</h1><p>Coming soon.</p>", 200, {'Content-Type': 'text/html'}
 
 
 
