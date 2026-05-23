@@ -474,6 +474,42 @@ def process_message_background(update_data: dict, bot_instance: Bot):
         logger.exception("Background processing failed: %s", e)
 
 
+
+def process_inline_background(data: dict, bot_instance: Bot):
+    """Process inline query in background thread."""
+    try:
+        inline_query = data["inline_query"]
+        query_id = inline_query["id"]
+        query_text = inline_query.get("query", "")
+        user = inline_query.get("from", {})
+        user_id = user.get("id", 0)
+        username = user.get("username", "")
+
+        logger.info("🔍 Inline query from %s: %r", user_id, query_text[:80])
+
+        # Process the query
+        answer_text = process_inline_query(query_text, user_id, username)
+
+        # Truncate if too long
+        if len(answer_text) > 3900:
+            answer_text = answer_text[:3800] + "\n\n... (message truncated)"
+
+        # Send answer back to Telegram
+        run_async(bot_instance.answer_inline_query(
+            inline_query_id=query_id,
+            results=[
+                InlineQueryResultArticle(
+                    id="1",
+                    title="🤖 AIM says...",
+                    input_message_content=InputTextMessageContent(message_text=answer_text),
+                    description=answer_text[:100] + "..." if len(answer_text) > 100 else answer_text
+                )
+            ],
+            cache_time=0
+        ))
+    except Exception as e:
+        logger.error("Inline background processing failed: %s", e)
+
 # ─── FLASK APP ───
 app = Flask(__name__)
 
@@ -486,8 +522,8 @@ def health_check():
     return jsonify({
         "status": "AIM Bot is live! 🚀",
         "empire": "rising",
-        "version": "v3.2 - African Intelligence Model + Better Error Handling",
-        "features": ["topic_extraction", "user_profiles", "memory_context", "memory_search", "duplicate_prevention", "async_webhook", "logto_auth_ready"],
+        "version": "v3.3 - African Intelligence Model + Inline Mode",
+        "features": ["topic_extraction", "user_profiles", "memory_context", "memory_search", "duplicate_prevention", "async_webhook", "inline_mode", "logto_auth_ready"],
         "supabase_connected": supabase is not None
     })
 
@@ -621,6 +657,57 @@ def privacy_policy():
             return f.read(), 200, {'Content-Type': 'text/html'}
     except FileNotFoundError:
         return "<h1>Privacy Policy</h1><p>Coming soon.</p>", 200, {'Content-Type': 'text/html'}
+
+
+
+# ─── INLINE MODE (ANSWER INLINE QUERIES) ───
+# This lets users type @askaimbot in ANY chat and get instant answers
+
+from telegram import InlineQueryResultArticle, InputTextMessageContent
+
+def process_inline_query(query_text: str, user_id: int, username: str) -> str:
+    """Process inline query and return answer."""
+    if not query_text.strip():
+        return "👋 Type your question after @askaimbot!"
+
+    # Check if memory search
+    if is_memory_search_query(query_text):
+        return build_memory_summary(user_id, query_text)
+
+    # Normal chat with Gemini
+    memory_context = get_memory_context(user_id, query_text)
+    full_prompt = f"{memory_context}\n\n--- Current Message ---\n{query_text}" if memory_context else query_text
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=full_prompt,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        )
+
+        if response.text:
+            # Save to memory
+            try:
+                save_chat_to_memory(user_id, username, query_text, response.text, "inline")
+            except Exception:
+                pass  # Non-critical
+            return response.text
+        else:
+            return "🤔 I hear you, but need more context. Ask again?"
+
+    except Exception as e:
+        error_msg = str(e).lower()
+        error_str = str(e)
+
+        if "503" in error_str or "unavailable" in error_msg:
+            return "🔥 Too many people dey use AIM right now! Try again in 30 seconds."
+        elif "429" in error_str or "resource_exhausted" in error_msg or "quota" in error_msg:
+            return "⏳ The Empire's lines are busy! Abeg give me 1 minute make I rest."
+        elif "404" in error_str or "not_found" in error_msg:
+            return "📡 My line dey static. Try again later."
+        else:
+            return "🧠 Abeg wait small, my brain dey reset..."
+
 
 
 if __name__ == "__main__":
