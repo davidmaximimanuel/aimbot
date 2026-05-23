@@ -443,15 +443,32 @@ def process_message_background(update_data: dict, bot_instance: Bot):
 
         except Exception as e:
             error_msg = str(e).lower()
-            if "429" in error_msg or "resource_exhausted" in error_msg or "quota" in error_msg:
+            error_str = str(e)
+
+            # 503 = Server overloaded (high demand)
+            if "503" in error_str or "unavailable" in error_msg or "high demand" in error_msg:
+                logger.warning("Gemini 503 overload: %s", e)
+                send_text_chunks(bot_instance, chat_id, "🔥 Too many people dey use AIM right now! The Empire's servers are packed. Try again in 30 seconds, Citizen.")
+
+            # 429 = Rate limit / quota
+            elif "429" in error_str or "resource_exhausted" in error_msg or "quota" in error_msg:
                 logger.warning("Gemini quota hit: %s", e)
-                send_text_chunks(bot_instance, chat_id, "Citizen, the Empire's lines are busy! Abeg give me 1 minute.")
-            elif "404" in error_msg or "not_found" in error_msg:
+                send_text_chunks(bot_instance, chat_id, "⏳ The Empire's lines are busy! Abeg give me 1 minute make I rest.")
+
+            # 404 = Model not found
+            elif "404" in error_str or "not_found" in error_msg:
                 logger.warning("Gemini model error: %s", e)
-                send_text_chunks(bot_instance, chat_id, "My line dey static. Try again later.")
+                send_text_chunks(bot_instance, chat_id, "📡 My line dey static — model no gree connect. Try again later.")
+
+            # 500/502/504 = Server errors
+            elif any(code in error_str for code in ["500", "502", "504"]):
+                logger.warning("Gemini server error: %s", e)
+                send_text_chunks(bot_instance, chat_id, "🛠️ AIM's engine dey warm up. Try again in a few seconds, Citizen.")
+
+            # Unknown errors
             else:
                 logger.exception("Gemini generation failed")
-                send_text_chunks(bot_instance, chat_id, "Abeg wait small, my brain dey reset...")
+                send_text_chunks(bot_instance, chat_id, "🧠 Abeg wait small, my brain dey reset... Try again in 30 seconds.")
 
     except Exception as e:
         logger.exception("Background processing failed: %s", e)
@@ -469,7 +486,7 @@ def health_check():
     return jsonify({
         "status": "AIM Bot is live! 🚀",
         "empire": "rising",
-        "version": "v3.1 - African Intelligence Model + Async Webhook",
+        "version": "v3.2 - African Intelligence Model + Better Error Handling",
         "features": ["topic_extraction", "user_profiles", "memory_context", "memory_search", "duplicate_prevention", "async_webhook", "logto_auth_ready"],
         "supabase_connected": supabase is not None
     })
