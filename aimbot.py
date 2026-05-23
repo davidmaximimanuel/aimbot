@@ -29,7 +29,6 @@ TELEGRAM_MAX_CHARS = 4096
 # ─── DUPLICATE PREVENTION ───
 _processed_update_ids: set[int] = set()
 _MAX_PROCESSED_IDS = 200
-
 _lock = threading.Lock()
 
 def is_duplicate_update(update_id: int) -> bool:
@@ -386,84 +385,76 @@ def get_memory_context(user_id: int, user_message: str) -> str:
     return "\n".join(context_parts) if context_parts else ""
 
 
-# ─── MESSAGE HANDLER (SYNC) ───
+# ─── BACKGROUND MESSAGE PROCESSOR ───
 
-async def handle_message_async(update: Update):
-    """Async version of message handler."""
-    if not update.message:
-        logger.warning("No message in update")
-        return "OK"
-
-    user_text = update.message.text
-    chat_type = update.message.chat.type if update.message.chat else "private"
-    user = update.message.from_user
-
-    if not user:
-        logger.warning("No user in message")
-        return "OK"
-
-    # Get bot username (cached to avoid repeated API calls)
-    bot_user = "askaimbot"  # Hardcoded to avoid get_me() API call
-
-    logger.info("📩 chat_id=%s user=%s type=%s preview=%r", 
-                update.effective_chat.id, user.id, chat_type, (user_text or "")[:80])
-
-    # Group mention check
-    if chat_type in ("group", "supergroup"):
-        if bot_user and user_text:
-            mention = f"@{bot_user.lower()}"
-            if mention not in user_text.lower():
-                logger.info("Ignoring group message (no @%s).", bot_user)
-                return "OK"
-
-    chat_id = update.effective_chat.id
-
-    # Check if memory search
-    if is_memory_search_query(user_text):
-        logger.info("🔍 Memory search for user %s", user.id)
-        memory_summary = build_memory_summary(user.id, user_text or "")
-        await send_text_chunks_async(bot, chat_id, memory_summary)
-        return "OK"
-
-    # Normal chat with Gemini
-    if not user_text:
-        await bot.send_message(chat_id=chat_id, text="I can only read text messages for now, Citizen! 📝")
-        return "OK"
-
-    memory_context = get_memory_context(user.id, user_text)
-    full_prompt = f"{memory_context}\n\n--- Current Message ---\n{user_text}" if memory_context else user_text
-
+def process_message_background(update_data: dict, bot_instance: Bot):
+    """Process message in background thread — webhook returns instantly."""
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=full_prompt,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-        )
+        update = Update.de_json(update_data, bot_instance)
+        if not update.message:
+            return
 
-        if response.text:
-            await send_text_chunks_async(bot, chat_id, response.text)
-            save_chat_to_memory(user.id, user.username, user_text, response.text, chat_type)
-        else:
-            await bot.send_message(chat_id=chat_id, text="I hear you, but my mouth dry. Ask again?")
+        user_text = update.message.text
+        chat_type = update.message.chat.type if update.message.chat else "private"
+        user = update.message.from_user
+
+        if not user:
+            return
+
+        # Group mention check
+        if chat_type in ("group", "supergroup"):
+            if user_text and "@askaimbot" not in user_text.lower():
+                logger.info("Ignoring group message (no @askaimbot)")
+                return
+
+        chat_id = update.effective_chat.id
+
+        # Check if memory search
+        if is_memory_search_query(user_text):
+            logger.info("🔍 Memory search for user %s", user.id)
+            memory_summary = build_memory_summary(user.id, user_text or "")
+            send_text_chunks(bot_instance, chat_id, memory_summary)
+            return
+
+        # Normal chat with Gemini
+        if not user_text:
+            send_text_chunks(bot_instance, chat_id, "I can only read text messages for now, Citizen! 📝")
+            return
+
+        memory_context = get_memory_context(user.id, user_text)
+        full_prompt = f"{memory_context}\n\n--- Current Message ---\n{user_text}" if memory_context else user_text
+
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=full_prompt,
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+            )
+
+            if response.text:
+                send_text_chunks(bot_instance, chat_id, response.text)
+                # Save to memory AFTER successful send
+                try:
+                    save_chat_to_memory(user.id, user.username, user_text, response.text, chat_type)
+                except Exception as mem_e:
+                    logger.error("Memory save failed (non-critical): %s", mem_e)
+            else:
+                send_text_chunks(bot_instance, chat_id, "I hear you, but my mouth dry. Ask again?")
+
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "429" in error_msg or "resource_exhausted" in error_msg or "quota" in error_msg:
+                logger.warning("Gemini quota hit: %s", e)
+                send_text_chunks(bot_instance, chat_id, "Citizen, the Empire's lines are busy! Abeg give me 1 minute.")
+            elif "404" in error_msg or "not_found" in error_msg:
+                logger.warning("Gemini model error: %s", e)
+                send_text_chunks(bot_instance, chat_id, "My line dey static. Try again later.")
+            else:
+                logger.exception("Gemini generation failed")
+                send_text_chunks(bot_instance, chat_id, "Abeg wait small, my brain dey reset...")
 
     except Exception as e:
-        error_msg = str(e).lower()
-        if "429" in error_msg or "resource_exhausted" in error_msg:
-            logger.warning("Gemini quota: %s", e)
-            await bot.send_message(chat_id=chat_id, text="Citizen, the Empire's lines are busy! Abeg give me 1 minute.")
-        elif "404" in error_msg or "not_found" in error_msg:
-            logger.warning("Gemini error: %s", e)
-            await bot.send_message(chat_id=chat_id, text="My line dey static. Try again later.")
-        else:
-            logger.exception("handle_message failed")
-            await bot.send_message(chat_id=chat_id, text="Abeg wait small, my brain dey reset...")
-
-    return "OK"
-
-
-def handle_message(update: Update):
-    """Synchronous wrapper that runs async handler in event loop."""
-    return run_async(handle_message_async(update))
+        logger.exception("Background processing failed: %s", e)
 
 
 # ─── FLASK APP ───
@@ -478,15 +469,15 @@ def health_check():
     return jsonify({
         "status": "AIM Bot is live! 🚀",
         "empire": "rising",
-        "version": "v3.0 - African Intelligence Model + Duplicate Fix",
-        "features": ["topic_extraction", "user_profiles", "memory_context", "memory_search", "duplicate_prevention", "logto_auth_ready"],
+        "version": "v3.1 - African Intelligence Model + Async Webhook",
+        "features": ["topic_extraction", "user_profiles", "memory_context", "memory_search", "duplicate_prevention", "async_webhook", "logto_auth_ready"],
         "supabase_connected": supabase is not None
     })
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Receive updates — with duplicate protection."""
+    """Receive updates — return 200 OK instantly, process in background."""
     try:
         data = request.get_json(force=True)
         update_id = data.get("update_id")
@@ -496,8 +487,13 @@ def webhook():
             logger.info("Ignoring duplicate update_id: %s", update_id)
             return "OK", 200
 
-        update = Update.de_json(data, bot)
-        handle_message(update)
+        # Return 200 OK immediately — process in background thread
+        threading.Thread(
+            target=process_message_background,
+            args=(data, bot),
+            daemon=True
+        ).start()
+
         return "OK", 200
     except Exception as e:
         logger.error("Webhook error: %s", e)
