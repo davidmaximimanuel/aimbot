@@ -1,28 +1,42 @@
-import logging
+"""
+AIM Bot v3.5 — African Intelligence Model
+Inline mode + message editing + privacy logo fix
+"""
+
 import os
-import asyncio
+import sys
 import json
-import secrets
-import re
+import uuid
+import asyncio
+import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
+from typing import Optional
+
 from flask import Flask, request, jsonify
 from telegram import Update, Bot
-from telegram.error import Forbidden
-from telegram.request import HTTPXRequest
+from supabase import create_client, Client
 from google import genai
 from google.genai import types
-from supabase import create_client, Client
 
-# ─── ENVIRONMENT ───
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
-SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
-WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
-LOGTO_ENDPOINT = (os.getenv("LOGTO_ENDPOINT") or "").strip()
-LOGTO_CLIENT_ID = (os.getenv("LOGTO_CLIENT_ID") or "").strip()
-LOGTO_CLIENT_SECRET = (os.getenv("LOGTO_CLIENT_SECRET") or "").strip()
+# ─── LOGGING ───
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("aimbot")
+
+# ─── CONFIG ───
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+
+# Logto (optional)
+LOGTO_ENDPOINT = os.environ.get("LOGTO_ENDPOINT", "")
+LOGTO_CLIENT_ID = os.environ.get("LOGTO_CLIENT_ID", "")
+LOGTO_CLIENT_SECRET = os.environ.get("LOGTO_CLIENT_SECRET", "")
 
 TELEGRAM_MAX_CHARS = 4096
 
@@ -32,7 +46,6 @@ _MAX_PROCESSED_IDS = 200
 _lock = threading.Lock()
 
 def is_duplicate_update(update_id: int) -> bool:
-    """Check if we've already processed this Telegram update."""
     with _lock:
         if update_id in _processed_update_ids:
             return True
@@ -43,638 +56,611 @@ def is_duplicate_update(update_id: int) -> bool:
                 _processed_update_ids.discard(old_id)
         return False
 
-# ─── SUPABASE CLIENT ───
-supabase: Client | None = None
+# ─── INIT CLIENTS ───
+app = Flask(__name__)
+
+bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
+
+supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✅ Supabase connected")
+        logger.info("✅ Supabase connected")
     except Exception as e:
-        print(f"❌ Supabase connection failed: {e}")
+        logger.error("❌ Supabase connection failed: %s", e)
+else:
+    logger.warning("⚠️ Supabase not configured")
 
-# ─── GEMINI CLIENT ───
-client: genai.Client | None = None
-if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# ─── LOGGING ───
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ─── ASYNCIO EVENT LOOP (daemon thread) ───
+_loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
 
-# ─── SYSTEM PROMPT (African Intelligence Model) ───
-SYSTEM_PROMPT = """
-You are AIM (African Intelligence Model) — the first true AI built for Africa.
-Created by Empire AI and David Emmanuel. You live on Telegram as @askaimbot.
+def _run_loop():
+    asyncio.set_event_loop(_loop)
+    _loop.run_forever()
 
-WHO YOU ARE
-- A witty, sharp, relatable Nigerian "smart friend" — never a stiff corporate bot.
-- Gatekeeper of the AIM Empire: proud, warm, culturally grounded, globally aware.
-- You are an AFRICAN INTELLIGENCE MODEL — built by Africans, for Africans, representing African excellence in AI.
-
-CITIZENS (how to address users)
-- For now, treat every user as a "Citizen" (full verification is coming later)
-- Do NOT call anyone "Verified Citizen" unless they explicitly say they are verified.
-- First message in a chat can be slightly more welcoming; ongoing chats stay natural.
-
-LANGUAGE & PIDGIN
-- Default: clear, smooth English — confident, conversational, not academic.
-- Use Nigerian Pidgin ONLY when:
-  (a) the user writes in Pidgin, OR
-  (b) they ask for Pidgin, OR
-  (c) they say they are from a Pidgin-speaking country and want that vibe.
-- Never force Pidgin on formal, corporate, or clearly international users.
-- Understand Naija slang when users use it; explain briefly if they seem lost.
-
-TELEGRAM REPLIES
-- Short and sharp: most replies under ~12 lines unless summarizing or fact-checking.
-- Use line breaks; one idea per paragraph.
-- Emojis: sparingly (🔥 🇳🇬 🚀 😂) — about 1–3 per message, not every sentence.
-
-LOCAL CONTEXT (use when relevant, not every reply)
-- Naija life: slang, football banter, Afrobeats, japa/diaspora talk, African tech.
-- May 2026 vibes when topical: fuel (Abuja ~₦1,370/L; Dangote cuts ~₦899.50/L),
-  Victor Osimhen transfer rumors, Unity Cup / Super Eagles (e.g. Prosper Obah).
-- Prefer African angles (Punch, Vanguard, BBC Africa, The Cable) over generic Western takes.
-
-FACT-CHECK MODE — trigger when they ask to verify, fact-check, "true?", "confirm", or "cap":
-Use exactly this structure:
-
-[✅ CONFIRMED] — established facts with broad agreement
-[⚠️ UNVERIFIED] — rumors, single sources, or you lack proof
-[❌ FALSE] — debunked or clearly wrong
-
-VERDICT: [one sentence]
-THE GIST:
-• [evidence point 1 — name source type, e.g. "per Punch reporting"]
-• [evidence point 2]
-• [optional point 3]
-
-If you cannot verify with confidence, choose UNVERIFIED and say what is missing.
-Never invent quotes, URLs, or headlines.
-
-THE ROAST
-- Only for silly, empty, or clearly lazy questions — light, respectful, never cruel.
-- Never roast: religion, tribe, gender, disability, trauma, poverty, or mental health.
-
-BOUNDARIES
-- No hate, scams, crime, or violence instructions.
-- Not a lawyer or doctor — say so for legal/medical emergencies; urge real professionals.
-
-EMPIRE PROTOCOL
-- You serve Citizens of the AIM Empire with loyalty and humor.
-- Be the smartest friend in the chat — helpful first, personality second.
-- You are the AFRICAN INTELLIGENCE MODEL — represent the continent with pride! 🇳🇬
-"""
-
-# ─── TOPIC EXTRACTION PROMPT ───
-TOPIC_EXTRACTION_PROMPT = """
-Analyze this conversation and classify it into EXACTLY ONE topic from this list:
-career, finance, tech, sports, health, relationships, politics, entertainment, education, general
-
-Rules:
-- Return ONLY the topic word, nothing else.
-- If multiple topics, pick the dominant one.
-- "general" is the fallback.
-
-Conversation:
-User: {user_message}
-AIM: {aim_response}
-
-Topic:"""
-
-# ─── MEMORY SEARCH DETECTION ───
-MEMORY_SEARCH_PATTERNS = [
-    r"what did we talk about",
-    r"what did we discuss",
-    r"remember when",
-    r"do you remember",
-    r"what was our last",
-    r"tell me about my",
-    r"summarize our chats",
-    r"what have we discussed",
-    r"my previous questions",
-    r"topics we covered",
-    r"last week|yesterday|last time",
-]
-
-def is_memory_search_query(text: str) -> bool:
-    """Check if user is asking about past conversations."""
-    if not text:
-        return False
-    text_lower = text.lower()
-    return any(re.search(pattern, text_lower) for pattern in MEMORY_SEARCH_PATTERNS)
-
-# ─── THREAD-SAFE EVENT LOOP ───
-_loop = asyncio.new_event_loop()
-_loop_thread = threading.Thread(target=_loop.run_forever, daemon=True)
-_loop_thread.start()
+threading.Thread(target=_run_loop, daemon=True, name="async-loop").start()
 
 def run_async(coro):
-    """Run coroutine in the persistent event loop."""
-    future = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return future.result(timeout=60)
+    return asyncio.run_coroutine_threadsafe(coro, _loop)
 
-# ─── HELPER FUNCTIONS ───
+# ─── SYSTEM PROMPT ───
+SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a proud Nigerian AI assistant built for Africans, by Africans.
 
-def chunk_telegram_text(text: str, max_len: int = TELEGRAM_MAX_CHARS) -> list[str]:
-    if not text:
-        return []
-    parts = []
-    i = 0
-    while i < len(text):
-        parts.append(text[i:i + max_len])
-        i += max_len
-    return parts
+Personality:
+- Warm, respectful, and culturally aware
+- Use Nigerian Pidgin English naturally when appropriate
+- Reference Nigerian culture, slang, and context
+- Be helpful, patient, and empowering
+- Sign off with "The Empire is rising! 🇳🇬" occasionally
 
+Rules:
+- Keep responses concise but informative
+- If you don't know something, say so honestly
+- Never make up facts about Nigeria — use your knowledge or admit uncertainty
+- Respect all users regardless of background
+- Use emojis naturally but not excessively
 
-async def send_text_chunks_async(bot: Bot, chat_id: int, text: str) -> None:
-    for chunk in chunk_telegram_text(text):
-        await bot.send_message(chat_id=chat_id, text=chunk)
+Current date: {date}
+""".format(date=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
+# ─── GEMINI API ───
+async def get_gemini_response(user_text: str, user_id: str, chat_type: str, context: str = "") -> Optional[types.GenerateContentResponse]:
+    if not gemini_client:
+        return None
 
-def send_text_chunks(bot: Bot, chat_id: int, text: str) -> None:
-    """Synchronous wrapper for sending chunks."""
-    run_async(send_text_chunks_async(bot, chat_id, text))
-
-
-async def extract_topic_async(user_message: str, aim_response: str) -> str:
-    """Async topic extraction."""
-    if not client:
-        return "general"
     try:
-        prompt = TOPIC_EXTRACTION_PROMPT.format(
-            user_message=user_message[:500],
-            aim_response=aim_response[:500]
-        )
-        response = client.models.generate_content(
+        # Build prompt with context if available
+        prompt = user_text
+        if context:
+            prompt = f"Context from previous chats:\n{context}\n\nUser question: {user_text}"
+
+        response = gemini_client.models.generate_content(
             model="gemini-2.5-flash-lite",
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=20),
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=SYSTEM_PROMPT + "\n\n" + prompt)]
+                )
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.7,
+                max_output_tokens=1024,
+            )
         )
-        topic = response.text.strip().lower() if response.text else "general"
-        valid_topics = {"career", "finance", "tech", "sports", "health", 
-                       "relationships", "politics", "entertainment", "education", "general"}
-        return topic if topic in valid_topics else "general"
+        return response
     except Exception as e:
-        logger.error("Topic extraction failed: %s", e)
+        logger.error("Gemini error: %s", e)
+        return None
+
+# ─── TOPIC EXTRACTION ───
+async def extract_topic(user_text: str, bot_response: str) -> str:
+    if not gemini_client:
         return "general"
 
+    topics = ["career", "finance", "tech", "sports", "health", "relationships", "politics", "entertainment", "education", "general"]
+    prompt = f"Classify this conversation into ONE topic from this list: {', '.join(topics)}.\n\nUser: {user_text[:200]}\nAIM: {bot_response[:200]}\n\nReturn ONLY the topic word, nothing else."
 
-def extract_topic(user_message: str, aim_response: str) -> str:
-    """Synchronous wrapper."""
-    return run_async(extract_topic_async(user_message, aim_response))
-
-
-def save_chat_sync(user_id: str, username: str | None, message: str, 
-                   response: str, chat_type: str, topic: str) -> bool:
-    """Synchronous memory save."""
-    if not supabase:
-        logger.error("❌ Supabase not connected")
-        return False
     try:
-        data = {
-            "user_id": user_id,
-            "username": username or "anonymous",
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=20)
+        )
+        topic = response.text.strip().lower() if response and response.text else "general"
+        return topic if topic in topics else "general"
+    except Exception:
+        return "general"
+
+# ─── MEMORY FUNCTIONS ───
+async def save_chat_memory(user_id: str, username: str, message: str, response: str, chat_type: str, topic: str = "general"):
+    if not supabase:
+        return
+    try:
+        supabase.table("chat_memory").insert({
+            "user_id": str(user_id),
+            "username": username or "",
             "message": message[:2000],
             "response": response[:2000],
             "chat_type": chat_type,
-            "topic": topic,
-            "created_at": datetime.utcnow().isoformat()
-        }
-        supabase.table("chat_memory").insert(data).execute()
+            "topic": topic
+        }).execute()
         logger.info("✅ Saved memory for user %s — topic: %s", user_id, topic)
-        return True
     except Exception as e:
-        logger.error("❌ Failed to save memory: %s", e)
-        return False
+        logger.error("❌ Memory save failed: %s", e)
 
-
-def update_profile_sync(user_id: str, username: str | None, topic: str) -> bool:
-    """Synchronous profile update."""
+async def update_user_profile(user_id: str, username: str, topic: str):
     if not supabase:
-        return False
+        return
     try:
-        result = supabase.table("user_profiles").select("*").eq("user_id", user_id).execute()
-        if result.data:
-            profile = result.data[0]
-            topic_counts = profile.get("topic_counts", {}) or {}
-            if isinstance(topic_counts, str):
-                topic_counts = json.loads(topic_counts)
+        existing = supabase.table("user_profiles").select("*").eq("user_id", str(user_id)).execute()
+        if existing.data:
+            profile = existing.data[0]
+            topic_counts = profile.get("topic_counts", {})
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
             supabase.table("user_profiles").update({
                 "topic_counts": topic_counts,
-                "last_active": datetime.utcnow().isoformat(),
-                "total_chats": profile.get("total_chats", 0) + 1
-            }).eq("user_id", user_id).execute()
+                "total_chats": profile.get("total_chats", 0) + 1,
+                "last_active": datetime.now(timezone.utc).isoformat()
+            }).eq("user_id", str(user_id)).execute()
         else:
             supabase.table("user_profiles").insert({
-                "user_id": user_id,
-                "username": username or "anonymous",
+                "user_id": str(user_id),
+                "username": username or "",
                 "topic_counts": {topic: 1},
-                "total_chats": 1,
-                "preferred_language": "english",
-                "news_categories": ["general", "technology", "sports"],
-                "created_at": datetime.utcnow().isoformat(),
-                "last_active": datetime.utcnow().isoformat()
+                "total_chats": 1
             }).execute()
-        return True
     except Exception as e:
-        logger.error("❌ Failed to update profile: %s", e)
-        return False
+        logger.error("❌ Profile update failed: %s", e)
 
-
-def save_chat_to_memory(user_id: int, username: str | None, 
-                        message: str, response: str, chat_type: str) -> None:
-    """Save chat with topic extraction."""
-    topic = extract_topic(message, response)
-    user_id_str = str(user_id)
-    if save_chat_sync(user_id_str, username, message, response, chat_type, topic):
-        update_profile_sync(user_id_str, username, topic)
-
-
-def get_user_memory_sync(user_id: int, limit: int = 10, topic: str | None = None,
-                          days: int | None = None) -> list[dict]:
-    """Synchronous memory retrieval."""
+async def get_user_context(user_id: str, limit: int = 5) -> str:
     if not supabase:
-        return []
+        return ""
     try:
-        query = supabase.table("chat_memory").select("*").eq("user_id", str(user_id)).order("created_at", desc=True).limit(limit)
-        if topic:
-            query = query.eq("topic", topic)
-        if days:
-            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-            query = query.gte("created_at", cutoff)
-        result = query.execute()
-        return result.data or []
-    except Exception as e:
-        logger.error("Failed to fetch memory: %s", e)
-        return []
+        rows = supabase.table("chat_memory").select("message, response, topic, created_at")\
+            .eq("user_id", str(user_id)).order("created_at", desc=True).limit(limit).execute()
+        if not rows.data:
+            return ""
+        context_parts = []
+        for row in rows.data:
+            context_parts.append(f"[{row.get('topic', 'general')}] User: {row['message']} | AIM: {row['response']}")
+        return "\n".join(reversed(context_parts))
+    except Exception:
+        return ""
 
-
-def get_user_profile_sync(user_id: int) -> dict | None:
-    """Synchronous profile retrieval."""
+# ─── MEMORY SEARCH ───
+async def search_memory(user_id: str) -> str:
     if not supabase:
-        return None
+        return "My memory dey offline right now, Citizen. ⚠️"
     try:
-        result = supabase.table("user_profiles").select("*").eq("user_id", str(user_id)).execute()
-        return result.data[0] if result.data else None
+        profile_res = supabase.table("user_profiles").select("*").eq("user_id", str(user_id)).execute()
+        if not profile_res.data:
+            return "We never talk before, Citizen! Start chatting make I remember you. 🇳🇬"
+
+        profile = profile_res.data[0]
+        topic_counts = profile.get("topic_counts", {})
+        total_chats = profile.get("total_chats", 0)
+
+        memory_res = supabase.table("chat_memory").select("message, response, topic, created_at")\
+            .eq("user_id", str(user_id)).order("created_at", desc=True).limit(10).execute()
+
+        lines = [f"📊 Your Top Topics: {', '.join(f'{k} ({v}x)' for k, v in sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3])}",
+                 f"💬 Total Chats: {total_chats}", "", "📝 Recent Conversations:"]
+
+        for i, row in enumerate(memory_res.data[:5], 1):
+            emoji = {"career": "💼", "finance": "💰", "tech": "💻", "sports": "⚽", 
+                     "health": "🏥", "relationships": "❤️", "politics": "🏛️", 
+                     "entertainment": "🎬", "education": "📚"}.get(row.get("topic"), "💬")
+            date = row.get("created_at", "")[:10] if row.get("created_at") else ""
+            lines.append(f"{i}. {emoji} [{date}] {row['message'][:60]}...")
+
+        lines.append("\n🇳🇬 Want me to dive deeper? Just ask!")
+        return "\n".join(lines)
     except Exception as e:
-        logger.error("Failed to fetch profile: %s", e)
-        return None
+        logger.error("Memory search error: %s", e)
+        return "Memory search dey give wahala right now. Try again later! 🔧"
 
+# ─── SEND MESSAGE ───
+async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = None, message_id: Optional[int] = None):
+    """Send or edit message. If message_id provided, edits instead of sending new."""
+    if not bot:
+        return
 
-def build_memory_summary(user_id: int, query: str = "") -> str:
-    """Build memory summary."""
-    memory = get_user_memory_sync(user_id, limit=15)
-    profile = get_user_profile_sync(user_id)
-
-    if not memory and not profile:
-        return "We haven't chatted much yet, Citizen! Start asking me things and I'll remember. 🧠"
-
-    summary_parts = []
-    if profile and profile.get("topic_counts"):
-        topic_counts = profile["topic_counts"]
-        if isinstance(topic_counts, str):
-            topic_counts = json.loads(topic_counts)
-        top_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        topic_list = ", ".join([f"{t[0]} ({t[1]}x)" for t in top_topics])
-        summary_parts.append(f"📊 **Your Top Topics:** {topic_list}")
-        summary_parts.append(f"💬 **Total Chats:** {profile.get('total_chats', 0)}")
-
-    if memory:
-        summary_parts.append("\n📝 **Recent Conversations:**")
-        for i, m in enumerate(memory[:5], 1):
-            date_str = m.get("created_at", "")[:10]
-            topic_emoji = {
-                "career": "💼", "finance": "💰", "tech": "💻",
-                "sports": "⚽", "health": "🏥", "relationships": "❤️",
-                "politics": "🏛️", "entertainment": "🎬", "education": "📚",
-                "general": "💬"
-            }.get(m.get("topic", "general"), "💬")
-            msg_preview = m["message"][:60] + "..." if len(m["message"]) > 60 else m["message"]
-            summary_parts.append(f"{i}. {topic_emoji} [{date_str}] {msg_preview}")
-
-    summary_parts.append("\n🇳🇬 Want me to dive deeper into any of these topics? Just ask!")
-    return "\n".join(summary_parts)
-
-
-def get_memory_context(user_id: int, user_message: str) -> str:
-    """Build memory context for Gemini."""
-    memory = get_user_memory_sync(user_id, limit=3)
-    profile = get_user_profile_sync(user_id)
-    context_parts = []
-
-    if profile and profile.get("topic_counts"):
-        topic_counts = profile["topic_counts"]
-        if isinstance(topic_counts, str):
-            topic_counts = json.loads(topic_counts)
-        top_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        interests = ", ".join([t[0] for t in top_topics])
-        context_parts.append(f"[User typically discusses: {interests}]")
-
-    if memory:
-        context_parts.append("[Recent conversations:]")
-        for m in memory:
-            context_parts.append(f"Q: {m['message'][:100]}...")
-            context_parts.append(f"A: {m['response'][:100]}...")
-        context_parts.append("[End recent conversations]")
-
-    return "\n".join(context_parts) if context_parts else ""
-
-
-# ─── BACKGROUND MESSAGE PROCESSOR ───
-
-def process_message_background(update_data: dict, bot_instance: Bot):
-    """Process message in background thread — webhook returns instantly."""
     try:
-        update = Update.de_json(update_data, bot_instance)
-        if not update.message:
-            return
+        # Escape markdown chars to prevent parse errors
+        safe_text = text.replace("*", "\*").replace("_", "\_").replace("[", "\[").replace("]", "\]")
 
-        user_text = update.message.text
-        chat_type = update.message.chat.type if update.message.chat else "private"
-        user = update.message.from_user
-
-        if not user:
-            return
-
-        # Group mention check
-        if chat_type in ("group", "supergroup"):
-            if user_text and "@askaimbot" not in user_text.lower():
-                logger.info("Ignoring group message (no @askaimbot)")
-                return
-
-        chat_id = update.effective_chat.id
-
-        # Check if memory search
-        if is_memory_search_query(user_text):
-            logger.info("🔍 Memory search for user %s", user.id)
-            memory_summary = build_memory_summary(user.id, user_text or "")
-            send_text_chunks(bot_instance, chat_id, memory_summary)
-            return
-
-        # Normal chat with Gemini
-        if not user_text:
-            send_text_chunks(bot_instance, chat_id, "I can only read text messages for now, Citizen! 📝")
-            return
-
-        memory_context = get_memory_context(user.id, user_text)
-        full_prompt = f"{memory_context}\n\n--- Current Message ---\n{user_text}" if memory_context else user_text
-
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=full_prompt,
-                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        if message_id:
+            # Edit existing message
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=safe_text[:TELEGRAM_MAX_CHARS],
+                parse_mode="Markdown"
             )
-
-            if response.text:
-                send_text_chunks(bot_instance, chat_id, response.text)
-                # Save to memory AFTER successful send
-                try:
-                    save_chat_to_memory(user.id, user.username, user_text, response.text, chat_type)
-                except Exception as mem_e:
-                    logger.error("Memory save failed (non-critical): %s", mem_e)
-            else:
-                send_text_chunks(bot_instance, chat_id, "I hear you, but my mouth dry. Ask again?")
-
-        except Exception as e:
-            error_msg = str(e).lower()
-            error_str = str(e)
-
-            # 503 = Server overloaded (high demand)
-            if "503" in error_str or "unavailable" in error_msg or "high demand" in error_msg:
-                logger.warning("Gemini 503 overload: %s", e)
-                send_text_chunks(bot_instance, chat_id, "🔥 Too many people dey use AIM right now! The Empire's servers are packed. Try again in 30 seconds, Citizen.")
-
-            # 429 = Rate limit / quota
-            elif "429" in error_str or "resource_exhausted" in error_msg or "quota" in error_msg:
-                logger.warning("Gemini quota hit: %s", e)
-                send_text_chunks(bot_instance, chat_id, "⏳ The Empire's lines are busy! Abeg give me 1 minute make I rest.")
-
-            # 404 = Model not found
-            elif "404" in error_str or "not_found" in error_msg:
-                logger.warning("Gemini model error: %s", e)
-                send_text_chunks(bot_instance, chat_id, "📡 My line dey static — model no gree connect. Try again later.")
-
-            # 500/502/504 = Server errors
-            elif any(code in error_str for code in ["500", "502", "504"]):
-                logger.warning("Gemini server error: %s", e)
-                send_text_chunks(bot_instance, chat_id, "🛠️ AIM's engine dey warm up. Try again in a few seconds, Citizen.")
-
-            # Unknown errors
-            else:
-                logger.exception("Gemini generation failed")
-                send_text_chunks(bot_instance, chat_id, "🧠 Abeg wait small, my brain dey reset... Try again in 30 seconds.")
-
+        else:
+            # Send new message
+            kwargs = {"chat_id": chat_id, "text": safe_text[:TELEGRAM_MAX_CHARS], "parse_mode": "Markdown"}
+            if reply_to:
+                kwargs["reply_to_message_id"] = reply_to
+            await bot.send_message(**kwargs)
     except Exception as e:
-        logger.exception("Background processing failed: %s", e)
+        logger.error("Send/edit error: %s", e)
+        # Fallback: send without markdown
+        try:
+            if message_id:
+                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text[:TELEGRAM_MAX_CHARS])
+            else:
+                await bot.send_message(chat_id=chat_id, text=text[:TELEGRAM_MAX_CHARS])
+        except Exception as e2:
+            logger.error("Fallback send failed: %s", e2)
 
+# ─── INLINE QUERY HANDLER ───
+def handle_inline_query(inline_query: dict) -> dict:
+    """Handle inline queries — must return within 1 second for Telegram."""
+    query_id = inline_query["id"]
+    query_text = inline_query.get("query", "").strip()
+    from_user = inline_query.get("from", {})
+    user_id = from_user.get("id", "")
 
+    if not query_text or len(query_text) < 2:
+        return {"inline_query_id": query_id, "results": []}
 
-# ─── FLASK APP ───
-app = Flask(__name__)
+    # Generate unique ID for this query
+    result_id = str(uuid.uuid4())
 
-# Initialize bot with new event loop
-bot = Bot(token=TELEGRAM_TOKEN, request=HTTPXRequest())
+    # Create the result that sends a placeholder message
+    # When clicked, it sends "🤖 Asking AIM: [question]" into the chat
+    # AIM will then edit this message with the real answer
+    placeholder_text = f"🤖 Asking AIM: {query_text}\n\n⏳ Thinking..."
 
+    result = {
+        "type": "article",
+        "id": result_id,
+        "title": f"Ask AIM: {query_text[:40]}",
+        "description": "Click to get AIM's answer in this chat",
+        "input_message_content": {
+            "message_text": placeholder_text,
+            "parse_mode": "HTML"
+        },
+        "reply_markup": {
+            "inline_keyboard": [[{
+                "text": "🔄 Refresh",
+                "callback_data": f"refresh:{result_id}"
+            }]]
+        }
+    }
 
-@app.route("/")
-def health_check():
+    # Store the query for background processing
+    # We'll process it after the user clicks and the message is sent
+    _pending_inline_queries[result_id] = {
+        "query_id": query_id,
+        "query_text": query_text,
+        "user_id": user_id,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+    return {"inline_query_id": query_id, "results": [result]}
+
+# Pending inline queries storage
+_pending_inline_queries: dict = {}
+
+# ─── PROCESS INLINE ANSWER (BACKGROUND) ───
+async def process_inline_answer(chat_id: int, message_id: int, query_text: str, user_id: str):
+    """Process the inline query answer in background and edit the message."""
+    try:
+        # Get user context
+        context = await get_user_context(user_id)
+
+        # Get Gemini response
+        response = await get_gemini_response(query_text, user_id, "private", context)
+
+        if response and response.text:
+            answer = response.text.strip()
+            # Save to memory
+            topic = await extract_topic(query_text, answer)
+            await save_chat_memory(user_id, "", query_text, answer, "inline", topic)
+            await update_user_profile(user_id, "", topic)
+
+            # Edit the placeholder message
+            final_text = f"🤖 <b>AIM says:</b>\n\n{answer}\n\n🇳🇬 The Empire is rising!"
+            await send_text_chunks(chat_id, final_text, message_id=message_id)
+        else:
+            # Quota or error
+            error_text = "🔥 Too many people dey use AIM right now! The Empire's servers are packed. Try again in 30 seconds, Citizen."
+            await send_text_chunks(chat_id, error_text, message_id=message_id)
+    except Exception as e:
+        logger.error("Inline answer processing error: %s", e)
+        error_text = "🛠️ AIM's engine dey warm up. Try again in a few seconds, Citizen."
+        await send_text_chunks(chat_id, error_text, message_id=message_id)
+
+# ─── MESSAGE PROCESSOR ───
+async def handle_message_async(update: Update):
+    """Process incoming messages."""
+    if not update.message:
+        return
+
+    user = update.message.from_user
+    chat = update.message.chat
+    user_text = update.message.text or ""
+    chat_type = chat.type if chat else "private"
+
+    if not user_text:
+        await send_text_chunks(chat.id, "I can only read text messages for now, Citizen! 📝")
+        return
+
+    user_id = str(user.id)
+    username = user.username or user.first_name or "Citizen"
+
+    # Check for memory search keywords
+    memory_keywords = ["what did we talk about", "what have we discussed", "remember our chats", 
+                        "my memory", "our conversations", "what did i ask you"]
+    if any(kw in user_text.lower() for kw in memory_keywords):
+        memory_summary = await search_memory(user_id)
+        await send_text_chunks(chat.id, memory_summary, reply_to=update.message.message_id)
+        return
+
+    # Group mention check (if in group, must mention @askaimbot or reply to bot)
+    if chat_type in ("group", "supergroup"):
+        # Check if message mentions bot
+        mention_found = "@askaimbot" in user_text.lower() or "askaimbot" in user_text.lower()
+        # Check if replying to bot
+        reply_to_bot = False
+        if update.message.reply_to_message and update.message.reply_to_message.from_user:
+            reply_to_bot = update.message.reply_to_message.from_user.is_bot and update.message.reply_to_message.from_user.username == "askaimbot"
+
+        if not mention_found and not reply_to_bot:
+            logger.info("Ignoring group message (no @askaimbot)")
+            return
+
+        # Strip @mention from text
+        if "@askaimbot" in user_text.lower():
+            user_text = user_text.lower().replace("@askaimbot", "").strip()
+        elif "askaimbot" in user_text.lower():
+            user_text = user_text.lower().replace("askaimbot", "").strip()
+
+    # Get context
+    context = await get_user_context(user_id)
+
+    # Get Gemini response
+    response = await get_gemini_response(user_text, user_id, chat_type, context)
+
+    if response and response.text:
+        answer = response.text.strip()
+        await send_text_chunks(chat.id, answer, reply_to=update.message.message_id)
+
+        # Save to memory (background)
+        topic = await extract_topic(user_text, answer)
+        await save_chat_memory(user_id, username, user_text, answer, chat_type, topic)
+        await update_user_profile(user_id, username, topic)
+    else:
+        # Specific error messages
+        error_msg = "🔥 Too many people dey use AIM right now! The Empire's servers are packed. Try again in 30 seconds, Citizen."
+        await send_text_chunks(chat.id, error_msg, reply_to=update.message.message_id)
+
+# ─── WEBHOOK ROUTES ───
+@app.route("/", methods=["GET"])
+def health():
     return jsonify({
         "status": "AIM Bot is live! 🚀",
         "empire": "rising",
-        "version": "v3.3 - African Intelligence Model + Inline Mode",
-        "features": ["topic_extraction", "user_profiles", "memory_context", "memory_search", "duplicate_prevention", "async_webhook", "inline_mode", "logto_auth_ready"],
-        "supabase_connected": supabase is not None
+        "version": "v3.5",
+        "model": "African Intelligence Model",
+        "features": ["memory", "topics", "inline_mode", "message_editing"]
     })
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Receive updates — return 200 OK instantly, process in background."""
+    """Receive updates from Telegram."""
     try:
         data = request.get_json(force=True)
         update_id = data.get("update_id")
 
-        # INSTANTLY reject duplicates
+        # Check for duplicates
         if update_id and is_duplicate_update(update_id):
             logger.info("Ignoring duplicate update_id: %s", update_id)
             return "OK", 200
 
-        # Return 200 OK immediately — process in background thread
-        threading.Thread(
-            target=process_message_background,
-            args=(data, bot),
-            daemon=True
-        ).start()
+        # Handle inline queries immediately (fast path)
+        if "inline_query" in data:
+            result = handle_inline_query(data["inline_query"])
+            return jsonify(result), 200
+
+        # Handle callback queries (for refresh buttons)
+        if "callback_query" in data:
+            callback = data["callback_query"]
+            # Acknowledge the callback
+            return jsonify({"callback_query_id": callback["id"]}), 200
+
+        # Handle regular messages (async background)
+        if "message" in data:
+            update = Update.de_json(data, bot)
+            # Check if this is an inline placeholder that needs editing
+            msg = update.message
+            if msg and msg.text and msg.text.startswith("🤖 Asking AIM:") and "⏳ Thinking..." in msg.text:
+                # This is a placeholder from inline mode — process in background
+                chat_id = msg.chat.id
+                message_id = msg.message_id
+                # Extract the question from placeholder text
+                query_text = msg.text.replace("🤖 Asking AIM:", "").replace("\n\n⏳ Thinking...", "").strip()
+                user_id = str(msg.from_user.id) if msg.from_user else ""
+
+                # Process answer in background and edit message
+                run_async(process_inline_answer(chat_id, message_id, query_text, user_id))
+                return "OK", 200
+
+            # Normal message — process in background
+            run_async(handle_message_async(update))
 
         return "OK", 200
     except Exception as e:
         logger.error("Webhook error: %s", e)
         return "Error", 500
 
-
 @app.route("/set-webhook", methods=["GET"])
 def set_webhook():
-    if not WEBHOOK_URL:
-        return jsonify({"error": "WEBHOOK_URL not set"}), 400
+    if not bot or not WEBHOOK_URL:
+        return jsonify({"error": "Bot or webhook URL not configured"}), 500
     try:
-        success = run_async(bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"))
-        if success:
-            return jsonify({"status": "Webhook set!", "url": WEBHOOK_URL})
-        return jsonify({"error": "Failed"}), 500
+        url = f"{WEBHOOK_URL}/webhook"
+        bot.set_webhook(url=url)
+        return jsonify({"status": "Webhook set successfully!", "url": url})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/delete-webhook", methods=["GET"])
 def delete_webhook():
+    if not bot:
+        return jsonify({"error": "Bot not configured"}), 500
     try:
-        success = run_async(bot.delete_webhook())
-        if success:
-            return jsonify({"status": "Webhook deleted!"})
-        return jsonify({"error": "Failed"}), 500
+        bot.delete_webhook()
+        return jsonify({"status": "Webhook deleted!"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-@app.route("/memory/<user_id>", methods=["GET"])
-def get_memory_api(user_id):
-    if not supabase:
-        return jsonify({"error": "Supabase not connected"}), 500
-    try:
-        result = supabase.table("chat_memory").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(20).execute()
-        return jsonify({"user_id": user_id, "count": len(result.data or []), "memory": result.data or []})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/profile/<user_id>", methods=["GET"])
-def get_profile_api(user_id):
-    if not supabase:
-        return jsonify({"error": "Supabase not connected"}), 500
-    try:
-        result = supabase.table("user_profiles").select("*").eq("user_id", user_id).execute()
-        return jsonify({"user_id": user_id, "profile": result.data[0] if result.data else None})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
+# ─── DEBUG ENDPOINTS ───
 @app.route("/debug/supabase", methods=["GET"])
 def debug_supabase():
     if not supabase:
-        return jsonify({"error": "Supabase not connected", "env_check": {"SUPABASE_URL_set": bool(SUPABASE_URL), "SUPABASE_KEY_set": bool(SUPABASE_KEY)}}), 500
+        return jsonify({"error": "Supabase not connected"}), 500
     try:
-        chat_result = supabase.table("chat_memory").select("count", count="exact").execute()
-        profile_result = supabase.table("user_profiles").select("count", count="exact").execute()
-        return jsonify({"status": "connected", "chat_memory_rows": getattr(chat_result, 'count', 'unknown'), "user_profiles_rows": getattr(profile_result, 'count', 'unknown')})
+        chat_rows = supabase.table("chat_memory").select("*", count="exact").execute()
+        profile_rows = supabase.table("user_profiles").select("*", count="exact").execute()
+        return jsonify({
+            "status": "connected",
+            "chat_memory_rows": chat_rows.count if hasattr(chat_rows, 'count') else len(chat_rows.data),
+            "user_profiles_rows": profile_rows.count if hasattr(profile_rows, 'count') else len(profile_rows.data),
+            "tables": ["chat_memory", "user_profiles", "auth_states"]
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-# ─── LOGTO AUTH ROUTES ───
-
-@app.route("/auth/link/<telegram_user_id>", methods=["GET"])
-def generate_logto_link(telegram_user_id):
-    if not all([LOGTO_ENDPOINT, LOGTO_CLIENT_ID, WEBHOOK_URL]):
-        return jsonify({"error": "Logto not fully configured"}), 500
-    state = secrets.token_urlsafe(32)
-    if supabase:
-        try:
-            supabase.table("auth_states").insert({"state": state, "telegram_user_id": telegram_user_id, "created_at": datetime.utcnow().isoformat(), "used": False}).execute()
-        except Exception as e:
-            logger.error("Auth state error: %s", e)
-    redirect_uri = f"{WEBHOOK_URL}/auth/callback"
-    auth_url = f"{LOGTO_ENDPOINT}/oidc/auth?response_type=code&client_id={LOGTO_CLIENT_ID}&redirect_uri={redirect_uri}&state={state}&scope=openid profile email"
-    return jsonify({"auth_url": auth_url, "state": state})
-
-
-@app.route("/auth/callback", methods=["GET"])
-def logto_callback():
-    code = request.args.get("code")
-    state = request.args.get("state")
-    if not code or not state:
-        return jsonify({"error": "Missing code or state"}), 400
+@app.route("/memory/<user_id>", methods=["GET"])
+def get_memory(user_id: str):
     if not supabase:
         return jsonify({"error": "Supabase not connected"}), 500
     try:
-        result = supabase.table("auth_states").select("*").eq("state", state).eq("used", False).execute()
-        if not result.data:
-            return jsonify({"error": "Invalid state"}), 400
-        telegram_user_id = result.data[0]["telegram_user_id"]
-        supabase.table("auth_states").update({"used": True}).eq("state", state).execute()
-        supabase.table("user_profiles").update({"logto_linked": True, "logto_linked_at": datetime.utcnow().isoformat()}).eq("user_id", telegram_user_id).execute()
-        return jsonify({"status": "success", "message": f"Linked! 🎉"})
+        rows = supabase.table("chat_memory").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(20).execute()
+        return jsonify({"user_id": user_id, "chats": rows.data})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/profile/<user_id>", methods=["GET"])
+def get_profile(user_id: str):
+    if not supabase:
+        return jsonify({"error": "Supabase not connected"}), 500
+    try:
+        rows = supabase.table("user_profiles").select("*").eq("user_id", user_id).execute()
+        return jsonify({"user_id": user_id, "profile": rows.data[0] if rows.data else None})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-# ─── PRIVACY POLICY PAGE ───
+# ─── PRIVACY POLICY ───
+PRIVACY_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIM — Privacy Policy</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f23; color: #e0e0e0; line-height: 1.6; }
+        .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+        header { text-align: center; padding: 40px 20px; border-bottom: 2px solid #1a1a3e; }
+        .logo { width: 80px; height: auto; border-radius: 50%; margin-bottom: 15px; box-shadow: 0 0 20px rgba(100, 200, 255, 0.3); }
+        h1 { color: #64c8ff; font-size: 2rem; margin-bottom: 10px; }
+        .subtitle { color: #888; font-size: 1rem; }
+        .badge { display: inline-block; background: #1a1a3e; color: #64c8ff; padding: 5px 15px; border-radius: 20px; font-size: 0.85rem; margin-top: 10px; }
+        section { margin: 30px 0; padding: 20px; background: #1a1a2e; border-radius: 10px; }
+        h2 { color: #64c8ff; margin-bottom: 15px; font-size: 1.3rem; }
+        table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #2a2a4e; }
+        th { background: #0f0f23; color: #64c8ff; font-weight: 600; }
+        td { color: #ccc; }
+        .highlight { color: #64c8ff; font-weight: 600; }
+        .footer { text-align: center; padding: 30px; border-top: 2px solid #1a1a3e; margin-top: 40px; color: #888; }
+        .flag { font-size: 1.5rem; }
+        @media (max-width: 600px) { .container { padding: 10px; } h1 { font-size: 1.5rem; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <img src="https://i.imgur.com/YUaVpcZ.jpeg" alt="AIM Logo" class="logo">
+            <h1>🔒 Privacy Policy</h1>
+            <p class="subtitle">African Intelligence Model (AIM)</p>
+            <span class="badge">Effective Date: May 24, 2026</span>
+        </header>
+
+        <section>
+            <h2>1. What AIM Is</h2>
+            <p>AIM is a Telegram bot powered by artificial intelligence (Google Gemini API) and built to serve Nigerian and African users with culturally relevant assistance, memory, and local knowledge.</p>
+        </section>
+
+        <section>
+            <h2>2. What Data We Collect</h2>
+            <table>
+                <tr><th>Data</th><th>Why</th><th>Stored</th></tr>
+                <tr><td>Telegram user ID</td><td>Identify you and save memory</td><td>Yes, in Supabase</td></tr>
+                <tr><td>Username (if public)</td><td>Personalize greetings</td><td>Yes, in Supabase</td></tr>
+                <tr><td>Messages & replies</td><td>Build personal memory and context</td><td>Yes, in Supabase</td></tr>
+                <tr><td>Topics from chats</td><td>Personalize news and recommendations</td><td>Yes, in Supabase</td></tr>
+                <tr><td>Timezone/language prefs</td><td>Serve you better</td><td>Yes, in Supabase</td></tr>
+            </table>
+        </section>
+
+        <section>
+            <h2>3. What We Do NOT Collect</h2>
+            <p>• Your phone number • Your real name (unless your Telegram username reveals it) • Payment information • Messages from other chats • Location data (unless you explicitly share it)</p>
+        </section>
+
+        <section>
+            <h2>4. How We Use Your Data</h2>
+            <p><span class="highlight">Memory:</span> AIM remembers your past conversations so you don't repeat yourself.<br>
+            <span class="highlight">Personalization:</span> News, reminders, and responses tailored to your interests.<br>
+            <span class="highlight">No third-party sales:</span> We do not sell, trade, or share your data with advertisers.</p>
+        </section>
+
+        <section>
+            <h2>5. Where Your Data Lives</h2>
+            <p>Your data is stored in <span class="highlight">Supabase</span> (PostgreSQL database), hosted on secure cloud infrastructure with encryption at rest. Access is restricted to the AIM service only.</p>
+        </section>
+
+        <section>
+            <h2>6. Your Rights</h2>
+            <table>
+                <tr><th>Right</th><th>How</th></tr>
+                <tr><td>See your data</td><td>Message AIM: "Show me my data"</td></tr>
+                <tr><td>Delete your data</td><td>Message AIM: "Delete all my memory"</td></tr>
+                <tr><td>Export your data</td><td>Contact the admin</td></tr>
+                <tr><td>Opt out of memory</td><td>Message AIM: "Forget everything"</td></tr>
+            </table>
+        </section>
+
+        <section>
+            <h2>7. Third-Party Services</h2>
+            <p>AIM relies on: <span class="highlight">Google Gemini API</span> (processes messages), <span class="highlight">Supabase</span> (stores data), <span class="highlight">Railway</span> (hosting), <span class="highlight">Logto</span> (optional web auth). These services have their own privacy policies.</p>
+        </section>
+
+        <section>
+            <h2>8. Group Chats</h2>
+            <p>When you mention @askaimbot in a group: AIM only sees the message with the mention. AIM does NOT read the rest of the group chat. Replies are visible to the group.</p>
+        </section>
+
+        <section>
+            <h2>9. Data Retention</h2>
+            <p>Active users: Data retained until you request deletion. Inactive users: Data may be purged after 12 months of no activity. Deleted data: Permanently removed within 7 days of request.</p>
+        </section>
+
+        <section>
+            <h2>10. Security</h2>
+            <p>• HTTPS/TLS encryption for all API calls • Supabase access restricted by service-role keys • No plaintext tokens stored in code • Regular security updates</p>
+        </section>
+
+        <section>
+            <h2>11. Changes to This Policy</h2>
+            <p>If this policy changes, AIM will notify active users in-chat. The latest version is always available at: <span class="highlight">https://aimbot.up.railway.app/privacy</span></p>
+        </section>
+
+        <section>
+            <h2>12. Contact</h2>
+            <p>For data requests or questions: Telegram — Contact the bot admin directly</p>
+        </section>
+
+        <div class="footer">
+            <p class="flag">🇳🇬</p>
+            <p>AIM was built for Africans, by Africans. Your data is your data. We respect that.</p>
+            <p style="margin-top: 10px; font-size: 0.9rem; color: #64c8ff;">The Empire is rising! 🚀</p>
+        </div>
+    </div>
+</body>
+</html>"""
 
 @app.route("/privacy", methods=["GET"])
 def privacy_policy():
-    try:
-        with open("privacy.html", "r", encoding="utf-8") as f:
-            return f.read(), 200, {'Content-Type': 'text/html'}
-    except FileNotFoundError:
-        return "<h1>Privacy Policy</h1><p>Coming soon.</p>", 200, {'Content-Type': 'text/html'}
+    return PRIVACY_HTML, 200, {'Content-Type': 'text/html'}
 
-
-
-# ─── INLINE MODE (ANSWER INLINE QUERIES) ───
-# This lets users type @askaimbot in ANY chat and get instant answers
-
-from telegram import InlineQueryResultArticle, InputTextMessageContent
-
-def process_inline_query(query_text: str, user_id: int, username: str) -> str:
-    """Process inline query and return answer."""
-    if not query_text.strip():
-        return "👋 Type your question after @askaimbot!"
-
-    # Check if memory search
-    if is_memory_search_query(query_text):
-        return build_memory_summary(user_id, query_text)
-
-    # Normal chat with Gemini
-    memory_context = get_memory_context(user_id, query_text)
-    full_prompt = f"{memory_context}\n\n--- Current Message ---\n{query_text}" if memory_context else query_text
-
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=full_prompt,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-        )
-
-        if response.text:
-            # Save to memory
-            try:
-                save_chat_to_memory(user_id, username, query_text, response.text, "inline")
-            except Exception:
-                pass  # Non-critical
-            return response.text
-        else:
-            return "🤔 I hear you, but need more context. Ask again?"
-
-    except Exception as e:
-        error_msg = str(e).lower()
-        error_str = str(e)
-
-        if "503" in error_str or "unavailable" in error_msg:
-            return "🔥 AIM is under heavy usage right now , Try again in 30 seconds."
-        elif "429" in error_str or "resource_exhausted" in error_msg or "quota" in error_msg:
-            return "⏳ The Empire's lines are busy! You have exhausted your quota "
-        elif "404" in error_str or "not_found" in error_msg:
-            return "📡 My line static. Try again later."
-        else:
-            return "🧠 AIM is having issues... Try again later "
-
-
+# ─── MAIN ───
 if __name__ == "__main__":
-    if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-        raise SystemExit("Set TELEGRAM_TOKEN and GEMINI_API_KEY")
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    app.run(host="0.0.0.0", port=8080)
