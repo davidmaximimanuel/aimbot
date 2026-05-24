@@ -475,41 +475,6 @@ def process_message_background(update_data: dict, bot_instance: Bot):
 
 
 
-def process_inline_background(data: dict, bot_instance: Bot):
-    """Process inline query in background thread."""
-    try:
-        inline_query = data["inline_query"]
-        query_id = inline_query["id"]
-        query_text = inline_query.get("query", "")
-        user = inline_query.get("from", {})
-        user_id = user.get("id", 0)
-        username = user.get("username", "")
-
-        logger.info("🔍 Inline query from %s: %r", user_id, query_text[:80])
-
-        # Process the query
-        answer_text = process_inline_query(query_text, user_id, username)
-
-        # Truncate if too long
-        if len(answer_text) > 3900:
-            answer_text = answer_text[:3800] + "\n\n... (message truncated)"
-
-        # Send answer back to Telegram
-        run_async(bot_instance.answer_inline_query(
-            inline_query_id=query_id,
-            results=[
-                InlineQueryResultArticle(
-                    id="1",
-                    title="🤖 AIM says...",
-                    input_message_content=InputTextMessageContent(message_text=answer_text),
-                    description=answer_text[:100] + "..." if len(answer_text) > 100 else answer_text
-                )
-            ],
-            cache_time=0
-        ))
-    except Exception as e:
-        logger.error("Inline background processing failed: %s", e)
-
 # ─── FLASK APP ───
 app = Flask(__name__)
 
@@ -700,14 +665,13 @@ def process_inline_query(query_text: str, user_id: int, username: str) -> str:
         error_str = str(e)
 
         if "503" in error_str or "unavailable" in error_msg:
-            return "🔥 Too many people dey use AIM right now! Try again in 30 seconds."
+            return "🔥 AIM is under heavy usage right now , Try again in 30 seconds."
         elif "429" in error_str or "resource_exhausted" in error_msg or "quota" in error_msg:
-            return "⏳ The Empire's lines are busy! Abeg give me 1 minute make I rest."
+            return "⏳ The Empire's lines are busy! You have exhausted your quota "
         elif "404" in error_str or "not_found" in error_msg:
-            return "📡 My line dey static. Try again later."
+            return "📡 My line static. Try again later."
         else:
-            return "🧠 Abeg wait small, my brain dey reset..."
-
+            return "🧠 AIM is having issues... Try again later "
 
 
 if __name__ == "__main__":
