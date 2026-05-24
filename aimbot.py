@@ -1,6 +1,6 @@
 """
-AIM Bot v3.5 — African Intelligence Model
-Inline mode + message editing + privacy logo fix
+AIM Bot v3.6 — African Intelligence Model
+Fixed inline mode using python-telegram-bot native answer_inline_query
 """
 
 import os
@@ -14,7 +14,11 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from flask import Flask, request, jsonify
-from telegram import Update, Bot
+from telegram import (
+    Update, Bot, InlineQueryResultArticle, InputTextMessageContent,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+from telegram.constants import ParseMode
 from supabase import create_client, Client
 from google import genai
 from google.genai import types
@@ -111,7 +115,6 @@ async def get_gemini_response(user_text: str, user_id: str, chat_type: str, cont
         return None
 
     try:
-        # Build prompt with context if available
         prompt = user_text
         if context:
             prompt = f"Context from previous chats:\n{context}\n\nUser question: {user_text}"
@@ -248,26 +251,24 @@ async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = No
         return
 
     try:
-        # Escape markdown chars to prevent parse errors
-        safe_text = text.replace("*", "\*").replace("_", "\_").replace("[", "\[").replace("]", "\]")
+        # Use HTML parse mode safely
+        safe_text = text.replace("<", "&lt;").replace(">", "&gt;") if "<" in text or ">" in text else text
 
         if message_id:
-            # Edit existing message
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=safe_text[:TELEGRAM_MAX_CHARS],
-                parse_mode="Markdown"
+                parse_mode=ParseMode.HTML
             )
         else:
-            # Send new message
-            kwargs = {"chat_id": chat_id, "text": safe_text[:TELEGRAM_MAX_CHARS], "parse_mode": "Markdown"}
+            kwargs = {"chat_id": chat_id, "text": safe_text[:TELEGRAM_MAX_CHARS], "parse_mode": ParseMode.HTML}
             if reply_to:
                 kwargs["reply_to_message_id"] = reply_to
             await bot.send_message(**kwargs)
     except Exception as e:
         logger.error("Send/edit error: %s", e)
-        # Fallback: send without markdown
+        # Fallback: send without parse mode
         try:
             if message_id:
                 await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text[:TELEGRAM_MAX_CHARS])
@@ -276,78 +277,66 @@ async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = No
         except Exception as e2:
             logger.error("Fallback send failed: %s", e2)
 
-# ─── INLINE QUERY HANDLER ───
-def handle_inline_query(inline_query: dict) -> dict:
-    """Handle inline queries — must return within 1 second for Telegram."""
-    query_id = inline_query["id"]
-    query_text = inline_query.get("query", "").strip()
-    from_user = inline_query.get("from", {})
-    user_id = from_user.get("id", "")
+# ─── INLINE QUERY HANDLER (CRITICAL FIX) ───
+async def handle_inline_query_async(inline_query):
+    """Handle inline queries using python-telegram-bot native method."""
+    query_id = inline_query.id
+    query_text = inline_query.query.strip()
+    user_id = inline_query.from_user.id if inline_query.from_user else ""
+
+    logger.info("📨 Inline query from %s: '%s'", user_id, query_text)
 
     if not query_text or len(query_text) < 2:
-        return {"inline_query_id": query_id, "results": []}
+        # Return empty results for short queries
+        await bot.answer_inline_query(
+            inline_query_id=query_id,
+            results=[],
+            cache_time=1
+        )
+        return
 
-    # Generate unique ID for this query
-    result_id = str(uuid.uuid4())
+    # Create a simple result that sends a message when clicked
+    # Use InputTextMessageContent properly
+    result = InlineQueryResultArticle(
+        id=str(uuid.uuid4()),
+        title=f"Ask AIM: {query_text[:40]}",
+        description="Click to get AIM's answer",
+        input_message_content=InputTextMessageContent(
+            message_text=f"🤖 Asking AIM: {query_text}\n\n⏳ Thinking...",
+            parse_mode=ParseMode.HTML
+        ),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Refresh", callback_data="refresh")
+        ]])
+    )
 
-    # Create the result that sends a placeholder message
-    # When clicked, it sends "🤖 Asking AIM: [question]" into the chat
-    # AIM will then edit this message with the real answer
-    placeholder_text = f"🤖 Asking AIM: {query_text}\n\n⏳ Thinking..."
-
-    result = {
-        "type": "article",
-        "id": result_id,
-        "title": f"Ask AIM: {query_text[:40]}",
-        "description": "Click to get AIM's answer in this chat",
-        "input_message_content": {
-            "message_text": placeholder_text,
-            "parse_mode": "HTML"
-        },
-        "reply_markup": {
-            "inline_keyboard": [[{
-                "text": "🔄 Refresh",
-                "callback_data": f"refresh:{result_id}"
-            }]]
-        }
-    }
-
-    # Store the query for background processing
-    # We'll process it after the user clicks and the message is sent
-    _pending_inline_queries[result_id] = {
-        "query_id": query_id,
-        "query_text": query_text,
-        "user_id": user_id,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-
-    return {"inline_query_id": query_id, "results": [result]}
-
-# Pending inline queries storage
-_pending_inline_queries: dict = {}
+    try:
+        await bot.answer_inline_query(
+            inline_query_id=query_id,
+            results=[result],
+            cache_time=0,  # Don't cache so we can update
+            is_personal=True
+        )
+        logger.info("✅ Inline query answered for %s", user_id)
+    except Exception as e:
+        logger.error("❌ Inline query answer failed: %s", e)
 
 # ─── PROCESS INLINE ANSWER (BACKGROUND) ───
 async def process_inline_answer(chat_id: int, message_id: int, query_text: str, user_id: str):
     """Process the inline query answer in background and edit the message."""
     try:
-        # Get user context
         context = await get_user_context(user_id)
-
-        # Get Gemini response
         response = await get_gemini_response(query_text, user_id, "private", context)
 
         if response and response.text:
             answer = response.text.strip()
-            # Save to memory
             topic = await extract_topic(query_text, answer)
             await save_chat_memory(user_id, "", query_text, answer, "inline", topic)
             await update_user_profile(user_id, "", topic)
 
-            # Edit the placeholder message
             final_text = f"🤖 <b>AIM says:</b>\n\n{answer}\n\n🇳🇬 The Empire is rising!"
             await send_text_chunks(chat_id, final_text, message_id=message_id)
         else:
-            # Quota or error
             error_text = "🔥 Too many people dey use AIM right now! The Empire's servers are packed. Try again in 30 seconds, Citizen."
             await send_text_chunks(chat_id, error_text, message_id=message_id)
     except Exception as e:
@@ -381,11 +370,9 @@ async def handle_message_async(update: Update):
         await send_text_chunks(chat.id, memory_summary, reply_to=update.message.message_id)
         return
 
-    # Group mention check (if in group, must mention @askaimbot or reply to bot)
+    # Group mention check
     if chat_type in ("group", "supergroup"):
-        # Check if message mentions bot
         mention_found = "@askaimbot" in user_text.lower() or "askaimbot" in user_text.lower()
-        # Check if replying to bot
         reply_to_bot = False
         if update.message.reply_to_message and update.message.reply_to_message.from_user:
             reply_to_bot = update.message.reply_to_message.from_user.is_bot and update.message.reply_to_message.from_user.username == "askaimbot"
@@ -394,28 +381,29 @@ async def handle_message_async(update: Update):
             logger.info("Ignoring group message (no @askaimbot)")
             return
 
-        # Strip @mention from text
         if "@askaimbot" in user_text.lower():
             user_text = user_text.lower().replace("@askaimbot", "").strip()
         elif "askaimbot" in user_text.lower():
             user_text = user_text.lower().replace("askaimbot", "").strip()
 
-    # Get context
-    context = await get_user_context(user_id)
+    # Check if this is a placeholder from inline mode
+    if user_text.startswith("🤖 asking aim:") and "⏳ thinking..." in user_text.lower():
+        query_text = user_text.replace("🤖 asking aim:", "").replace("⏳ thinking...", "").strip()
+        await process_inline_answer(chat.id, update.message.message_id, query_text, user_id)
+        return
 
-    # Get Gemini response
+    # Normal message processing
+    context = await get_user_context(user_id)
     response = await get_gemini_response(user_text, user_id, chat_type, context)
 
     if response and response.text:
         answer = response.text.strip()
         await send_text_chunks(chat.id, answer, reply_to=update.message.message_id)
 
-        # Save to memory (background)
         topic = await extract_topic(user_text, answer)
         await save_chat_memory(user_id, username, user_text, answer, chat_type, topic)
         await update_user_profile(user_id, username, topic)
     else:
-        # Specific error messages
         error_msg = "🔥 Too many people dey use AIM right now! The Empire's servers are packed. Try again in 30 seconds, Citizen."
         await send_text_chunks(chat.id, error_msg, reply_to=update.message.message_id)
 
@@ -425,7 +413,7 @@ def health():
     return jsonify({
         "status": "AIM Bot is live! 🚀",
         "empire": "rising",
-        "version": "v3.5",
+        "version": "v3.6",
         "model": "African Intelligence Model",
         "features": ["memory", "topics", "inline_mode", "message_editing"]
     })
@@ -442,35 +430,19 @@ def webhook():
             logger.info("Ignoring duplicate update_id: %s", update_id)
             return "OK", 200
 
-        # Handle inline queries immediately (fast path)
-        if "inline_query" in data:
-            result = handle_inline_query(data["inline_query"])
-            return jsonify(result), 200
+        update = Update.de_json(data, bot)
 
-        # Handle callback queries (for refresh buttons)
-        if "callback_query" in data:
-            callback = data["callback_query"]
-            # Acknowledge the callback
-            return jsonify({"callback_query_id": callback["id"]}), 200
+        # Handle inline queries
+        if update.inline_query:
+            run_async(handle_inline_query_async(update.inline_query))
+            return "OK", 200
 
-        # Handle regular messages (async background)
-        if "message" in data:
-            update = Update.de_json(data, bot)
-            # Check if this is an inline placeholder that needs editing
-            msg = update.message
-            if msg and msg.text and msg.text.startswith("🤖 Asking AIM:") and "⏳ Thinking..." in msg.text:
-                # This is a placeholder from inline mode — process in background
-                chat_id = msg.chat.id
-                message_id = msg.message_id
-                # Extract the question from placeholder text
-                query_text = msg.text.replace("🤖 Asking AIM:", "").replace("\n\n⏳ Thinking...", "").strip()
-                user_id = str(msg.from_user.id) if msg.from_user else ""
+        # Handle callback queries
+        if update.callback_query:
+            return "OK", 200
 
-                # Process answer in background and edit message
-                run_async(process_inline_answer(chat_id, message_id, query_text, user_id))
-                return "OK", 200
-
-            # Normal message — process in background
+        # Handle regular messages
+        if update.message:
             run_async(handle_message_async(update))
 
         return "OK", 200
