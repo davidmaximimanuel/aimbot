@@ -1,6 +1,6 @@
 """
-AIM Bot v3.7 — African Intelligence Model
-Fixed inline mode: robust placeholder detection + message editing
+AIM Bot v3.8 — African Intelligence Model
+Fixed inline mode: multiline placeholder detection + removed embedded privacy HTML
 """
 
 import os
@@ -248,7 +248,6 @@ async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = No
 
     try:
         if message_id:
-            # Edit existing message
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
@@ -257,14 +256,12 @@ async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = No
             )
             logger.info("✅ Edited message %s in chat %s", message_id, chat_id)
         else:
-            # Send new message
             kwargs = {"chat_id": chat_id, "text": text[:TELEGRAM_MAX_CHARS], "parse_mode": ParseMode.HTML}
             if reply_to:
                 kwargs["reply_to_message_id"] = reply_to
             await bot.send_message(**kwargs)
     except Exception as e:
         logger.error("Send/edit error: %s", e)
-        # Fallback without parse mode
         try:
             if message_id:
                 await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text[:TELEGRAM_MAX_CHARS])
@@ -290,13 +287,12 @@ async def handle_inline_query_async(inline_query):
         )
         return
 
-    # Create result with placeholder message
     result = InlineQueryResultArticle(
         id=str(uuid.uuid4()),
         title=f"Ask AIM: {query_text[:40]}",
         description="Click to get AIM's answer",
         input_message_content=InputTextMessageContent(
-            message_text=f"🤖 Asking AIM: {query_text}\n\n⏳ Thinking...",
+            message_text=f"🤖 Asking AIM: {query_text}\n⏳ Thinking...",
             parse_mode=ParseMode.HTML
         ),
         reply_markup=InlineKeyboardMarkup([[
@@ -352,35 +348,59 @@ async def process_inline_answer(chat_id: int, message_id: int, query_text: str, 
 
 # ─── CHECK IF MESSAGE IS INLINE PLACEHOLDER ───
 def is_inline_placeholder(text: str) -> tuple[bool, str]:
-    """Check if message is an inline placeholder and extract the query."""
+    """Check if message is an inline placeholder and extract the query.
+
+    Handles formats like:
+    - "🤖 Asking AIM: what is it\n⏳ Thinking..."
+    - "🤖 Asking AIM: how is a car made\n⏳ Thinking..."
+    """
     if not text:
         return False, ""
 
-    # Check for various placeholder patterns
+    text_stripped = text.strip()
+    text_lower = text_stripped.lower()
+
+    # Must contain "Asking AIM" and "Thinking"
+    if "asking aim" not in text_lower:
+        return False, ""
+
+    if "thinking" not in text_lower and "⏳" not in text_stripped:
+        return False, ""
+
+    # Try to extract query using regex - multiline mode
+    # Pattern: "Asking AIM:" followed by text, then newline, then "Thinking"
     patterns = [
-        r"🤖\s*Asking\s*AIM:\s*(.+?)\s*⏳\s*Thinking\.\.\.",
-        r"🤖\s*Asking\s*AIM:\s*(.+?)",
-        r"Asking\s*AIM:\s*(.+?)\s*Thinking",
-        r"Asking\s*AIM:\s*(.+?)",
+        r"🤖\s*Asking\s*AIM:\s*(.+?)\s*[\n\r]+\s*⏳?\s*Thinking",
+        r"Asking\s*AIM:\s*(.+?)\s*[\n\r]+\s*⏳?\s*Thinking",
+        r"🤖\s*Asking\s*AIM:\s*(.+?)(?:\s*[\n\r]|$)",
+        r"Asking\s*AIM:\s*(.+?)(?:\s*[\n\r]|$)",
     ]
 
-    text_lower = text.lower()
-    if "asking aim" in text_lower and ("thinking" in text_lower or "⏳" in text):
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-            if match:
-                query = match.group(1).strip()
+    for pattern in patterns:
+        match = re.search(pattern, text_stripped, re.IGNORECASE | re.DOTALL)
+        if match:
+            query = match.group(1).strip()
+            # Clean up any remaining emoji or "Thinking" text
+            query = query.replace("⏳", "").replace("Thinking...", "").replace("thinking...", "").strip()
+            if query:
                 logger.info("🎯 Detected inline placeholder with query: '%s'", query)
                 return True, query
-        # Fallback: extract everything after "Asking AIM:"
-        if "Asking AIM:" in text:
-            parts = text.split("Asking AIM:", 1)
-            if len(parts) > 1:
-                query = parts[1].replace("⏳", "").replace("Thinking...", "").replace("thinking...", "").strip()
-                if query:
-                    logger.info("🎯 Fallback detected inline placeholder with query: '%s'", query)
-                    return True, query
 
+    # Ultimate fallback: split on "Asking AIM:"
+    if "Asking AIM:" in text_stripped:
+        parts = text_stripped.split("Asking AIM:", 1)
+        if len(parts) > 1:
+            query = parts[1].strip()
+            # Remove everything from first newline onward
+            if "\n" in query:
+                query = query.split("\n", 1)[0].strip()
+            # Clean up
+            query = query.replace("⏳", "").replace("Thinking...", "").replace("thinking...", "").strip()
+            if query:
+                logger.info("🎯 Fallback detected inline placeholder with query: '%s'", query)
+                return True, query
+
+    logger.info("⚠️ Found 'Asking AIM' + 'Thinking' but could not extract query from: '%s'", text_stripped[:200])
     return False, ""
 
 # ─── MESSAGE PROCESSOR ───
@@ -402,7 +422,7 @@ async def handle_message_async(update: Update):
     user_id = str(user.id)
     username = user.username or user.first_name or "Citizen"
 
-    logger.info("📩 Message from %s in %s: '%s'", user_id, chat_type, user_text[:100])
+    logger.info("📩 Message from %s in %s: '%s'", user_id, chat_type, user_text[:100].replace('\n', ' '))
 
     # Check if this is an inline placeholder that needs editing
     is_placeholder, query_text = is_inline_placeholder(user_text)
@@ -456,7 +476,7 @@ def health():
     return jsonify({
         "status": "AIM Bot is live! 🚀",
         "empire": "rising",
-        "version": "v3.7",
+        "version": "v3.8",
         "model": "African Intelligence Model",
         "features": ["memory", "topics", "inline_mode", "message_editing"]
     })
@@ -551,130 +571,14 @@ def get_profile(user_id: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ─── PRIVACY POLICY ───
-PRIVACY_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AIM — Privacy Policy</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f23; color: #e0e0e0; line-height: 1.6; }
-        .container { max-width: 800px; margin: 0 auto; padding: 20px; }
-        header { text-align: center; padding: 40px 20px; border-bottom: 2px solid #1a1a3e; }
-        .logo { width: 80px; height: auto; border-radius: 50%; margin-bottom: 15px; box-shadow: 0 0 20px rgba(100, 200, 255, 0.3); }
-        h1 { color: #64c8ff; font-size: 2rem; margin-bottom: 10px; }
-        .subtitle { color: #888; font-size: 1rem; }
-        .badge { display: inline-block; background: #1a1a3e; color: #64c8ff; padding: 5px 15px; border-radius: 20px; font-size: 0.85rem; margin-top: 10px; }
-        section { margin: 30px 0; padding: 20px; background: #1a1a2e; border-radius: 10px; }
-        h2 { color: #64c8ff; margin-bottom: 15px; font-size: 1.3rem; }
-        table { width: 100%; border-collapse: collapse; margin: 15px 0; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #2a2a4e; }
-        th { background: #0f0f23; color: #64c8ff; font-weight: 600; }
-        td { color: #ccc; }
-        .highlight { color: #64c8ff; font-weight: 600; }
-        .footer { text-align: center; padding: 30px; border-top: 2px solid #1a1a3e; margin-top: 40px; color: #888; }
-        .flag { font-size: 1.5rem; }
-        @media (max-width: 600px) { .container { padding: 10px; } h1 { font-size: 1.5rem; } }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <img src="https://i.imgur.com/YUaVpcZ.jpeg" alt="AIM Logo" class="logo">
-            <h1>🔒 Privacy Policy</h1>
-            <p class="subtitle">African Intelligence Model (AIM)</p>
-            <span class="badge">Effective Date: May 24, 2026</span>
-        </header>
-
-        <section>
-            <h2>1. What AIM Is</h2>
-            <p>AIM is a Telegram bot powered by artificial intelligence (Google Gemini API) and built to serve Nigerian and African users with culturally relevant assistance, memory, and local knowledge.</p>
-        </section>
-
-        <section>
-            <h2>2. What Data We Collect</h2>
-            <table>
-                <tr><th>Data</th><th>Why</th><th>Stored</th></tr>
-                <tr><td>Telegram user ID</td><td>Identify you and save memory</td><td>Yes, in Supabase</td></tr>
-                <tr><td>Username (if public)</td><td>Personalize greetings</td><td>Yes, in Supabase</td></tr>
-                <tr><td>Messages & replies</td><td>Build personal memory and context</td><td>Yes, in Supabase</td></tr>
-                <tr><td>Topics from chats</td><td>Personalize news and recommendations</td><td>Yes, in Supabase</td></tr>
-                <tr><td>Timezone/language prefs</td><td>Serve you better</td><td>Yes, in Supabase</td></tr>
-            </table>
-        </section>
-
-        <section>
-            <h2>3. What We Do NOT Collect</h2>
-            <p>• Your phone number • Your real name (unless your Telegram username reveals it) • Payment information • Messages from other chats • Location data (unless you explicitly share it)</p>
-        </section>
-
-        <section>
-            <h2>4. How We Use Your Data</h2>
-            <p><span class="highlight">Memory:</span> AIM remembers your past conversations so you don't repeat yourself.<br>
-            <span class="highlight">Personalization:</span> News, reminders, and responses tailored to your interests.<br>
-            <span class="highlight">No third-party sales:</span> We do not sell, trade, or share your data with advertisers.</p>
-        </section>
-
-        <section>
-            <h2>5. Where Your Data Lives</h2>
-            <p>Your data is stored in <span class="highlight">Supabase</span> (PostgreSQL database), hosted on secure cloud infrastructure with encryption at rest. Access is restricted to the AIM service only.</p>
-        </section>
-
-        <section>
-            <h2>6. Your Rights</h2>
-            <table>
-                <tr><th>Right</th><th>How</th></tr>
-                <tr><td>See your data</td><td>Message AIM: "Show me my data"</td></tr>
-                <tr><td>Delete your data</td><td>Message AIM: "Delete all my memory"</td></tr>
-                <tr><td>Export your data</td><td>Contact the admin</td></tr>
-                <tr><td>Opt out of memory</td><td>Message AIM: "Forget everything"</td></tr>
-            </table>
-        </section>
-
-        <section>
-            <h2>7. Third-Party Services</h2>
-            <p>AIM relies on: <span class="highlight">Google Gemini API</span> (processes messages), <span class="highlight">Supabase</span> (stores data), <span class="highlight">Railway</span> (hosting), <span class="highlight">Logto</span> (optional web auth). These services have their own privacy policies.</p>
-        </section>
-
-        <section>
-            <h2>8. Group Chats</h2>
-            <p>When you mention @askaimbot in a group: AIM only sees the message with the mention. AIM does NOT read the rest of the group chat. Replies are visible to the group.</p>
-        </section>
-
-        <section>
-            <h2>9. Data Retention</h2>
-            <p>Active users: Data retained until you request deletion. Inactive users: Data may be purged after 12 months of no activity. Deleted data: Permanently removed within 7 days of request.</p>
-        </section>
-
-        <section>
-            <h2>10. Security</h2>
-            <p>• HTTPS/TLS encryption for all API calls • Supabase access restricted by service-role keys • No plaintext tokens stored in code • Regular security updates</p>
-        </section>
-
-        <section>
-            <h2>11. Changes to This Policy</h2>
-            <p>If this policy changes, AIM will notify active users in-chat. The latest version is always available at: <span class="highlight">https://aimbot.up.railway.app/privacy</span></p>
-        </section>
-
-        <section>
-            <h2>12. Contact</h2>
-            <p>For data requests or questions: Telegram — Contact the bot admin directly</p>
-        </section>
-
-        <div class="footer">
-            <p class="flag">🇳🇬</p>
-            <p>AIM was built for Africans, by Africans. Your data is your data. We respect that.</p>
-            <p style="margin-top: 10px; font-size: 0.9rem; color: #64c8ff;">The Empire is rising! 🚀</p>
-        </div>
-    </div>
-</body>
-</html>"""
-
+# ─── PRIVACY POLICY (uses external file) ───
 @app.route("/privacy", methods=["GET"])
 def privacy_policy():
-    return PRIVACY_HTML, 200, {'Content-Type': 'text/html'}
+    try:
+        with open("privacy.html", "r", encoding="utf-8") as f:
+            return f.read(), 200, {'Content-Type': 'text/html'}
+    except FileNotFoundError:
+        return "<h1>Privacy Policy</h1><p>Coming soon.</p>", 200, {'Content-Type': 'text/html'}
 
 # ─── MAIN ───
 if __name__ == "__main__":
