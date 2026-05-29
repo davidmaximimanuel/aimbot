@@ -1,6 +1,6 @@
 """
-AIM Bot v3.9 — African Intelligence Model
-Inline mode: reply-based (not edit) + professional tone
+AIM Bot v4.0 — African Intelligence Model
+Ultra-simple inline placeholder detection + professional tone
 """
 
 import os
@@ -10,14 +10,12 @@ import uuid
 import asyncio
 import logging
 import threading
-import re
 from datetime import datetime, timezone
 from typing import Optional
 
 from flask import Flask, request, jsonify
 from telegram import (
-    Update, Bot, InlineQueryResultArticle, InputTextMessageContent,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    Update, Bot, InlineQueryResultArticle, InputTextMessageContent
 )
 from telegram.constants import ParseMode
 from supabase import create_client, Client
@@ -92,7 +90,7 @@ Personality:
 - Warm, respectful, and culturally aware
 - Reference African culture and context when relevant
 - Be helpful, patient, and empowering
-- Use standard English only — Use  Pidgin, slang, or informal dialects only when the user initiates it or asks for it 
+- Use standard English only — Pidgin, slang, or informal dialects only wen initiated by the user
 - Never use phrases like "The Empire is rising" or similar taglines
 
 Rules:
@@ -287,24 +285,22 @@ async def handle_inline_query_async(inline_query):
         )
         return
 
-    # NEW: Instead of placeholder, try to get answer immediately (fast path)
-    # If Gemini is quick, return the answer directly in the popup
+    # Try fast path: get Gemini answer within 8 seconds
     answer_text = None
     try:
-        # Quick Gemini call with short timeout
         response = await asyncio.wait_for(
             get_gemini_response(query_text, user_id, "private"),
-            timeout=8.0  # Telegram allows up to 10-15 seconds for inline
+            timeout=8.0
         )
         if response and response.text:
-            answer_text = response.text.strip()[:300]  # Limit for inline preview
+            answer_text = response.text.strip()[:300]
     except asyncio.TimeoutError:
         logger.info("⏱️ Gemini timeout for inline query, using placeholder")
     except Exception as e:
         logger.error("Inline Gemini error: %s", e)
 
     if answer_text:
-        # Return the actual answer immediately
+        # Return actual answer immediately
         result = InlineQueryResultArticle(
             id=str(uuid.uuid4()),
             title=f"AIM: {query_text[:30]}",
@@ -339,11 +335,10 @@ async def handle_inline_query_async(inline_query):
 
 # ─── PROCESS INLINE ANSWER (BACKGROUND) ───
 async def process_inline_answer(chat_id: int, message_id: int, query_text: str, user_id: str):
-    """Process the inline query answer and send as REPLY (not edit)."""
+    """Process the inline query answer and send as REPLY."""
     logger.info("🔄 Processing inline answer for msg %s: '%s'", message_id, query_text)
 
     try:
-        # Get context and Gemini response
         context = await get_user_context(user_id)
         response = await get_gemini_response(query_text, user_id, "private", context)
 
@@ -353,7 +348,6 @@ async def process_inline_answer(chat_id: int, message_id: int, query_text: str, 
             await save_chat_memory(user_id, "", query_text, answer, "inline", topic)
             await update_user_profile(user_id, "", topic)
 
-            # Send as REPLY to the placeholder message instead of editing
             final_text = f"🤖 <b>AIM says:</b>\n\n{answer}"
             await send_text_chunks(chat_id, final_text, reply_to=message_id)
             logger.info("✅ Inline answer sent as reply for msg %s", message_id)
@@ -367,50 +361,54 @@ async def process_inline_answer(chat_id: int, message_id: int, query_text: str, 
 
 # ─── CHECK IF MESSAGE IS INLINE PLACEHOLDER ───
 def is_inline_placeholder(text: str) -> tuple[bool, str]:
-    """Check if message is an inline placeholder and extract the query."""
+    """Ultra-simple check: does this look like an inline placeholder?
+
+    Expected format from Telegram:
+    🤖 Asking AIM: [question]
+    ⏳ Processing...
+    """
     if not text:
         return False, ""
 
-    text_stripped = text.strip()
-    text_lower = text_stripped.lower()
+    text_clean = text.strip()
+    text_lower = text_clean.lower()
 
-    # Must contain "Asking AIM" and "Processing" or "Thinking"
+    # Log what we received for debugging
+    logger.info("🔍 Checking if placeholder: '%s'", text_clean[:200].replace('\n', ' | '))
+
+    # MUST contain "asking aim" (case insensitive)
     if "asking aim" not in text_lower:
         return False, ""
 
-    if "processing" not in text_lower and "thinking" not in text_lower and "⏳" not in text_stripped:
+    # MUST contain "processing" or "thinking" (case insensitive)
+    has_processing = "processing" in text_lower or "thinking" in text_lower
+    if not has_processing:
         return False, ""
 
-    # Extract query using regex - multiline mode
-    patterns = [
-        r"🤖\s*Asking\s*AIM:\s*(.+?)\s*[\n\r]+\s*⏳?\s*(?:Processing|Thinking)",
-        r"Asking\s*AIM:\s*(.+?)\s*[\n\r]+\s*⏳?\s*(?:Processing|Thinking)",
-        r"🤖\s*Asking\s*AIM:\s*(.+?)(?:\s*[\n\r]|$)",
-        r"Asking\s*AIM:\s*(.+?)(?:\s*[\n\r]|$)",
-    ]
+    # Extract the question: everything between "Asking AIM:" and the newline before "Processing"
+    # Split by "Asking AIM:" (case insensitive)
+    parts = text_clean.split(":", 1)
+    if len(parts) < 2:
+        return False, ""
 
-    for pattern in patterns:
-        match = re.search(pattern, text_stripped, re.IGNORECASE | re.DOTALL)
-        if match:
-            query = match.group(1).strip()
-            query = query.replace("⏳", "").replace("Processing...", "").replace("processing...", "").replace("Thinking...", "").replace("thinking...", "").strip()
-            if query:
-                logger.info("🎯 Detected inline placeholder with query: '%s'", query)
-                return True, query
+    # parts[0] = "🤖 Asking AIM"
+    # parts[1] = " tell him I never said...\n⏳ Processing..."
+    after_prefix = parts[1].strip()
 
-    # Ultimate fallback: split on "Asking AIM:"
-    if "Asking AIM:" in text_stripped:
-        parts = text_stripped.split("Asking AIM:", 1)
-        if len(parts) > 1:
-            query = parts[1].strip()
-            if "\n" in query:
-                query = query.split("\n", 1)[0].strip()
-            query = query.replace("⏳", "").replace("Processing...", "").replace("processing...", "").replace("Thinking...", "").replace("thinking...", "").strip()
-            if query:
-                logger.info("🎯 Fallback detected inline placeholder with query: '%s'", query)
-                return True, query
+    # Remove everything from the first newline onward
+    if "\n" in after_prefix:
+        query = after_prefix.split("\n", 1)[0].strip()
+    else:
+        query = after_prefix.strip()
 
-    logger.info("⚠️ Found 'Asking AIM' but could not extract query from: '%s'", text_stripped[:200])
+    # Clean up any remaining processing/thinking text
+    query = query.replace("⏳", "").replace("Processing...", "").replace("processing...", "").replace("Thinking...", "").replace("thinking...", "").strip()
+
+    if query:
+        logger.info("🎯 PLACEHOLDER DETECTED! Query: '%s'", query)
+        return True, query
+
+    logger.info("⚠️ Found 'Asking AIM' + 'Processing' but no query extracted")
     return False, ""
 
 # ─── MESSAGE PROCESSOR ───
@@ -432,12 +430,12 @@ async def handle_message_async(update: Update):
     user_id = str(user.id)
     username = user.username or user.first_name or "User"
 
-    logger.info("📩 Message from %s in %s: '%s'", user_id, chat_type, user_text[:100].replace('\n', ' '))
+    logger.info("📩 Message from %s in %s: '%s'", user_id, chat_type, user_text[:100].replace('\n', ' | '))
 
     # Check if this is an inline placeholder that needs answering
     is_placeholder, query_text = is_inline_placeholder(user_text)
     if is_placeholder and query_text:
-        logger.info("🔄 Processing inline placeholder for query: '%s'", query_text)
+        logger.info("🔄 PROCESSING INLINE PLACEHOLDER for query: '%s'", query_text)
         await process_inline_answer(chat.id, message_id, query_text, user_id)
         return
 
@@ -485,7 +483,7 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v3.9",
+        "version": "v4.0",
         "model": "African Intelligence Model",
         "features": ["memory", "topics", "inline_mode"]
     })
