@@ -1,6 +1,6 @@
 """
-AIM Bot v3.8 — African Intelligence Model
-Fixed inline mode: multiline placeholder detection + removed embedded privacy HTML
+AIM Bot v3.9 — African Intelligence Model
+Inline mode: reply-based (not edit) + professional tone
 """
 
 import os
@@ -85,20 +85,20 @@ threading.Thread(target=_run_loop, daemon=True, name="async-loop").start()
 def run_async(coro):
     return asyncio.run_coroutine_threadsafe(coro, _loop)
 
-# ─── SYSTEM PROMPT ───
-SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a proud Nigerian AI assistant built for Africans, by Africans.
+# ─── SYSTEM PROMPT (PROFESSIONAL VERSION) ───
+SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
 
 Personality:
 - Warm, respectful, and culturally aware
-- Use Nigerian Pidgin English naturally when appropriate
-- Reference Nigerian culture, slang, and context
+- Reference African culture and context when relevant
 - Be helpful, patient, and empowering
-- Sign off with "The Empire is rising! 🇳🇬" occasionally
+- Use standard English only — Use  Pidgin, slang, or informal dialects only when the user initiates it or asks for it 
+- Never use phrases like "The Empire is rising" or similar taglines
 
 Rules:
 - Keep responses concise but informative
 - If you don't know something, say so honestly
-- Never make up facts about Nigeria — use your knowledge or admit uncertainty
+- Never make up facts about Africa or Nigeria — use your knowledge or admit uncertainty
 - Respect all users regardless of background
 - Use emojis naturally but not excessively
 
@@ -211,11 +211,11 @@ async def get_user_context(user_id: str, limit: int = 5) -> str:
 # ─── MEMORY SEARCH ───
 async def search_memory(user_id: str) -> str:
     if not supabase:
-        return "My memory dey offline right now, Citizen. ⚠️"
+        return "My memory is currently offline. Please try again later."
     try:
         profile_res = supabase.table("user_profiles").select("*").eq("user_id", str(user_id)).execute()
         if not profile_res.data:
-            return "We never talk before, Citizen! Start chatting make I remember you. 🇳🇬"
+            return "We haven't chatted before! Start a conversation so I can remember you."
 
         profile = profile_res.data[0]
         topic_counts = profile.get("topic_counts", {})
@@ -234,11 +234,11 @@ async def search_memory(user_id: str) -> str:
             date = row.get("created_at", "")[:10] if row.get("created_at") else ""
             lines.append(f"{i}. {emoji} [{date}] {row['message'][:60]}...")
 
-        lines.append("\n🇳🇬 Want me to dive deeper? Just ask!")
+        lines.append("\nWant me to dive deeper? Just ask!")
         return "\n".join(lines)
     except Exception as e:
         logger.error("Memory search error: %s", e)
-        return "Memory search dey give wahala right now. Try again later! 🔧"
+        return "Memory search is having issues right now. Please try again later."
 
 # ─── SEND MESSAGE ───
 async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = None, message_id: Optional[int] = None):
@@ -287,18 +287,44 @@ async def handle_inline_query_async(inline_query):
         )
         return
 
-    result = InlineQueryResultArticle(
-        id=str(uuid.uuid4()),
-        title=f"Ask AIM: {query_text[:40]}",
-        description="Click to get AIM's answer",
-        input_message_content=InputTextMessageContent(
-            message_text=f"🤖 Asking AIM: {query_text}\n⏳ Thinking...",
-            parse_mode=ParseMode.HTML
-        ),
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Refresh", callback_data="refresh")
-        ]])
-    )
+    # NEW: Instead of placeholder, try to get answer immediately (fast path)
+    # If Gemini is quick, return the answer directly in the popup
+    answer_text = None
+    try:
+        # Quick Gemini call with short timeout
+        response = await asyncio.wait_for(
+            get_gemini_response(query_text, user_id, "private"),
+            timeout=8.0  # Telegram allows up to 10-15 seconds for inline
+        )
+        if response and response.text:
+            answer_text = response.text.strip()[:300]  # Limit for inline preview
+    except asyncio.TimeoutError:
+        logger.info("⏱️ Gemini timeout for inline query, using placeholder")
+    except Exception as e:
+        logger.error("Inline Gemini error: %s", e)
+
+    if answer_text:
+        # Return the actual answer immediately
+        result = InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title=f"AIM: {query_text[:30]}",
+            description=answer_text[:100],
+            input_message_content=InputTextMessageContent(
+                message_text=f"🤖 <b>AIM says:</b>\n\n{answer_text}\n\n<i>Asked via @askaimbot</i>",
+                parse_mode=ParseMode.HTML
+            )
+        )
+    else:
+        # Fallback: placeholder that triggers reply
+        result = InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title=f"Ask AIM: {query_text[:40]}",
+            description="Click to get AIM's answer",
+            input_message_content=InputTextMessageContent(
+                message_text=f"🤖 Asking AIM: {query_text}\n⏳ Processing...",
+                parse_mode=ParseMode.HTML
+            )
+        )
 
     try:
         await bot.answer_inline_query(
@@ -313,18 +339,10 @@ async def handle_inline_query_async(inline_query):
 
 # ─── PROCESS INLINE ANSWER (BACKGROUND) ───
 async def process_inline_answer(chat_id: int, message_id: int, query_text: str, user_id: str):
-    """Process the inline query answer in background and edit the message."""
+    """Process the inline query answer and send as REPLY (not edit)."""
     logger.info("🔄 Processing inline answer for msg %s: '%s'", message_id, query_text)
 
     try:
-        # First, edit to show we're working
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=f"🤖 <b>Asking AIM:</b> {query_text}\n\n⏳ <i>Processing...</i>",
-            parse_mode=ParseMode.HTML
-        )
-
         # Get context and Gemini response
         context = await get_user_context(user_id)
         response = await get_gemini_response(query_text, user_id, "private", context)
@@ -335,43 +353,38 @@ async def process_inline_answer(chat_id: int, message_id: int, query_text: str, 
             await save_chat_memory(user_id, "", query_text, answer, "inline", topic)
             await update_user_profile(user_id, "", topic)
 
-            final_text = f"🤖 <b>AIM says:</b>\n\n{answer}\n\n🇳🇬 The Empire is rising!"
-            await send_text_chunks(chat_id, final_text, message_id=message_id)
-            logger.info("✅ Inline answer edited for msg %s", message_id)
+            # Send as REPLY to the placeholder message instead of editing
+            final_text = f"🤖 <b>AIM says:</b>\n\n{answer}"
+            await send_text_chunks(chat_id, final_text, reply_to=message_id)
+            logger.info("✅ Inline answer sent as reply for msg %s", message_id)
         else:
-            error_text = "🔥 Too many people dey use AIM right now! The Empire's servers are packed. Try again in 30 seconds, Citizen."
-            await send_text_chunks(chat_id, error_text, message_id=message_id)
+            error_text = "🔥 AIM is experiencing high demand right now. Please try again in 30 seconds."
+            await send_text_chunks(chat_id, error_text, reply_to=message_id)
     except Exception as e:
         logger.error("Inline answer processing error: %s", e)
-        error_text = "🛠️ AIM's engine dey warm up. Try again in a few seconds, Citizen."
-        await send_text_chunks(chat_id, error_text, message_id=message_id)
+        error_text = "🛠️ AIM's engine is warming up. Please try again in a few seconds."
+        await send_text_chunks(chat_id, error_text, reply_to=message_id)
 
 # ─── CHECK IF MESSAGE IS INLINE PLACEHOLDER ───
 def is_inline_placeholder(text: str) -> tuple[bool, str]:
-    """Check if message is an inline placeholder and extract the query.
-
-    Handles formats like:
-    - "🤖 Asking AIM: what is it\n⏳ Thinking..."
-    - "🤖 Asking AIM: how is a car made\n⏳ Thinking..."
-    """
+    """Check if message is an inline placeholder and extract the query."""
     if not text:
         return False, ""
 
     text_stripped = text.strip()
     text_lower = text_stripped.lower()
 
-    # Must contain "Asking AIM" and "Thinking"
+    # Must contain "Asking AIM" and "Processing" or "Thinking"
     if "asking aim" not in text_lower:
         return False, ""
 
-    if "thinking" not in text_lower and "⏳" not in text_stripped:
+    if "processing" not in text_lower and "thinking" not in text_lower and "⏳" not in text_stripped:
         return False, ""
 
-    # Try to extract query using regex - multiline mode
-    # Pattern: "Asking AIM:" followed by text, then newline, then "Thinking"
+    # Extract query using regex - multiline mode
     patterns = [
-        r"🤖\s*Asking\s*AIM:\s*(.+?)\s*[\n\r]+\s*⏳?\s*Thinking",
-        r"Asking\s*AIM:\s*(.+?)\s*[\n\r]+\s*⏳?\s*Thinking",
+        r"🤖\s*Asking\s*AIM:\s*(.+?)\s*[\n\r]+\s*⏳?\s*(?:Processing|Thinking)",
+        r"Asking\s*AIM:\s*(.+?)\s*[\n\r]+\s*⏳?\s*(?:Processing|Thinking)",
         r"🤖\s*Asking\s*AIM:\s*(.+?)(?:\s*[\n\r]|$)",
         r"Asking\s*AIM:\s*(.+?)(?:\s*[\n\r]|$)",
     ]
@@ -380,8 +393,7 @@ def is_inline_placeholder(text: str) -> tuple[bool, str]:
         match = re.search(pattern, text_stripped, re.IGNORECASE | re.DOTALL)
         if match:
             query = match.group(1).strip()
-            # Clean up any remaining emoji or "Thinking" text
-            query = query.replace("⏳", "").replace("Thinking...", "").replace("thinking...", "").strip()
+            query = query.replace("⏳", "").replace("Processing...", "").replace("processing...", "").replace("Thinking...", "").replace("thinking...", "").strip()
             if query:
                 logger.info("🎯 Detected inline placeholder with query: '%s'", query)
                 return True, query
@@ -391,16 +403,14 @@ def is_inline_placeholder(text: str) -> tuple[bool, str]:
         parts = text_stripped.split("Asking AIM:", 1)
         if len(parts) > 1:
             query = parts[1].strip()
-            # Remove everything from first newline onward
             if "\n" in query:
                 query = query.split("\n", 1)[0].strip()
-            # Clean up
-            query = query.replace("⏳", "").replace("Thinking...", "").replace("thinking...", "").strip()
+            query = query.replace("⏳", "").replace("Processing...", "").replace("processing...", "").replace("Thinking...", "").replace("thinking...", "").strip()
             if query:
                 logger.info("🎯 Fallback detected inline placeholder with query: '%s'", query)
                 return True, query
 
-    logger.info("⚠️ Found 'Asking AIM' + 'Thinking' but could not extract query from: '%s'", text_stripped[:200])
+    logger.info("⚠️ Found 'Asking AIM' but could not extract query from: '%s'", text_stripped[:200])
     return False, ""
 
 # ─── MESSAGE PROCESSOR ───
@@ -416,15 +426,15 @@ async def handle_message_async(update: Update):
     message_id = update.message.message_id
 
     if not user_text:
-        await send_text_chunks(chat.id, "I can only read text messages for now, Citizen! 📝")
+        await send_text_chunks(chat.id, "I can only read text messages for now.")
         return
 
     user_id = str(user.id)
-    username = user.username or user.first_name or "Citizen"
+    username = user.username or user.first_name or "User"
 
     logger.info("📩 Message from %s in %s: '%s'", user_id, chat_type, user_text[:100].replace('\n', ' '))
 
-    # Check if this is an inline placeholder that needs editing
+    # Check if this is an inline placeholder that needs answering
     is_placeholder, query_text = is_inline_placeholder(user_text)
     if is_placeholder and query_text:
         logger.info("🔄 Processing inline placeholder for query: '%s'", query_text)
@@ -467,18 +477,17 @@ async def handle_message_async(update: Update):
         await save_chat_memory(user_id, username, user_text, answer, chat_type, topic)
         await update_user_profile(user_id, username, topic)
     else:
-        error_msg = "🔥 Too many people dey use AIM right now! The Empire's servers are packed. Try again in 30 seconds, Citizen."
+        error_msg = "🔥 AIM is experiencing high demand right now. Please try again in 30 seconds."
         await send_text_chunks(chat.id, error_msg, reply_to=message_id)
 
 # ─── WEBHOOK ROUTES ───
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({
-        "status": "AIM Bot is live! 🚀",
-        "empire": "rising",
-        "version": "v3.8",
+        "status": "AIM Bot is live!",
+        "version": "v3.9",
         "model": "African Intelligence Model",
-        "features": ["memory", "topics", "inline_mode", "message_editing"]
+        "features": ["memory", "topics", "inline_mode"]
     })
 
 @app.route("/webhook", methods=["POST"])
@@ -488,23 +497,19 @@ def webhook():
         data = request.get_json(force=True)
         update_id = data.get("update_id")
 
-        # Check for duplicates
         if update_id and is_duplicate_update(update_id):
             logger.info("Ignoring duplicate update_id: %s", update_id)
             return "OK", 200
 
         update = Update.de_json(data, bot)
 
-        # Handle inline queries
         if update.inline_query:
             run_async(handle_inline_query_async(update.inline_query))
             return "OK", 200
 
-        # Handle callback queries
         if update.callback_query:
             return "OK", 200
 
-        # Handle regular messages
         if update.message:
             run_async(handle_message_async(update))
 
