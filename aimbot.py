@@ -447,7 +447,7 @@ async def search_memory_by_keyword(user_id: str, query_text: str) -> str:
             date = row.get("created_at", "")[:10] if row.get("created_at") else ""
             msg_preview = row["message"][:80] if row["message"] else ""
             resp_preview = row["response"][:120] if row["response"] else ""
-            lines.append(f"\n{i}. {emoji} [{date}] You: "{msg_preview}..."")
+            lines.append(f'\n{i}. {emoji} [{date}] You: "{msg_preview}..."')
             lines.append(f"   AIM: "{resp_preview}..."")
 
         return "\n".join(lines)
