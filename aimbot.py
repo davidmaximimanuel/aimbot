@@ -1,6 +1,6 @@
 """
-AIM Bot v4.0 — African Intelligence Model
-Ultra-simple inline placeholder detection + professional tone
+AIM Bot v5.0 — African Intelligence Model
+Smart Memory + User Preferences + Professional Tone
 """
 
 import os
@@ -10,8 +10,9 @@ import uuid
 import asyncio
 import logging
 import threading
-from datetime import datetime, timezone
-from typing import Optional
+import re
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Tuple
 
 from flask import Flask, request, jsonify
 from telegram import (
@@ -83,14 +84,14 @@ threading.Thread(target=_run_loop, daemon=True, name="async-loop").start()
 def run_async(coro):
     return asyncio.run_coroutine_threadsafe(coro, _loop)
 
-# ─── SYSTEM PROMPT (PROFESSIONAL VERSION) ───
-SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
+# ─── BASE SYSTEM PROMPT ───
+BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
 
 Personality:
 - Warm, respectful, and culturally aware
 - Reference African culture and context when relevant
 - Be helpful, patient, and empowering
-- Use standard English only — Pidgin, slang, or informal dialects only wen initiated by the user
+- Use standard English only — Pidgin, slang, or informal dialects only when initiated by the user
 - Never use phrases like "The Empire is rising" or similar taglines
 
 Rules:
@@ -101,24 +102,77 @@ Rules:
 - Use emojis naturally but not excessively
 
 Current date: {date}
-""".format(date=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+"""
+
+# ─── USER PREFERENCE INJECTION ───
+async def get_user_profile_data(user_id: str) -> dict:
+    """Fetch user profile from Supabase."""
+    if not supabase:
+        return {}
+    try:
+        rows = supabase.table("user_profiles").select("*").eq("user_id", str(user_id)).execute()
+        if rows.data:
+            return rows.data[0]
+        return {}
+    except Exception as e:
+        logger.error("Profile fetch error: %s", e)
+        return {}
+
+def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, context: str = "") -> str:
+    """Build full prompt with user preferences and memory context."""
+
+    # Start with base system prompt
+    prompt_parts = [BASE_SYSTEM_PROMPT.format(date=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))]
+
+    # Add user preferences section
+    pref_language = profile.get("preferred_language", "english")
+    timezone_str = profile.get("timezone", "Africa/Lagos")
+    topic_counts = profile.get("topic_counts", {})
+    total_chats = profile.get("total_chats", 0)
+
+    pref_lines = ["\n--- USER PREFERENCES ---"]
+    pref_lines.append(f"- User ID: {user_id}")
+    pref_lines.append(f"- Preferred language: {pref_language}")
+    pref_lines.append(f"- Timezone: {timezone_str}")
+    pref_lines.append(f"- Total chats together: {total_chats}")
+
+    if topic_counts:
+        top_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        pref_lines.append(f"- Top interests: {', '.join(f'{k}({v})' for k, v in top_topics)}")
+
+    # CRITICAL: Language instruction based on preference
+    if pref_language.lower() == "english":
+        pref_lines.append("- LANGUAGE RULE: Respond in standard English ONLY. Do NOT use Pidgin, Nigerian slang, or informal dialects unless the user explicitly asks you to.")
+
+    pref_lines.append("--- END PREFERENCES ---\n")
+    prompt_parts.append("\n".join(pref_lines))
+
+    # Add memory context
+    if context:
+        prompt_parts.append(f"\n--- RELEVANT MEMORY ---\n{context}\n--- END MEMORY ---\n")
+
+    # Add current question
+    prompt_parts.append(f"\nUSER QUESTION: {user_text}")
+
+    return "\n".join(prompt_parts)
 
 # ─── GEMINI API ───
-async def get_gemini_response(user_text: str, user_id: str, chat_type: str, context: str = "") -> Optional[types.GenerateContentResponse]:
+async def get_gemini_response(user_text: str, user_id: str, chat_type: str, profile: dict = None, context: str = "") -> Optional[types.GenerateContentResponse]:
     if not gemini_client:
         return None
 
     try:
-        prompt = user_text
-        if context:
-            prompt = f"Context from previous chats:\n{context}\n\nUser question: {user_text}"
+        if profile is None:
+            profile = await get_user_profile_data(user_id)
+
+        prompt = build_enhanced_prompt(user_text, user_id, profile, context)
 
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash-lite",
             contents=[
                 types.Content(
                     role="user",
-                    parts=[types.Part(text=SYSTEM_PROMPT + "\n\n" + prompt)]
+                    parts=[types.Part(text=prompt)]
                 )
             ],
             config=types.GenerateContentConfig(
@@ -191,7 +245,8 @@ async def update_user_profile(user_id: str, username: str, topic: str):
     except Exception as e:
         logger.error("❌ Profile update failed: %s", e)
 
-async def get_user_context(user_id: str, limit: int = 5) -> str:
+async def get_user_context(user_id: str, limit: int = 15) -> str:
+    """Get last N chats for context injection."""
     if not supabase:
         return ""
     try:
@@ -206,8 +261,202 @@ async def get_user_context(user_id: str, limit: int = 5) -> str:
     except Exception:
         return ""
 
-# ─── MEMORY SEARCH ───
+async def get_relevant_context(user_id: str, query_text: str, limit: int = 15) -> str:
+    """Get context sorted by relevance to query (topic match + recency)."""
+    if not supabase:
+        return ""
+    try:
+        # Get last 30 chats
+        rows = supabase.table("chat_memory").select("message, response, topic, created_at")\
+            .eq("user_id", str(user_id)).order("created_at", desc=True).limit(30).execute()
+        if not rows.data:
+            return ""
+
+        # Score each chat by relevance
+        query_lower = query_text.lower()
+        keyword_topics = {
+            "space": ["tech", "science"],
+            "nigeria": ["general", "politics", "entertainment"],
+            "money": ["finance"],
+            "job": ["career"],
+            "health": ["health"],
+            "love": ["relationships"],
+            "sport": ["sports"],
+            "music": ["entertainment"],
+            "school": ["education"],
+            "code": ["tech"],
+            "programming": ["tech"],
+            "ai": ["tech"],
+            "goat": ["general", "education"],
+            "animal": ["general", "education"]
+        }
+
+        # Find matching topics for query
+        matched_topics = set()
+        for keyword, topics in keyword_topics.items():
+            if keyword in query_lower:
+                matched_topics.update(topics)
+
+        scored = []
+        for row in rows.data:
+            score = 0
+            # Recency score (newer = higher)
+            age_days = (datetime.now(timezone.utc) - datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))).days
+            score += max(0, 30 - age_days)
+
+            # Topic match score
+            if row.get("topic") in matched_topics:
+                score += 50
+
+            # Keyword match in message/response
+            msg_resp = f"{row['message']} {row['response']}".lower()
+            for word in query_lower.split():
+                if len(word) > 3 and word in msg_resp:
+                    score += 10
+
+            scored.append((score, row))
+
+        # Sort by score, take top N
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_rows = scored[:limit]
+
+        context_parts = []
+        for _, row in top_rows:
+            context_parts.append(f"[{row.get('topic', 'general')}] User: {row['message']} | AIM: {row['response']}")
+
+        return "\n".join(context_parts)
+    except Exception as e:
+        logger.error("Relevant context error: %s", e)
+        return await get_user_context(user_id, limit)
+
+# ─── SMART MEMORY SEARCH ───
+def is_memory_search_query(user_text: str) -> bool:
+    """Detect if user is asking about past conversations."""
+    if not user_text:
+        return False
+
+    memory_keywords = [
+        "what did we talk about",
+        "what have we discussed",
+        "remember our chats",
+        "my memory",
+        "our conversations",
+        "what did i ask you",
+        "what were we talking about",
+        "we were talking about",
+        "we discussed",
+        "tell me about",
+        "what did we say about",
+        "remember when",
+        "do you remember",
+        "what about that time",
+        "didn't we talk about"
+    ]
+
+    text_lower = user_text.lower()
+    return any(kw in text_lower for kw in memory_keywords)
+
+def extract_search_keywords(user_text: str) -> list:
+    """Extract keywords from memory search query."""
+    # Remove common phrases
+    clean = user_text.lower()
+    for phrase in ["what did we talk about", "what were we talking about", "we were talking about",
+                   "tell me about", "what did we say about", "do you remember", "remember when",
+                   "what about", "didn't we talk about", "what have we discussed"]:
+        clean = clean.replace(phrase, "")
+
+    # Remove punctuation and split
+    clean = re.sub(r'[^\w\s]', ' ', clean)
+    words = [w.strip() for w in clean.split() if len(w.strip()) > 2]
+
+    # Filter out stop words
+    stop_words = {"the", "and", "about", "were", "did", "have", "what", "when", "that", "this", "with", "for", "from", "you", "are", "was", "is", "it", "we", "our", "me", "my", "i", "a", "an", "to", "of", "in", "on", "at", "be", "been", "being", "do", "does", "did", "can", "could", "would", "should", "will", "shall", "may", "might", "must", "shall", "say", "said", "get", "got", "go", "went", "come", "came", "know", "knew", "think", "thought", "take", "took", "see", "saw", "want", "wanted", "use", "used", "find", "found", "give", "gave", "tell", "told", "ask", "asked", "work", "worked", "seem", "seemed", "feel", "felt", "try", "tried", "leave", "left", "call", "called", "good", "new", "first", "last", "long", "great", "little", "own", "other", "old", "right", "big", "high", "different", "small", "large", "next", "early", "young", "important", "few", "public", "bad", "same", "able"}
+
+    keywords = [w for w in words if w not in stop_words]
+    return keywords
+
+async def search_memory_by_keyword(user_id: str, query_text: str) -> str:
+    """Search memory for specific topics/keywords."""
+    if not supabase:
+        return "My memory is currently offline. Please try again later."
+
+    try:
+        keywords = extract_search_keywords(query_text)
+        logger.info("🔍 Memory search keywords: %s", keywords)
+
+        if not keywords:
+            # Fallback to general memory summary
+            return await search_memory(user_id)
+
+        # Try keyword search across messages and responses
+        all_results = []
+
+        for keyword in keywords[:3]:  # Check top 3 keywords
+            # Search in messages
+            msg_results = supabase.table("chat_memory").select("*")\
+                .eq("user_id", str(user_id))\
+                .ilike("message", f"%{keyword}%")\
+                .order("created_at", desc=True).limit(5).execute()
+
+            # Search in responses
+            resp_results = supabase.table("chat_memory").select("*")\
+                .eq("user_id", str(user_id))\
+                .ilike("response", f"%{keyword}%")\
+                .order("created_at", desc=True).limit(5).execute()
+
+            all_results.extend(msg_results.data)
+            all_results.extend(resp_results.data)
+
+        # Also search by topic inference
+        topic_map = {
+            "space": "tech", "nigeria": "general", "money": "finance", "job": "career",
+            "health": "health", "love": "relationships", "sport": "sports", "music": "entertainment",
+            "school": "education", "code": "tech", "programming": "tech", "ai": "tech",
+            "goat": "general", "animal": "general", "bleat": "general"
+        }
+
+        for keyword in keywords:
+            if keyword in topic_map:
+                topic_results = supabase.table("chat_memory").select("*")\
+                    .eq("user_id", str(user_id))\
+                    .eq("topic", topic_map[keyword])\
+                    .order("created_at", desc=True).limit(5).execute()
+                all_results.extend(topic_results.data)
+
+        # Deduplicate by ID
+        seen_ids = set()
+        unique_results = []
+        for row in all_results:
+            if row["id"] not in seen_ids:
+                seen_ids.add(row["id"])
+                unique_results.append(row)
+
+        # Sort by date
+        unique_results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+        if not unique_results:
+            return f"I don't recall us discussing {' '.join(keywords)}. Would you like to start a new conversation about it?"
+
+        # Build response
+        lines = [f"🔍 I found {len(unique_results)} conversation(s) about that:"]
+
+        for i, row in enumerate(unique_results[:5], 1):
+            emoji = {"career": "💼", "finance": "💰", "tech": "💻", "sports": "⚽",
+                     "health": "🏥", "relationships": "❤️", "politics": "🏛️",
+                     "entertainment": "🎬", "education": "📚"}.get(row.get("topic"), "💬")
+            date = row.get("created_at", "")[:10] if row.get("created_at") else ""
+            msg_preview = row["message"][:80] if row["message"] else ""
+            resp_preview = row["response"][:120] if row["response"] else ""
+            lines.append(f"\n{i}. {emoji} [{date}] You: "{msg_preview}..."")
+            lines.append(f"   AIM: "{resp_preview}..."")
+
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error("Keyword memory search error: %s", e)
+        return "I found something in my memory, but I'm having trouble organizing it. Please try again."
+
 async def search_memory(user_id: str) -> str:
+    """General memory summary."""
     if not supabase:
         return "My memory is currently offline. Please try again later."
     try:
@@ -226,8 +475,8 @@ async def search_memory(user_id: str) -> str:
                  f"💬 Total Chats: {total_chats}", "", "📝 Recent Conversations:"]
 
         for i, row in enumerate(memory_res.data[:5], 1):
-            emoji = {"career": "💼", "finance": "💰", "tech": "💻", "sports": "⚽", 
-                     "health": "🏥", "relationships": "❤️", "politics": "🏛️", 
+            emoji = {"career": "💼", "finance": "💰", "tech": "💻", "sports": "⚽",
+                     "health": "🏥", "relationships": "❤️", "politics": "🏛️",
                      "entertainment": "🎬", "education": "📚"}.get(row.get("topic"), "💬")
             date = row.get("created_at", "")[:10] if row.get("created_at") else ""
             lines.append(f"{i}. {emoji} [{date}] {row['message'][:60]}...")
@@ -288,8 +537,9 @@ async def handle_inline_query_async(inline_query):
     # Try fast path: get Gemini answer within 8 seconds
     answer_text = None
     try:
+        profile = await get_user_profile_data(user_id)
         response = await asyncio.wait_for(
-            get_gemini_response(query_text, user_id, "private"),
+            get_gemini_response(query_text, user_id, "private", profile),
             timeout=8.0
         )
         if response and response.text:
@@ -339,8 +589,9 @@ async def process_inline_answer(chat_id: int, message_id: int, query_text: str, 
     logger.info("🔄 Processing inline answer for msg %s: '%s'", message_id, query_text)
 
     try:
-        context = await get_user_context(user_id)
-        response = await get_gemini_response(query_text, user_id, "private", context)
+        profile = await get_user_profile_data(user_id)
+        context = await get_relevant_context(user_id, query_text)
+        response = await get_gemini_response(query_text, user_id, "private", profile, context)
 
         if response and response.text:
             answer = response.text.strip()
@@ -360,48 +611,34 @@ async def process_inline_answer(chat_id: int, message_id: int, query_text: str, 
         await send_text_chunks(chat_id, error_text, reply_to=message_id)
 
 # ─── CHECK IF MESSAGE IS INLINE PLACEHOLDER ───
-def is_inline_placeholder(text: str) -> tuple[bool, str]:
-    """Ultra-simple check: does this look like an inline placeholder?
-
-    Expected format from Telegram:
-    🤖 Asking AIM: [question]
-    ⏳ Processing...
-    """
+def is_inline_placeholder(text: str) -> Tuple[bool, str]:
+    """Ultra-simple check: does this look like an inline placeholder?"""
     if not text:
         return False, ""
 
     text_clean = text.strip()
     text_lower = text_clean.lower()
 
-    # Log what we received for debugging
     logger.info("🔍 Checking if placeholder: '%s'", text_clean[:200].replace('\n', ' | '))
 
-    # MUST contain "asking aim" (case insensitive)
     if "asking aim" not in text_lower:
         return False, ""
 
-    # MUST contain "processing" or "thinking" (case insensitive)
     has_processing = "processing" in text_lower or "thinking" in text_lower
     if not has_processing:
         return False, ""
 
-    # Extract the question: everything between "Asking AIM:" and the newline before "Processing"
-    # Split by "Asking AIM:" (case insensitive)
     parts = text_clean.split(":", 1)
     if len(parts) < 2:
         return False, ""
 
-    # parts[0] = "🤖 Asking AIM"
-    # parts[1] = " tell him I never said...\n⏳ Processing..."
     after_prefix = parts[1].strip()
 
-    # Remove everything from the first newline onward
     if "\n" in after_prefix:
         query = after_prefix.split("\n", 1)[0].strip()
     else:
         query = after_prefix.strip()
 
-    # Clean up any remaining processing/thinking text
     query = query.replace("⏳", "").replace("Processing...", "").replace("processing...", "").replace("Thinking...", "").replace("thinking...", "").strip()
 
     if query:
@@ -432,6 +669,9 @@ async def handle_message_async(update: Update):
 
     logger.info("📩 Message from %s in %s: '%s'", user_id, chat_type, user_text[:100].replace('\n', ' | '))
 
+    # Fetch user profile for preferences
+    profile = await get_user_profile_data(user_id)
+
     # Check if this is an inline placeholder that needs answering
     is_placeholder, query_text = is_inline_placeholder(user_text)
     if is_placeholder and query_text:
@@ -439,12 +679,15 @@ async def handle_message_async(update: Update):
         await process_inline_answer(chat.id, message_id, query_text, user_id)
         return
 
-    # Check for memory search keywords
-    memory_keywords = ["what did we talk about", "what have we discussed", "remember our chats", 
-                        "my memory", "our conversations", "what did i ask you"]
-    if any(kw in user_text.lower() for kw in memory_keywords):
-        memory_summary = await search_memory(user_id)
-        await send_text_chunks(chat.id, memory_summary, reply_to=message_id)
+    # Check for memory search keywords (BROADER)
+    if is_memory_search_query(user_text):
+        # Check if it's a specific topic search or general summary
+        keywords = extract_search_keywords(user_text)
+        if keywords and len(keywords) > 0:
+            memory_result = await search_memory_by_keyword(user_id, user_text)
+        else:
+            memory_result = await search_memory(user_id)
+        await send_text_chunks(chat.id, memory_result, reply_to=message_id)
         return
 
     # Group mention check
@@ -463,9 +706,9 @@ async def handle_message_async(update: Update):
         elif "askaimbot" in user_text.lower():
             user_text = user_text.lower().replace("askaimbot", "").strip()
 
-    # Normal message processing
-    context = await get_user_context(user_id)
-    response = await get_gemini_response(user_text, user_id, chat_type, context)
+    # Normal message processing — use relevant context, not just last 5
+    context = await get_relevant_context(user_id, user_text)
+    response = await get_gemini_response(user_text, user_id, chat_type, profile, context)
 
     if response and response.text:
         answer = response.text.strip()
@@ -483,9 +726,9 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v4.0",
+        "version": "v5.0",
         "model": "African Intelligence Model",
-        "features": ["memory", "topics", "inline_mode"]
+        "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode"]
     })
 
 @app.route("/webhook", methods=["POST"])
