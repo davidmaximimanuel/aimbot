@@ -632,7 +632,7 @@ async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_
             secs = duration_secs % 60
             time_str = ""
             if mins > 0: time_str += f"{mins} minute{'s' if mins != 1 else ''}"
-            if secs > 0: time_str += f" and {secs} second{'s' if secs != 1 else ''}" if time_str else f"{secs} second{'s' if
+                        if secs > 0: time_str += f" and {secs} second{'s' if secs != 1 else ''}" if time_str else f"{secs} second{'s' if secs != 1 else ''}"
 
 
 # ─── SEND MESSAGE ───
@@ -872,7 +872,7 @@ async def handle_message_async(update: Update):
         return  # Tool handled, stop here. Do not send to Gemini.
 
 
-        
+
     if not user_text:
         await send_text_chunks(chat.id, "I can only read text messages for now.")
         return
