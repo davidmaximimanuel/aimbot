@@ -1,5 +1,5 @@
 """
-AIM Bot v4.1 — African Intelligence Model (Master Clean Build)
+AIM Bot v4.2 — African Intelligence Model (Master Clean Build)
 Smart Memory + User Preferences + Professional Tone + Time Awareness + Tools
 """
 
@@ -118,7 +118,7 @@ def check_timers_background():
 
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
 
-# ─── BASE SYSTEM PROMPT (Strict Professional Tone) ───
+# ─── BASE SYSTEM PROMPT (Strict Professional Tone + Capabilities) ───
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
 
 PERSONALITY & TONE:
@@ -135,6 +135,14 @@ RULES:
 - Never make up facts about Africa or Nigeria.
 - Respect all users regardless of background.
 - Use emojis naturally but not excessively.
+
+CAPABILITIES & TOOLS:
+- Memory: You can recall and search past conversations by topic or keyword
+- Time Tools: You can set timers (hours, minutes, seconds) and run stopwatches
+- Time Awareness: You know the current time and date in Lagos (WAT)
+- Inline Mode: Users can call you in any chat using @askaimbot
+- If a user asks "What can you do?", list these features clearly and professionally
+- If a user says "set a timer", "start stopwatch", or similar, the backend handles it automatically
 
 TIME AWARENESS:
 - Current time and date: {datetime_info}
@@ -413,16 +421,12 @@ async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_
                 await send_text_chunks(chat_id, "You don't have an active stopwatch running.", reply_to=message_id)
                 return True
 
-               # 3. TIMER START (Handles hours, minutes, and seconds)
-                # 3. TIMER START (Handles multi-unit like "1h 30m 15s")
-        # Find all number-unit pairs in the text
         time_parts = re.findall(r'(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)', text_lower)
         
         if time_parts:
             logger.info("⏲️ Timer command detected with parts: %s", time_parts)
             total_seconds = 0
             
-            # Calculate total seconds from all parts
             for amount_str, unit in time_parts:
                 amount = int(amount_str)
                 if unit in ['h', 'hr', 'hrs', 'hour', 'hours']:
@@ -444,7 +448,6 @@ async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_
                     "is_active": True
                 }).execute()
                 
-                # Format the reply message beautifully
                 hrs = total_seconds // 3600
                 mins = (total_seconds % 3600) // 60
                 secs = total_seconds % 60
@@ -456,12 +459,11 @@ async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_
                     else: time_str += f"{mins} minute{'s' if mins != 1 else ''}"
                 if secs > 0:
                     if time_str: time_str += f" and {secs} second{'s' if secs != 1 else ''}"
-                    else: time_str += f"{secs} second{'s' if secs != 1 else ''}"
+                    else: time_str = f"{secs} second{'s' if secs != 1 else ''}"
                     
                 await send_text_chunks(chat_id, f"⏲️ Timer set for {time_str.strip()}! I'll ping you when it's done.", reply_to=message_id)
                 return True
 
-        # 4. CANCEL/STOP TIMER
         if re.search(r'\b(cancel|stop|delete|remove)\s+(the\s+|a\s+)?timer\b', text_lower):
             logger.info("🛑 Cancel timer command detected.")
             res = supabase.table("user_tools").select("*")\
@@ -474,7 +476,7 @@ async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_
             if res.data:
                 row = res.data[0]
                 supabase.table("user_tools").update({"is_active": False}).eq("id", row["id"]).execute()
-                await send_text_chunks(chat_id, " Timer canceled successfully.", reply_to=message_id)
+                await send_text_chunks(chat_id, "🛑 Timer canceled successfully.", reply_to=message_id)
                 return True
             else:
                 await send_text_chunks(chat_id, "You don't have any active timers running.", reply_to=message_id)
@@ -594,7 +596,6 @@ async def handle_message_async(update: Update):
     chat_type = chat.type if chat else "private"
     message_id = update.message.message_id
 
-    # Define these IMMEDIATELY so they are available everywhere
     user_id = str(user.id)
     username = user.username or user.first_name or "User"
 
@@ -602,17 +603,14 @@ async def handle_message_async(update: Update):
         await send_text_chunks(chat.id, "I can only read text messages for now.")
         return
 
-    # 🛑 CHECK FOR TOOLS FIRST (Saves API tokens!)
     if await handle_tool_command(user_id, chat.id, message_id, user_text):
         return 
 
-    # Check if this is an inline placeholder that needs answering
     is_placeholder, query_text = is_inline_placeholder(user_text)
     if is_placeholder and query_text:
         await process_inline_answer(chat.id, message_id, query_text, user_id)
         return
 
-    # Check for memory search keywords
     if is_memory_search_query(user_text):
         keywords = extract_search_keywords(user_text)
         if keywords and len(keywords) > 0:
@@ -622,7 +620,6 @@ async def handle_message_async(update: Update):
         await send_text_chunks(chat.id, memory_result, reply_to=message_id)
         return
 
-    # Group mention check
     if chat_type in ("group", "supergroup"):
         mention_found = "@askaimbot" in user_text.lower() or "askaimbot" in user_text.lower()
         reply_to_bot = False
@@ -634,7 +631,6 @@ async def handle_message_async(update: Update):
         if "@askaimbot" in user_text.lower(): user_text = user_text.lower().replace("@askaimbot", "").strip()
         elif "askaimbot" in user_text.lower(): user_text = user_text.lower().replace("askaimbot", "").strip()
 
-    # Normal message processing
     profile = await get_user_profile_data(user_id)
     context = await get_relevant_context(user_id, user_text)
     response = await get_gemini_response(user_text, user_id, chat_type, profile, context)
@@ -654,7 +650,7 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v4.1",
+        "version": "v4.2",
         "model": "African Intelligence Model",
         "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools"]
     })
