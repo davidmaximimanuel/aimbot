@@ -413,26 +413,45 @@ async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_
                 await send_text_chunks(chat_id, "You don't have an active stopwatch running.", reply_to=message_id)
                 return True
 
-        timer_match = re.search(r'\b(start|set)\s+(a\s+)?timer\s+(for\s+)?(\d+)\s*(m|min|mins|minutes|s|sec|secs|seconds)?\b', text_lower)
+               # 3. TIMER START (Handles hours, minutes, and seconds)
+        timer_match = re.search(r'\b(start|set)\s+(a\s+)?timer\s+(for\s+)?(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)?\b', text_lower)
         if timer_match:
+            logger.info("⏲️ Timer command detected.")
             amount = int(timer_match.group(4))
-            unit = timer_match.group(5) or 'm'
-            duration_secs = amount if unit in ['s', 'sec', 'secs', 'seconds'] else amount * 60
+            unit = timer_match.group(5) or 'm' # Default to minutes if no unit is specified
+            
+            # Calculate total seconds based on unit
+            if unit in ['s', 'sec', 'secs', 'second', 'seconds']:
+                duration_secs = amount
+            elif unit in ['h', 'hr', 'hrs', 'hour', 'hours']:
+                duration_secs = amount * 3600
+            else:
+                duration_secs = amount * 60 # Default to minutes
+                
             target_time = datetime.now(timezone.utc) + timedelta(seconds=duration_secs)
             
             supabase.table("user_tools").insert({
-                "user_id": str(user_id), "tool_type": "timer",
+                "user_id": str(user_id),
+                "tool_type": "timer",
                 "start_time": datetime.now(timezone.utc).isoformat(),
-                "duration_seconds": duration_secs, "target_time": target_time.isoformat(), "is_active": True
+                "duration_seconds": duration_secs,
+                "target_time": target_time.isoformat(),
+                "is_active": True
             }).execute()
             
-            mins = duration_secs // 60
+            # Format the reply message beautifully
+            hrs = duration_secs // 3600
+            mins = (duration_secs % 3600) // 60
             secs = duration_secs % 60
             time_str = ""
-            if mins > 0: time_str += f"{mins} minute{'s' if mins != 1 else ''}"
+            
+            if hrs > 0: time_str += f"{hrs} hour{'s' if hrs != 1 else ''}"
+            if mins > 0:
+                if time_str: time_str += f" and {mins} minute{'s' if mins != 1 else ''}"
+                else: time_str += f"{mins} minute{'s' if mins != 1 else ''}"
             if secs > 0:
                 if time_str: time_str += f" and {secs} second{'s' if secs != 1 else ''}"
-                else: time_str = f"{secs} second{'s' if secs != 1 else ''}"
+                else: time_str += f"{secs} second{'s' if secs != 1 else ''}"
                 
             await send_text_chunks(chat_id, f"⏲️ Timer set for {time_str.strip()}! I'll ping you when it's done.", reply_to=message_id)
             return True
