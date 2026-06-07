@@ -84,7 +84,7 @@ threading.Thread(target=_run_loop, daemon=True, name="async-loop").start()
 def run_async(coro):
     return asyncio.run_coroutine_threadsafe(coro, _loop)
 
-# ─── BASE SYSTEM PROMPT ───
+# ─── BASE SYSTEM PROMPT ───# ─── BASE SYSTEM PROMPT ───
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
 
 Personality:
@@ -101,7 +101,12 @@ Rules:
 - Respect all users regardless of background
 - Use emojis naturally but not excessively
 
-Current date: {date}
+TIME AWARENESS:
+- Current time and date: {datetime_info}
+- Use this time context naturally in your responses
+- If it's late night (10 PM - 6 AM), you may gently suggest rest when appropriate
+- If it's morning, you can say "Good morning" naturally
+- Reference the time only when relevant to the conversation
 """
 
 # ─── USER PREFERENCE INJECTION ───
@@ -120,6 +125,32 @@ async def get_user_profile_data(user_id: str) -> dict:
 
 def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, context: str = "") -> str:
     """Build full prompt with user preferences and memory context."""
+
+    # Get current time in Lagos (WAT = UTC+1)
+    wat_offset = timedelta(hours=1)
+    wat_timezone = timezone(wat_offset)
+    now_wat = datetime.now(wat_timezone)
+    
+    # Format datetime info
+    date_str = now_wat.strftime("%A, %B %d, %Y")  # "Sunday, June 07, 2026"
+    time_str = now_wat.strftime("%I:%M %p")  # "02:47 AM"
+    
+    # Determine time of day
+    hour = now_wat.hour
+    if 5 <= hour < 12:
+        time_of_day = "morning"
+    elif 12 <= hour < 17:
+        time_of_day = "afternoon"
+    elif 17 <= hour < 21:
+        time_of_day = "evening"
+    else:
+        time_of_day = "night"
+    
+    # Build datetime info string
+    datetime_info = f"{time_str} WAT, {date_str} ({time_of_day})"
+
+    # Start with base system prompt
+    prompt_parts = [BASE_SYSTEM_PROMPT.format(datetime_info=datetime_info)]
 
     # Start with base system prompt
     prompt_parts = [BASE_SYSTEM_PROMPT.format(date=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))]

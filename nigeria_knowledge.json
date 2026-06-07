@@ -1,0 +1,42 @@
+{
+  "slang_and_pidgin": [
+    {"phrase": "Japa", "meaning": "To emigrate or leave the country, usually for better opportunities abroad.", "context": "Used when talking about leaving Nigeria for the UK, US, or Canada or any country .", "Example": "Omo , Daniel don Japa oo" },
+    {"phrase": "Sapa", "meaning": "Extreme poverty or being completely broke.", "context": "Used when someone has no money. E.g., 'Sapa is holding me tight.'", "Example": "Omo , Sapa hold me tight oo" },
+    {"phrase": "Wahala", "meaning": "Trouble, problem, or stress.", "context": "Universal. 'No wahala' means no problem.", "Example": "Yeah no wahala nah" },
+    {"phrase": "E go be", "meaning": "It will be okay / It will work out.", "context": "Used to reassure someone.", "Example": "Omo , e go be bro " },
+    {"phrase": "Abeg", "meaning": "Please / I beg you.", "context": "Used to ask for a favor or plead.", "Example": "Abeg come early" },
+    {"phrase": "Oga", "meaning": "Boss, sir, or someone in charge.", "context": "Used to show respect or acknowledge authority.", "Example": "Oga don go church" },
+    {"phrase": "Gbedu", "meaning": "Music, vibes, or a party.", "context": "Used when talking about Afrobeats or nightlife.", "Example": "Omo , the guy dey gbedu" },
+    {"phrase": "Owambe", "meaning": "A large, lively Nigerian party (usually weddings or birthdays) with lots of food and music.", "context": "Weekend social events.", "Example": "e get one owambe for ajah this weekend " },
+    {"phrase": "Urgent 2k", "meaning": "A small amount of money requested urgently, usually for food or transport.", "context": "Joking or serious requests between friends.", "Example": "How far , fid me urgent 2k nah" },
+    {"phrase": "Detty December", "meaning": "The festive period in December when Nigerians spend lavishly and party hard.", "context": "End of year celebrations.", "Example": "e get where dem dey dodetty december ?" },
+    {"phrase": "I don tire", "meaning": "A state of extreme exhaustion or fatigue.", "context": "AFter one has done a hard days job or has been attempting to resolve a problem or is stating a complaint.", "Example": "Omo , I don tire " },
+    {"phrase": " How e be ", "meaning": " How are you / How are things .", "context": " Asking after a person , project or wellbeing.", "Example": "How far , how e be nah" },
+    {"phrase": " nah ", "meaning": " please/urgency.", "context": " Used to signal urgency , plead with someone or just used casually to remind one of a topic.", "Example": "hey do this thing nah" },
+    {"phrase": " omo ", "meaning": " bro or child or man .", "context": " used just how english uses bro or man for example , omo how are you meaning bro how are you .", "Example": "Omo , Daniel don Japa oo" },
+    {"phrase": " I dey go / I don dey go ", "meaning": " I am leaving .", "context": " When one is leaving.", "Example": "Omo , I don dey go " },
+    {"phrase": " e choke / e go far  ", "meaning": " It is too much , or too bad or too strict .", "context": " Signalling that something is too much , more than average or expected .", "Example": "Aha e choke oo" },
+    {"phrase": " Chop ", "meaning": " eat .", "context": " To eat .", "Example": "Omo , I wan chop" },
+    {"phrase": " Sabi ", "meaning": " know .", "context": " when one knows what to do  .", "Example": "Omo , I sabi ball die " },
+    {"phrase": " Oversabi ", "meaning": " Know it all .", "context": " someone who acts asa know it all  .", "Example": "leave am , nah oversabi nah" },
+    {"phrase": " hear word ", "meaning": " listen and obey .", "context": " when one is to listen and obey to instructions or advise given to him or her .", "Example": "Omo , Daniel you ne dey hear word" }
+  ],
+  "cultural_norms": [
+    {"topic": "Greetings", "rule": "Always greet elders first. In many cultures (Yoruba, Igbo, Hausa), men prostrate or bow, and women kneel or curtsy when greeting elders."},
+    {"topic": "Respect", "rule": "Never call an elder by their first name. Use 'Uncle', 'Aunty', 'Sir', 'Ma', or their title (Chief, Doctor, Engineer)."},
+    {"topic": "Food", "rule": "In traditional settings, eating with the right hand is preferred. The left hand is considered unclean."},
+    {"topic": "Time", "rule": "'African Time' is a cultural joke about being late, but in business settings in Lagos/Abuja, punctuality is expected."}
+  ],
+  "geography_and_transport": [
+    {"location": "Lagos", "facts": "Economic capital. Major areas: Island (VI, Lekki, Ikoyi) and Mainland (Yaba, Surulere, Ikeja). Traffic ('Go-slow') is a major daily factor."},
+    {"location": "Abuja", "facts": "Political capital. Planned city. Major areas: Garki, Wuse, Maitama, Asokoro. Generally cleaner and less congested than Lagos."},
+    {"transport": "Ride-hailing", "apps": "Bolt, Uber, and inDriver are the main apps. 'Okada' (motorcycle taxis) are banned in many parts of Lagos but common in other states."}
+  ],
+  "current_events_sources": [
+    {"name": "Punch Newspapers", "url": "https://punchng.com", "category": "General News"},
+    {"name": "The Cable", "url": "https://www.thecable.ng", "category": "Investigative & Policy"},
+    {"name": "Premium Times", "url": "https://www.premiumtimesng.com", "category": "Investigative Journalism"},
+    {"name": "TechCabal", "url": "https://techcabal.com", "category": "Tech & Startups"},
+    {"name": "Legit.ng", "url": "https://www.legit.ng", "category": "Entertainment & Lifestyle"}
+  ]
+}
