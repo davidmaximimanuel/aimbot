@@ -11,6 +11,7 @@ import asyncio
 import logging
 import threading
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 
@@ -83,6 +84,46 @@ threading.Thread(target=_run_loop, daemon=True, name="async-loop").start()
 
 def run_async(coro):
     return asyncio.run_coroutine_threadsafe(coro, _loop)
+
+
+def check_timers_background():
+    """Background thread to check for due timers every 30 seconds."""
+    logger.info("⏲️ Timer background worker started.")
+    while True:
+        time.sleep(30) # Check every 30 seconds
+        if not supabase or not bot:
+            continue
+        try:
+            now_utc = datetime.now(timezone.utc).isoformat()
+            # Find active timers where target_time is in the past
+            res = supabase.table("user_tools").select("*").eq("tool_type", "timer").eq("is_active", True).lte("target_time", now_utc).execute()
+            
+            if res.data:
+                for row in res.data:
+                    user_id = row["user_id"]
+                    duration = row.get("duration_seconds", 0)
+                    
+                    # Mark as inactive immediately so we don't ping twice
+                    supabase.table("user_tools").update({"is_active": False}).eq("id", row["id"]).execute()
+                    
+                    mins = duration // 60
+                    secs = duration % 60
+                    time_str = ""
+                    if mins > 0: time_str += f"{mins} minute{'s' if mins != 1 else ''}"
+                    if secs > 0: time_str += f" and {secs} second{'s' if secs != 1 else ''}" if time_str else f"{secs} second{'s' if secs != 1 else ''}"
+                    
+                    msg = f"⏰ Time's up! Your {time_str.strip()} timer is over."
+                    
+                    # Send message via the async loop
+                    run_async(bot.send_message(chat_id=int(user_id), text=msg))
+                    logger.info("⏰ Timer fired for user %s", user_id)
+        except Exception as e:
+            logger.error("Timer background check error: %s", e)
+
+# Start the background worker thread
+threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
+
+
 
 # ─── BASE SYSTEM PROMPT ───# ─── BASE SYSTEM PROMPT ───
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
@@ -173,7 +214,7 @@ def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, context: 
 
     # CRITICAL: Language instruction based on preference
     if pref_language.lower() == "english":
-        pref_lines.append("- LANGUAGE RULE: Respond in standard English ONLY. Do NOT use Pidgin, Nigerian slang, or informal dialects unless the user explicitly asks you to.")
+        pref_lines.append("- LANGUAGE RULE: Respond in standard English ONLY. ONLY use Pidgin, Nigerian slang, or informal dialects when the user asks you to or initiates.")
 
     pref_lines.append("--- END PREFERENCES ---\n")
     prompt_parts.append("\n".join(pref_lines))
@@ -518,6 +559,82 @@ async def search_memory(user_id: str) -> str:
         logger.error("Memory search error: %s", e)
         return "Memory search is having issues right now. Please try again later."
 
+
+# ─── TOOL COMMAND ROUTER (ZERO API TOKENS) ───
+async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_text: str) -> bool:
+    """Intercepts timer/stopwatch commands. Returns True if handled, False to pass to Gemini."""
+    if not supabase:
+        return False
+        
+    text_lower = user_text.lower().strip()
+    
+    # 1. STOPWATCH START
+    if re.search(r'\b(start|begin)\s+(a\s+)?stopwatch\b', text_lower):
+        try:
+            supabase.table("user_tools").insert({
+                "user_id": str(user_id),
+                "tool_type": "stopwatch",
+                "start_time": datetime.now(timezone.utc).isoformat(),
+                "is_active": True
+            }).execute()
+            await send_text_chunks(chat_id, "⏱️ Stopwatch started! Say 'stop stopwatch' when you're done.", reply_to=message_id)
+            return True
+        except Exception as e:
+            logger.error("Stopwatch start error: %s", e)
+
+    # 2. STOPWATCH STOP
+    if re.search(r'\b(stop|end|finish)\s+(the\s+|a\s+)?stopwatch\b', text_lower):
+        try:
+            res = supabase.table("user_tools").select("*").eq("user_id", str(user_id)).eq("tool_type", "stopwatch").eq("is_active", True).order("created_at", desc=True).limit(1).execute()
+            if res.data:
+                row = res.data[0]
+                start_time = datetime.fromisoformat(row["start_time"].replace("Z", "+00:00"))
+                elapsed = datetime.now(timezone.utc) - start_time
+                total_secs = int(elapsed.total_seconds())
+                mins, secs = divmod(total_secs, 60)
+                
+                supabase.table("user_tools").update({"is_active": False}).eq("id", row["id"]).execute()
+                
+                time_str = f"{mins} minute{'s' if mins != 1 else ''} and {secs} second{'s' if secs != 1 else ''}"
+                if mins == 0: time_str = f"{secs} second{'s' if secs != 1 else ''}"
+                
+                await send_text_chunks(chat_id, f"⏱️ Stopwatch stopped! Time elapsed: {time_str}.", reply_to=message_id)
+                return True
+            else:
+                await send_text_chunks(chat_id, "You don't have an active stopwatch running. Say 'start stopwatch' to begin.", reply_to=message_id)
+                return True
+        except Exception as e:
+            logger.error("Stopwatch stop error: %s", e)
+
+    # 3. TIMER START (Handles "timer 5m", "set timer for 10 minutes", "timer 30s")
+    timer_match = re.search(r'\b(start|set)\s+(a\s+)?timer\s+(for\s+)?(\d+)\s*(m|min|mins|minutes|s|sec|secs|seconds)?\b', text_lower)
+    if timer_match:
+        amount = int(timer_match.group(4))
+        unit = timer_match.group(5) or 'm' # Default to minutes if no unit is specified
+        
+        if unit in ['s', 'sec', 'secs', 'seconds']:
+            duration_secs = amount
+        else:
+            duration_secs = amount * 60
+            
+        target_time = datetime.now(timezone.utc) + timedelta(seconds=duration_secs)
+        try:
+            supabase.table("user_tools").insert({
+                "user_id": str(user_id),
+                "tool_type": "timer",
+                "start_time": datetime.now(timezone.utc).isoformat(),
+                "duration_seconds": duration_secs,
+                "target_time": target_time.isoformat(),
+                "is_active": True
+            }).execute()
+            
+            mins = duration_secs // 60
+            secs = duration_secs % 60
+            time_str = ""
+            if mins > 0: time_str += f"{mins} minute{'s' if mins != 1 else ''}"
+            if secs > 0: time_str += f" and {secs} second{'s' if secs != 1 else ''}" if time_str else f"{secs} second{'s' if
+
+
 # ─── SEND MESSAGE ───
 async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = None, message_id: Optional[int] = None):
     """Send or edit message."""
@@ -679,6 +796,64 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
     logger.info("⚠️ Found 'Asking AIM' + 'Processing' but no query extracted")
     return False, ""
 
+
+# ─── TOOL COMMAND ROUTER (ZERO API TOKENS) ───
+async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_text: str) -> bool:
+    """Intercepts timer/stopwatch commands. Returns True if handled, False to pass to Gemini."""
+    if not supabase:
+        return False
+        
+    text_lower = user_text.lower().strip()
+    
+    # 1. STOPWATCH START
+    if "start stopwatch" in text_lower or "begin stopwatch" in text_lower:
+        try:
+            supabase.table("user_tools").insert({
+                "user_id": str(user_id),
+                "tool_type": "stopwatch",
+                "start_time": datetime.now(timezone.utc).isoformat(),
+                "is_active": True
+            }).execute()
+            await send_text_chunks(chat_id, "⏱️ Stopwatch started! Say 'stop stopwatch' when you're done.", reply_to=message_id)
+            return True
+        except Exception as e:
+            logger.error("Stopwatch start error: %s", e)
+
+    # 2. STOPWATCH STOP
+    if "stop stopwatch" in text_lower or "end stopwatch" in text_lower:
+        try:
+            res = supabase.table("user_tools").select("*")\
+                .eq("user_id", str(user_id))\
+                .eq("tool_type", "stopwatch")\
+                .eq("is_active", True)\
+                .order("created_at", desc=True)\
+                .limit(1).execute()
+                
+            if res.data:
+                row = res.data[0]
+                start_time = datetime.fromisoformat(row["start_time"].replace("Z", "+00:00"))
+                elapsed = datetime.now(timezone.utc) - start_time
+                total_secs = int(elapsed.total_seconds())
+                mins, secs = divmod(total_secs, 60)
+                
+                # Mark as inactive so it doesn't trigger again
+                supabase.table("user_tools").update({"is_active": False}).eq("id", row["id"]).execute()
+                
+                time_str = f"{mins} minute{'s' if mins != 1 else ''} and {secs} second{'s' if secs != 1 else ''}"
+                if mins == 0:
+                    time_str = f"{secs} second{'s' if secs != 1 else ''}"
+                    
+                await send_text_chunks(chat_id, f"⏱️ Stopwatch stopped! Time elapsed: {time_str}.", reply_to=message_id)
+                return True
+            else:
+                await send_text_chunks(chat_id, "You don't have an active stopwatch running. Say 'start stopwatch' to begin.", reply_to=message_id)
+                return True
+        except Exception as e:
+            logger.error("Stopwatch stop error: %s", e)
+
+    return False # If it's not a tool command, pass it to Gemini
+
+
 # ─── MESSAGE PROCESSOR ───
 async def handle_message_async(update: Update):
     """Process incoming messages."""
@@ -691,14 +866,25 @@ async def handle_message_async(update: Update):
     chat_type = chat.type if chat else "private"
     message_id = update.message.message_id
 
+
+    # 🛑 CHECK FOR TOOLS FIRST (Saves API tokens!)
+    if await handle_tool_command(user_id, chat.id, message_id, user_text):
+        return  # Tool handled, stop here. Do not send to Gemini.
+
+
+        
     if not user_text:
         await send_text_chunks(chat.id, "I can only read text messages for now.")
         return
 
-    user_id = str(user.id)
+        user_id = str(user.id)
     username = user.username or user.first_name or "User"
 
     logger.info("📩 Message from %s in %s: '%s'", user_id, chat_type, user_text[:100].replace('\n', ' | '))
+
+    # 🛑 CHECK FOR TOOLS FIRST (Saves API tokens!)
+    if await handle_tool_command(user_id, chat.id, message_id, user_text):
+        return # Tool handled, stop here. Do not send to Gemini.
 
     # Fetch user profile for preferences
     profile = await get_user_profile_data(user_id)
