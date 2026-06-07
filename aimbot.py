@@ -414,47 +414,71 @@ async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_
                 return True
 
                # 3. TIMER START (Handles hours, minutes, and seconds)
-        timer_match = re.search(r'\b(start|set)\s+(a\s+)?timer\s+(for\s+)?(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)?\b', text_lower)
-        if timer_match:
-            logger.info("⏲️ Timer command detected.")
-            amount = int(timer_match.group(4))
-            unit = timer_match.group(5) or 'm' # Default to minutes if no unit is specified
+                # 3. TIMER START (Handles multi-unit like "1h 30m 15s")
+        # Find all number-unit pairs in the text
+        time_parts = re.findall(r'(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)', text_lower)
+        
+        if time_parts:
+            logger.info("⏲️ Timer command detected with parts: %s", time_parts)
+            total_seconds = 0
             
-            # Calculate total seconds based on unit
-            if unit in ['s', 'sec', 'secs', 'second', 'seconds']:
-                duration_secs = amount
-            elif unit in ['h', 'hr', 'hrs', 'hour', 'hours']:
-                duration_secs = amount * 3600
+            # Calculate total seconds from all parts
+            for amount_str, unit in time_parts:
+                amount = int(amount_str)
+                if unit in ['h', 'hr', 'hrs', 'hour', 'hours']:
+                    total_seconds += amount * 3600
+                elif unit in ['m', 'min', 'mins', 'minute', 'minutes']:
+                    total_seconds += amount * 60
+                elif unit in ['s', 'sec', 'secs', 'second', 'seconds']:
+                    total_seconds += amount
+                    
+            if total_seconds > 0:
+                target_time = datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
+                
+                supabase.table("user_tools").insert({
+                    "user_id": str(user_id),
+                    "tool_type": "timer",
+                    "start_time": datetime.now(timezone.utc).isoformat(),
+                    "duration_seconds": total_seconds,
+                    "target_time": target_time.isoformat(),
+                    "is_active": True
+                }).execute()
+                
+                # Format the reply message beautifully
+                hrs = total_seconds // 3600
+                mins = (total_seconds % 3600) // 60
+                secs = total_seconds % 60
+                time_str = ""
+                
+                if hrs > 0: time_str += f"{hrs} hour{'s' if hrs != 1 else ''}"
+                if mins > 0:
+                    if time_str: time_str += f" and {mins} minute{'s' if mins != 1 else ''}"
+                    else: time_str += f"{mins} minute{'s' if mins != 1 else ''}"
+                if secs > 0:
+                    if time_str: time_str += f" and {secs} second{'s' if secs != 1 else ''}"
+                    else: time_str += f"{secs} second{'s' if secs != 1 else ''}"
+                    
+                await send_text_chunks(chat_id, f"⏲️ Timer set for {time_str.strip()}! I'll ping you when it's done.", reply_to=message_id)
+                return True
+
+        # 4. CANCEL/STOP TIMER
+        if re.search(r'\b(cancel|stop|delete|remove)\s+(the\s+|a\s+)?timer\b', text_lower):
+            logger.info("🛑 Cancel timer command detected.")
+            res = supabase.table("user_tools").select("*")\
+                .eq("user_id", str(user_id))\
+                .eq("tool_type", "timer")\
+                .eq("is_active", True)\
+                .order("created_at", desc=True)\
+                .limit(1).execute()
+
+            if res.data:
+                row = res.data[0]
+                supabase.table("user_tools").update({"is_active": False}).eq("id", row["id"]).execute()
+                await send_text_chunks(chat_id, " Timer canceled successfully.", reply_to=message_id)
+                return True
             else:
-                duration_secs = amount * 60 # Default to minutes
-                
-            target_time = datetime.now(timezone.utc) + timedelta(seconds=duration_secs)
-            
-            supabase.table("user_tools").insert({
-                "user_id": str(user_id),
-                "tool_type": "timer",
-                "start_time": datetime.now(timezone.utc).isoformat(),
-                "duration_seconds": duration_secs,
-                "target_time": target_time.isoformat(),
-                "is_active": True
-            }).execute()
-            
-            # Format the reply message beautifully
-            hrs = duration_secs // 3600
-            mins = (duration_secs % 3600) // 60
-            secs = duration_secs % 60
-            time_str = ""
-            
-            if hrs > 0: time_str += f"{hrs} hour{'s' if hrs != 1 else ''}"
-            if mins > 0:
-                if time_str: time_str += f" and {mins} minute{'s' if mins != 1 else ''}"
-                else: time_str += f"{mins} minute{'s' if mins != 1 else ''}"
-            if secs > 0:
-                if time_str: time_str += f" and {secs} second{'s' if secs != 1 else ''}"
-                else: time_str += f"{secs} second{'s' if secs != 1 else ''}"
-                
-            await send_text_chunks(chat_id, f"⏲️ Timer set for {time_str.strip()}! I'll ping you when it's done.", reply_to=message_id)
-            return True
+                await send_text_chunks(chat_id, "You don't have any active timers running.", reply_to=message_id)
+                return True
 
         return False
     except Exception as e:
