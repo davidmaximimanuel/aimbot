@@ -1,5 +1,5 @@
 """
-AIM Bot v6.0 — African Intelligence Model (Master Clean Build)
+AIM Bot v6.1 — African Intelligence Model (Master Clean Build)
 Smart Memory + User Preferences + Professional Tone + Time Awareness + Tools + Web Search
 """
 
@@ -34,7 +34,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("aimbot")
 
-# ── CONFIG ───
+# ─── CONFIG ───
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -121,26 +121,63 @@ def check_timers_background():
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
 
 # ─── WEB SEARCH & LINK TOOLS ───
+def search_web(query: str, max_results: int = 3) -> str:
+    """Search DuckDuckGo and return a summary of results."""
+    try:
+        with DDGS() as ddgs:
+            results = [r for r in ddgs.text(query, max_results=max_results)]
+        if not results:
+            return "No search results found."
+        
+        formatted = []
+        for r in results:
+            formatted.append(f"- Title: {r.get('title', '')}\n  Snippet: {r.get('body', '')}\n  Link: {r.get('href', '')}")
+        return "\n\n".join(formatted)
+    except Exception as e:
+        logger.error("Web search error: %s", e)
+        return "Web search is currently unavailable."
+
+def fetch_url_content(url: str) -> str:
+    """Fetch and extract main text from a URL."""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        for script in soup(["script", "style"]):
+            script.extract()
+            
+        text = soup.get_text(separator=' ', strip=True)
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = ' '.join(chunk for chunk in chunks if chunk)
+        
+        return text[:2000]
+    except Exception as e:
+        logger.error("URL fetch error: %s", e)
+        return "Failed to read the link content."
+
+def detect_urls(text: str) -> list:
+    """Extract URLs from text."""
+    url_pattern = re.compile(r'https?://\S+')
+    return url_pattern.findall(text)
+
 def is_search_query(text: str) -> bool:
     """Detect if user wants a web search or is asking about current events."""
     text_lower = text.lower()
     
-    # 1. Explicit search commands
     explicit_triggers = ["search for", "google", "look up", "find out", "search the web", "browse"]
     if any(trigger in text_lower for trigger in explicit_triggers):
         return True
         
-    # 2. News & Current Events
     news_triggers = ["latest news", "breaking news", "what happened", "what is happening", "current events", "news about"]
     if any(trigger in text_lower for trigger in news_triggers):
         return True
         
-    # 3. Sports & Live Events (Super Eagles, Premier League, etc.)
     sports_triggers = ["playing next", "next match", "who won", "what is the score", "fixture", "upcoming game", "standings", "next game"]
     if any(trigger in text_lower for trigger in sports_triggers):
         return True
         
-    # 4. Time-Sensitive Questions (Who/What/When + time words)
     time_words = ["today", "yesterday", "tomorrow", "tonight", "this week", "currently", "right now", "latest", "new", "next", "recent"]
     question_words = ["who", "what", "when", "where", "how", "which"]
     
@@ -152,40 +189,7 @@ def is_search_query(text: str) -> bool:
         
     return False
 
-def fetch_url_content(url: str) -> str:
-    """Fetch and extract main text from a URL."""
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Remove script and style elements
-        for script in soup(["script", "style"]):
-            script.extract()
-            
-        text = soup.get_text(separator=' ', strip=True)
-        # Clean up whitespace
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = ' '.join(chunk for chunk in chunks if chunk)
-        
-        return text[:2000] # Limit to 2000 chars to save tokens
-    except Exception as e:
-        logger.error("URL fetch error: %s", e)
-        return "Failed to read the link content."
-
-def detect_urls(text: str) -> list:
-    """Extract URLs from text."""
-    url_pattern = re.compile(r'https?://\S+')
-    return url_pattern.findall(text)
-
-def is_search_query(text: str) -> bool:
-    """Detect if user wants a web search."""
-    text_lower = text.lower()
-    search_triggers = ["search for", "google", "look up", "find out", "latest news", "who won", "current price", "what is happening in"]
-    return any(trigger in text_lower for trigger in search_triggers)
-
-# ─── BASE SYSTEM PROMPT ──
+# ─── BASE SYSTEM PROMPT ───
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
 
 PERSONALITY & TONE:
@@ -215,7 +219,7 @@ TIME AWARENESS:
 - Use this time context naturally in your responses (e.g., if it's late night, you may gently suggest rest).
 """
 
-# ─── USER PREFERENCE INJECTION ──
+# ─── USER PREFERENCE INJECTION ───
 async def get_user_profile_data(user_id: str) -> dict:
     if not supabase: return {}
     try:
@@ -305,7 +309,7 @@ async def extract_topic(user_text: str, bot_response: str) -> str:
     except Exception:
         return "general"
 
-# ── MEMORY FUNCTIONS ───
+# ─── MEMORY FUNCTIONS ───
 async def save_chat_memory(user_id: str, username: str, message: str, response: str, chat_type: str, topic: str = "general"):
     if not supabase: return
     try:
@@ -373,7 +377,7 @@ async def get_relevant_context(user_id: str, query_text: str, limit: int = 15) -
         logger.error("Relevant context error: %s", e)
         return ""
 
-# ── SMART MEMORY SEARCH ───
+# ─── SMART MEMORY SEARCH ───
 def is_memory_search_query(user_text: str) -> bool:
     if not user_text: return False
     memory_keywords = [
@@ -423,9 +427,9 @@ async def search_memory_by_keyword(user_id: str, query_text: str) -> str:
 
         if not unique_results: return f"I don't recall us discussing {' '.join(keywords)}. Would you like to start a new conversation about it?"
 
-        lines = [f" I found {len(unique_results)} conversation(s) about that:"]
+        lines = [f"🔍 I found {len(unique_results)} conversation(s) about that:"]
         for i, row in enumerate(unique_results[:5], 1):
-            emoji = {"career": "💼", "finance": "", "tech": "💻", "sports": "⚽", "health": "🏥", "relationships": "❤️", "politics": "🏛️", "entertainment": "", "education": "📚"}.get(row.get("topic"), "💬")
+            emoji = {"career": "💼", "finance": "💰", "tech": "💻", "sports": "⚽", "health": "🏥", "relationships": "❤️", "politics": "🏛️", "entertainment": "🎬", "education": "📚"}.get(row.get("topic"), "💬")
             date = row.get("created_at", "")[:10] if row.get("created_at") else ""
             msg_preview = row["message"][:80] if row["message"] else ""
             resp_preview = row["response"][:120] if row["response"] else ""
@@ -449,7 +453,7 @@ async def search_memory(user_id: str) -> str:
         lines = [f"📊 Your Top Topics: {', '.join(f'{k} ({v}x)' for k, v in sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3])}",
                  f"💬 Total Chats: {total_chats}", "", "📝 Recent Conversations:"]
         for i, row in enumerate(memory_res.data[:5], 1):
-            emoji = {"career": "💼", "finance": "💰", "tech": "💻", "sports": "", "health": "🏥", "relationships": "❤️", "politics": "️", "entertainment": "🎬", "education": "📚"}.get(row.get("topic"), "💬")
+            emoji = {"career": "💼", "finance": "💰", "tech": "💻", "sports": "⚽", "health": "🏥", "relationships": "❤️", "politics": "🏛️", "entertainment": "🎬", "education": "📚"}.get(row.get("topic"), "💬")
             date = row.get("created_at", "")[:10] if row.get("created_at") else ""
             lines.append(f"{i}. {emoji} [{date}] {row['message'][:60]}...")
         lines.append("\nWant me to dive deeper? Just ask!")
@@ -469,7 +473,7 @@ async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_
                 "user_id": str(user_id), "tool_type": "stopwatch",
                 "start_time": datetime.now(timezone.utc).isoformat(), "is_active": True
             }).execute()
-            await send_text_chunks(chat_id, "️ Stopwatch started! Say 'stop stopwatch' when you're done.", reply_to=message_id)
+            await send_text_chunks(chat_id, "⏱️ Stopwatch started! Say 'stop stopwatch' when you're done.", reply_to=message_id)
             return True
 
         if re.search(r'\b(stop|end|finish)\s+(the\s+|a\s+)?stopwatch\b', text_lower):
@@ -574,9 +578,12 @@ async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = No
 
 # ─── INLINE QUERY HANDLER ───
 async def handle_inline_query_async(inline_query):
+    """Handle inline queries with fast path and fallback."""
     query_id = inline_query.id
     query_text = inline_query.query.strip()
     user_id = inline_query.from_user.id if inline_query.from_user else ""
+
+    logger.info("📨 Inline query from %s: '%s'", user_id, query_text)
 
     if not query_text or len(query_text) < 2:
         await bot.answer_inline_query(inline_query_id=query_id, results=[], cache_time=1)
@@ -585,34 +592,55 @@ async def handle_inline_query_async(inline_query):
     answer_text = None
     try:
         profile = await get_user_profile_data(user_id)
-        response = await asyncio.wait_for(get_gemini_response(query_text, user_id, "private", profile), timeout=8.0)
-        if response and response.text: answer_text = response.text.strip()[:300]
+        response = await asyncio.wait_for(
+            get_gemini_response(query_text, user_id, "private", profile),
+            timeout=8.0
+        )
+        if response and response.text:
+            answer_text = response.text.strip()[:300]
     except asyncio.TimeoutError:
-        pass
+        logger.info("⏱️ Gemini timeout for inline query, using placeholder")
     except Exception as e:
         logger.error("Inline Gemini error: %s", e)
 
     if answer_text:
         result = InlineQueryResultArticle(
-            id=str(uuid.uuid4()), title=f"AIM: {query_text[:30]}", description=answer_text[:100],
+            id=str(uuid.uuid4()),
+            title=f"AIM: {query_text[:30]}",
+            description=answer_text[:100],
             input_message_content=InputTextMessageContent(
-                message_text=f"🤖 <b>AIM says:</b>\n\n{answer_text}\n\n<i>Asked via @askaimbot</i>", parse_mode=ParseMode.HTML
+                message_text=f"🤖 <b>AIM says:</b>\n\n{answer_text}\n\n<i>Asked via @askaimbot</i>",
+                parse_mode=ParseMode.HTML
             )
         )
     else:
+        # Fallback: placeholder that triggers reply
+        # NO HTML parse_mode here - plain text for reliable detection
         result = InlineQueryResultArticle(
-            id=str(uuid.uuid4()), title=f"Ask AIM: {query_text[:40]}", description="Click to get AIM's answer",
+            id=str(uuid.uuid4()),
+            title=f"Ask AIM: {query_text[:40]}",
+            description="Click to get AIM's answer",
             input_message_content=InputTextMessageContent(
-                message_text=f"🤖 Asking AIM: {query_text}\n⏳ Processing...", parse_mode=ParseMode.HTML
+                message_text=f"🤖 Asking AIM: {query_text}\n⏳ Processing..."
             )
         )
 
     try:
-        await bot.answer_inline_query(inline_query_id=query_id, results=[result], cache_time=0, is_personal=True)
+        await bot.answer_inline_query(
+            inline_query_id=query_id,
+            results=[result],
+            cache_time=0,
+            is_personal=True
+        )
+        logger.info("✅ Inline query answered for %s", user_id)
     except Exception as e:
         logger.error("❌ Inline query answer failed: %s", e)
 
+# ─── PROCESS INLINE ANSWER (BACKGROUND) ───
 async def process_inline_answer(chat_id: int, message_id: int, query_text: str, user_id: str):
+    """Process the inline query answer and send as REPLY."""
+    logger.info("🔄 Processing inline answer for msg %s: '%s'", message_id, query_text)
+
     try:
         profile = await get_user_profile_data(user_id)
         context = await get_relevant_context(user_id, query_text)
@@ -623,26 +651,42 @@ async def process_inline_answer(chat_id: int, message_id: int, query_text: str, 
             topic = await extract_topic(query_text, answer)
             await save_chat_memory(user_id, "", query_text, answer, "inline", topic)
             await update_user_profile(user_id, "", topic)
+
             final_text = f"🤖 <b>AIM says:</b>\n\n{answer}"
             await send_text_chunks(chat_id, final_text, reply_to=message_id)
+            logger.info("✅ Inline answer sent as reply for msg %s", message_id)
         else:
-            await send_text_chunks(chat_id, "🔥 AIM is experiencing high demand right now. Please try again in 30 seconds.", reply_to=message_id)
+            error_text = "🔥 AIM is experiencing high demand right now. Please try again in 30 seconds."
+            await send_text_chunks(chat_id, error_text, reply_to=message_id)
     except Exception as e:
         logger.error("Inline answer processing error: %s", e)
-        await send_text_chunks(chat_id, "🛠️ AIM's engine is warming up. Please try again in a few seconds.", reply_to=message_id)
+        error_text = "🛠️ AIM's engine is warming up. Please try again in a few seconds."
+        await send_text_chunks(chat_id, error_text, reply_to=message_id)
 
+# ─── CHECK IF MESSAGE IS INLINE PLACEHOLDER ───
 def is_inline_placeholder(text: str) -> Tuple[bool, str]:
-    if not text: return False, ""
+    """Ultra-simple check: does this look like an inline placeholder?"""
+    if not text:
+        return False, ""
+
     text_clean = text.strip()
     text_lower = text_clean.lower()
 
-    if "asking aim" not in text_lower: return False, ""
-    if "processing" not in text_lower and "thinking" not in text_lower: return False, ""
+    logger.info("🔍 Checking if placeholder: '%s'", text_clean[:200].replace('\n', ' | '))
+
+    if "asking aim" not in text_lower:
+        return False, ""
+
+    has_processing = "processing" in text_lower or "thinking" in text_lower
+    if not has_processing:
+        return False, ""
 
     parts = text_clean.split(":", 1)
-    if len(parts) < 2: return False, ""
-    
+    if len(parts) < 2:
+        return False, ""
+
     after_prefix = parts[1].strip()
+
     if "\n" in after_prefix:
         query = after_prefix.split("\n", 1)[0].strip()
     else:
@@ -650,12 +694,18 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
 
     query = query.replace("⏳", "").replace("Processing...", "").replace("processing...", "").replace("Thinking...", "").replace("thinking...", "").strip()
 
-    if query: return True, query
+    if query:
+        logger.info("🎯 PLACEHOLDER DETECTED! Query: '%s'", query)
+        return True, query
+
+    logger.info("⚠️ Found 'Asking AIM' + 'Processing' but no query extracted")
     return False, ""
 
-# ── MESSAGE PROCESSOR ───
+# ─── MESSAGE PROCESSOR ───
 async def handle_message_async(update: Update):
-    if not update.message: return
+    """Process incoming messages."""
+    if not update.message:
+        return
 
     user = update.message.from_user
     chat = update.message.chat
@@ -663,22 +713,28 @@ async def handle_message_async(update: Update):
     chat_type = chat.type if chat else "private"
     message_id = update.message.message_id
 
-    user_id = str(user.id)
-    username = user.username or user.first_name or "User"
-
     if not user_text:
         await send_text_chunks(chat.id, "I can only read text messages for now.")
         return
 
-    if await handle_tool_command(user_id, chat.id, message_id, user_text):
-        return 
+    user_id = str(user.id)
+    username = user.username or user.first_name or "User"
 
+    logger.info("📩 Message from %s in %s: '%s'", user_id, chat_type, user_text[:100].replace('\n', ' | '))
+
+    # Fetch user profile for preferences
+    profile = await get_user_profile_data(user_id)
+
+    # Check if this is an inline placeholder that needs answering
     is_placeholder, query_text = is_inline_placeholder(user_text)
     if is_placeholder and query_text:
+        logger.info("🔄 PROCESSING INLINE PLACEHOLDER for query: '%s'", query_text)
         await process_inline_answer(chat.id, message_id, query_text, user_id)
         return
 
+    # Check for memory search keywords (BROADER)
     if is_memory_search_query(user_text):
+        # Check if it's a specific topic search or general summary
         keywords = extract_search_keywords(user_text)
         if keywords and len(keywords) > 0:
             memory_result = await search_memory_by_keyword(user_id, user_text)
@@ -687,17 +743,25 @@ async def handle_message_async(update: Update):
         await send_text_chunks(chat.id, memory_result, reply_to=message_id)
         return
 
+    # Group mention check
     if chat_type in ("group", "supergroup"):
         mention_found = "@askaimbot" in user_text.lower() or "askaimbot" in user_text.lower()
         reply_to_bot = False
         if update.message.reply_to_message and update.message.reply_to_message.from_user:
             reply_to_bot = update.message.reply_to_message.from_user.is_bot and update.message.reply_to_message.from_user.username == "askaimbot"
 
-        if not mention_found and not reply_to_bot: return
+        if not mention_found and not reply_to_bot:
+            logger.info("Ignoring group message (no @askaimbot)")
+            return
 
-        if "@askaimbot" in user_text.lower(): user_text = user_text.lower().replace("@askaimbot", "").strip()
-        elif "askaimbot" in user_text.lower(): user_text = user_text.lower().replace("askaimbot", "").strip()
+        if "@askaimbot" in user_text.lower():
+            user_text = user_text.lower().replace("@askaimbot", "").strip()
+        elif "askaimbot" in user_text.lower():
+            user_text = user_text.lower().replace("askaimbot", "").strip()
 
+    # Normal message processing — use relevant context, not just last 5
+    context = await get_relevant_context(user_id, user_text)
+    
     # --- WEB CONTEXT INJECTION ---
     web_context = ""
     
@@ -720,16 +784,12 @@ async def handle_message_async(update: Update):
         if search_results and "No search results found" not in search_results:
             web_context += f"Web Search Results for '{user_text}':\n{search_results}"
 
-    # Normal message processing
-    profile = await get_user_profile_data(user_id)
-    context = await get_relevant_context(user_id, user_text)
-    
-    # Pass web_context to the AI
     response = await get_gemini_response(user_text, user_id, chat_type, profile, context, web_context)
 
     if response and response.text:
         answer = response.text.strip()
         await send_text_chunks(chat.id, answer, reply_to=message_id)
+
         topic = await extract_topic(user_text, answer)
         await save_chat_memory(user_id, username, user_text, answer, chat_type, topic)
         await update_user_profile(user_id, username, topic)
@@ -742,18 +802,20 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v6.0",
+        "version": "v6.1",
         "model": "African Intelligence Model",
         "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools", "web_search"]
     })
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    """Receive updates from Telegram."""
     try:
         data = request.get_json(force=True)
         update_id = data.get("update_id")
 
         if update_id and is_duplicate_update(update_id):
+            logger.info("Ignoring duplicate update_id: %s", update_id)
             return "OK", 200
 
         update = Update.de_json(data, bot)
@@ -775,7 +837,8 @@ def webhook():
 
 @app.route("/set-webhook", methods=["GET"])
 def set_webhook():
-    if not bot or not WEBHOOK_URL: return jsonify({"error": "Bot or webhook URL not configured"}), 500
+    if not bot or not WEBHOOK_URL:
+        return jsonify({"error": "Bot or webhook URL not configured"}), 500
     try:
         url = f"{WEBHOOK_URL}/webhook"
         bot.set_webhook(url=url)
@@ -785,7 +848,8 @@ def set_webhook():
 
 @app.route("/delete-webhook", methods=["GET"])
 def delete_webhook():
-    if not bot: return jsonify({"error": "Bot not configured"}), 500
+    if not bot:
+        return jsonify({"error": "Bot not configured"}), 500
     try:
         bot.delete_webhook()
         return jsonify({"status": "Webhook deleted!"})
@@ -795,7 +859,8 @@ def delete_webhook():
 # ─── DEBUG ENDPOINTS ───
 @app.route("/debug/supabase", methods=["GET"])
 def debug_supabase():
-    if not supabase: return jsonify({"error": "Supabase not connected"}), 500
+    if not supabase:
+        return jsonify({"error": "Supabase not connected"}), 500
     try:
         chat_rows = supabase.table("chat_memory").select("*", count="exact").execute()
         profile_rows = supabase.table("user_profiles").select("*", count="exact").execute()
@@ -803,14 +868,15 @@ def debug_supabase():
             "status": "connected",
             "chat_memory_rows": chat_rows.count if hasattr(chat_rows, 'count') else len(chat_rows.data),
             "user_profiles_rows": profile_rows.count if hasattr(profile_rows, 'count') else len(profile_rows.data),
-            "tables": ["chat_memory", "user_profiles", "auth_states", "user_tools", "nigeria_knowledge"]
+            "tables": ["chat_memory", "user_profiles", "auth_states"]
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/memory/<user_id>", methods=["GET"])
 def get_memory(user_id: str):
-    if not supabase: return jsonify({"error": "Supabase not connected"}), 500
+    if not supabase:
+        return jsonify({"error": "Supabase not connected"}), 500
     try:
         rows = supabase.table("chat_memory").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(20).execute()
         return jsonify({"user_id": user_id, "chats": rows.data})
@@ -819,7 +885,8 @@ def get_memory(user_id: str):
 
 @app.route("/profile/<user_id>", methods=["GET"])
 def get_profile(user_id: str):
-    if not supabase: return jsonify({"error": "Supabase not connected"}), 500
+    if not supabase:
+        return jsonify({"error": "Supabase not connected"}), 500
     try:
         rows = supabase.table("user_profiles").select("*").eq("user_id", user_id).execute()
         return jsonify({"user_id": user_id, "profile": rows.data[0] if rows.data else None})
