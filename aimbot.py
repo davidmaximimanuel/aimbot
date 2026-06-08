@@ -1,5 +1,5 @@
 """
-AIM Bot v6.1 — African Intelligence Model (Master Clean Build)
+AIM Bot v6.2 — African Intelligence Model (Master Clean Build)
 Smart Memory + User Preferences + Professional Tone + Time Awareness + Tools + Web Search
 """
 
@@ -164,29 +164,69 @@ def detect_urls(text: str) -> list:
 
 def is_search_query(text: str) -> bool:
     """Detect if user wants a web search or is asking about current events."""
-    text_lower = text.lower()
+    text_lower = text.lower().strip()
     
-    explicit_triggers = ["search for", "google", "look up", "find out", "search the web", "browse"]
+    # Explicit search commands - always search
+    explicit_triggers = ["search for", "google", "look up", "find out", "search the web", "browse", "search"]
     if any(trigger in text_lower for trigger in explicit_triggers):
         return True
-        
-    news_triggers = ["latest news", "breaking news", "what happened", "what is happening", "current events", "news about"]
+    
+    # News and current events
+    news_triggers = [
+        "latest news", "breaking news", "what happened", "what is happening", 
+        "current events", "news about", "recent news", "today's news"
+    ]
     if any(trigger in text_lower for trigger in news_triggers):
         return True
-        
-    sports_triggers = ["playing next", "next match", "who won", "what is the score", "fixture", "upcoming game", "standings", "next game"]
+    
+    # Sports - scores, fixtures, results
+    sports_triggers = [
+        "playing next", "next match", "who won", "what is the score", 
+        "fixture", "upcoming game", "standings", "next game", "match result",
+        "game result", "final score", "champions league", "premier league",
+        "la liga", "world cup", "afcon", "super eagles"
+    ]
     if any(trigger in text_lower for trigger in sports_triggers):
         return True
-        
-    time_words = ["today", "yesterday", "tomorrow", "tonight", "this week", "currently", "right now", "latest", "new", "next", "recent"]
-    question_words = ["who", "what", "when", "where", "how", "which"]
+    
+    # Time-sensitive questions - questions about "now" or recent events
+    time_words = [
+        "today", "yesterday", "tomorrow", "tonight", "this week", 
+        "currently", "right now", "latest", "new", "next", "recent",
+        "now", "just now", "this morning", "this evening", "this afternoon"
+    ]
+    question_words = ["who", "what", "when", "where", "how", "which", "why"]
     
     has_question = any(qw in text_lower.split() for qw in question_words)
     has_time = any(tw in text_lower for tw in time_words)
     
     if has_question and has_time:
         return True
-        
+    
+    # Factual questions that likely need current info
+    factual_patterns = [
+        "price of", "cost of", "exchange rate", "weather", "temperature",
+        "stock price", "bitcoin", "crypto", "currency", "naira to dollar",
+        "dollar to naira", "fuel price", " petrol price", "flight",
+        "flight status", "traffic", "road condition", "event", "concert",
+        "movie release", "album release", "song release"
+    ]
+    if any(pattern in text_lower for pattern in factual_patterns):
+        return True
+    
+    # Questions about specific people/entities that might have recent news
+    entity_patterns = ["president", "governor", "minister", "ceo", "founder", "artist", "musician", "actor", "actress"]
+    if any(pattern in text_lower for pattern in entity_patterns) and has_question:
+        return True
+    
+    # If it's a question and seems factual, be more permissive
+    if has_question and len(text_lower) > 10:
+        # Check if it's asking about something specific
+        specific_words = ["is", "are", "was", "were", "do", "does", "did", "can", "could", "will", "would"]
+        if any(word in text_lower.split() for word in specific_words):
+            # Be permissive for factual questions
+            return True
+    
     return False
 
 # ─── BASE SYSTEM PROMPT ───
@@ -614,8 +654,6 @@ async def handle_inline_query_async(inline_query):
             )
         )
     else:
-        # Fallback: placeholder that triggers reply
-        # NO HTML parse_mode here - plain text for reliable detection
         result = InlineQueryResultArticle(
             id=str(uuid.uuid4()),
             title=f"Ask AIM: {query_text[:40]}",
@@ -722,19 +760,15 @@ async def handle_message_async(update: Update):
 
     logger.info("📩 Message from %s in %s: '%s'", user_id, chat_type, user_text[:100].replace('\n', ' | '))
 
-    # Fetch user profile for preferences
     profile = await get_user_profile_data(user_id)
 
-    # Check if this is an inline placeholder that needs answering
     is_placeholder, query_text = is_inline_placeholder(user_text)
     if is_placeholder and query_text:
         logger.info("🔄 PROCESSING INLINE PLACEHOLDER for query: '%s'", query_text)
         await process_inline_answer(chat.id, message_id, query_text, user_id)
         return
 
-    # Check for memory search keywords (BROADER)
     if is_memory_search_query(user_text):
-        # Check if it's a specific topic search or general summary
         keywords = extract_search_keywords(user_text)
         if keywords and len(keywords) > 0:
             memory_result = await search_memory_by_keyword(user_id, user_text)
@@ -743,7 +777,6 @@ async def handle_message_async(update: Update):
         await send_text_chunks(chat.id, memory_result, reply_to=message_id)
         return
 
-    # Group mention check
     if chat_type in ("group", "supergroup"):
         mention_found = "@askaimbot" in user_text.lower() or "askaimbot" in user_text.lower()
         reply_to_bot = False
@@ -759,13 +792,10 @@ async def handle_message_async(update: Update):
         elif "askaimbot" in user_text.lower():
             user_text = user_text.lower().replace("askaimbot", "").strip()
 
-    # Normal message processing — use relevant context, not just last 5
     context = await get_relevant_context(user_id, user_text)
     
-    # --- WEB CONTEXT INJECTION ---
     web_context = ""
     
-    # 1. Check for Links
     urls = detect_urls(user_text)
     if urls:
         logger.info("🔗 URLs detected: %s", urls)
@@ -777,7 +807,6 @@ async def handle_message_async(update: Update):
         if link_contents:
             web_context += "\n".join(link_contents)
 
-    # 2. Check for Search Intent
     if is_search_query(user_text) and not web_context:
         logger.info("🔍 Search intent detected for: %s", user_text)
         search_results = search_web(user_text)
@@ -802,7 +831,7 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v6.1",
+        "version": "v6.2",
         "model": "African Intelligence Model",
         "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools", "web_search"]
     })
