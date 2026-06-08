@@ -121,21 +121,36 @@ def check_timers_background():
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
 
 # ─── WEB SEARCH & LINK TOOLS ───
-def search_web(query: str, max_results: int = 3) -> str:
-    """Search DuckDuckGo and return a summary of results."""
-    try:
-        with DDGS() as ddgs:
-            results = [r for r in ddgs.text(query, max_results=max_results)]
-        if not results:
-            return "No search results found."
+def is_search_query(text: str) -> bool:
+    """Detect if user wants a web search or is asking about current events."""
+    text_lower = text.lower()
+    
+    # 1. Explicit search commands
+    explicit_triggers = ["search for", "google", "look up", "find out", "search the web", "browse"]
+    if any(trigger in text_lower for trigger in explicit_triggers):
+        return True
         
-        formatted = []
-        for r in results:
-            formatted.append(f"- Title: {r.get('title', '')}\n  Snippet: {r.get('body', '')}\n  Link: {r.get('href', '')}")
-        return "\n\n".join(formatted)
-    except Exception as e:
-        logger.error("Web search error: %s", e)
-        return "Web search is currently unavailable."
+    # 2. News & Current Events
+    news_triggers = ["latest news", "breaking news", "what happened", "what is happening", "current events", "news about"]
+    if any(trigger in text_lower for trigger in news_triggers):
+        return True
+        
+    # 3. Sports & Live Events (Super Eagles, Premier League, etc.)
+    sports_triggers = ["playing next", "next match", "who won", "what is the score", "fixture", "upcoming game", "standings", "next game"]
+    if any(trigger in text_lower for trigger in sports_triggers):
+        return True
+        
+    # 4. Time-Sensitive Questions (Who/What/When + time words)
+    time_words = ["today", "yesterday", "tomorrow", "tonight", "this week", "currently", "right now", "latest", "new", "next", "recent"]
+    question_words = ["who", "what", "when", "where", "how", "which"]
+    
+    has_question = any(qw in text_lower.split() for qw in question_words)
+    has_time = any(tw in text_lower for tw in time_words)
+    
+    if has_question and has_time:
+        return True
+        
+    return False
 
 def fetch_url_content(url: str) -> str:
     """Fetch and extract main text from a URL."""
