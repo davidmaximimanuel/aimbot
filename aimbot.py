@@ -1,6 +1,6 @@
 """
-AIM Bot v4.2 — African Intelligence Model (Master Clean Build)
-Smart Memory + User Preferences + Professional Tone + Time Awareness + Tools
+AIM Bot v6.0 — African Intelligence Model (Master Clean Build)
+Smart Memory + User Preferences + Professional Tone + Time Awareness + Tools + Web Search
 """
 
 import os
@@ -12,8 +12,11 @@ import logging
 import threading
 import re
 import time
+import requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
+from bs4 import BeautifulSoup
+from duckduckgo_search import DDGS
 
 from flask import Flask, request, jsonify
 from telegram import (
@@ -31,7 +34,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("aimbot")
 
-# ─── CONFIG ───
+# ── CONFIG ───
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -86,7 +89,6 @@ def run_async(coro):
 
 # ─── BACKGROUND TIMER WORKER ───
 def check_timers_background():
-    """Background thread to check for due timers every 30 seconds."""
     logger.info("⏲️ Timer background worker started.")
     while True:
         time.sleep(30)
@@ -118,7 +120,57 @@ def check_timers_background():
 
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
 
-# ─── BASE SYSTEM PROMPT (Strict Professional Tone + Capabilities) ───
+# ─── WEB SEARCH & LINK TOOLS ───
+def search_web(query: str, max_results: int = 3) -> str:
+    """Search DuckDuckGo and return a summary of results."""
+    try:
+        with DDGS() as ddgs:
+            results = [r for r in ddgs.text(query, max_results=max_results)]
+        if not results:
+            return "No search results found."
+        
+        formatted = []
+        for r in results:
+            formatted.append(f"- Title: {r.get('title', '')}\n  Snippet: {r.get('body', '')}\n  Link: {r.get('href', '')}")
+        return "\n\n".join(formatted)
+    except Exception as e:
+        logger.error("Web search error: %s", e)
+        return "Web search is currently unavailable."
+
+def fetch_url_content(url: str) -> str:
+    """Fetch and extract main text from a URL."""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.extract()
+            
+        text = soup.get_text(separator=' ', strip=True)
+        # Clean up whitespace
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = ' '.join(chunk for chunk in chunks if chunk)
+        
+        return text[:2000] # Limit to 2000 chars to save tokens
+    except Exception as e:
+        logger.error("URL fetch error: %s", e)
+        return "Failed to read the link content."
+
+def detect_urls(text: str) -> list:
+    """Extract URLs from text."""
+    url_pattern = re.compile(r'https?://\S+')
+    return url_pattern.findall(text)
+
+def is_search_query(text: str) -> bool:
+    """Detect if user wants a web search."""
+    text_lower = text.lower()
+    search_triggers = ["search for", "google", "look up", "find out", "latest news", "who won", "current price", "what is happening in"]
+    return any(trigger in text_lower for trigger in search_triggers)
+
+# ─── BASE SYSTEM PROMPT ──
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
 
 PERSONALITY & TONE:
@@ -137,19 +189,18 @@ RULES:
 - Use emojis naturally but not excessively.
 
 CAPABILITIES & TOOLS:
-- Memory: You can recall and search past conversations by topic or keyword
-- Time Tools: You can set timers (hours, minutes, seconds) and run stopwatches
-- Time Awareness: You know the current time and date in Lagos (WAT)
-- Inline Mode: Users can call you in any chat using @askaimbot
-- If a user asks "What can you do?", list these features clearly and professionally
-- If a user says "set a timer", "start stopwatch", or similar, the backend handles it automatically
+- Memory: You can recall and search past conversations by topic or keyword.
+- Time Tools: You can set timers (hours, minutes, seconds) and run stopwatches.
+- Time Awareness: You know the current time and date in Lagos (WAT).
+- Web Search: You have access to real-time web search results and can read links provided by the user.
+- If a user asks "What can you do?", list these features clearly and professionally.
 
 TIME AWARENESS:
 - Current time and date: {datetime_info}
 - Use this time context naturally in your responses (e.g., if it's late night, you may gently suggest rest).
 """
 
-# ─── USER PREFERENCE INJECTION ───
+# ─── USER PREFERENCE INJECTION ──
 async def get_user_profile_data(user_id: str) -> dict:
     if not supabase: return {}
     try:
@@ -159,8 +210,7 @@ async def get_user_profile_data(user_id: str) -> dict:
         logger.error("Profile fetch error: %s", e)
         return {}
 
-def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, context: str = "") -> str:
-    # Get current time in Lagos (WAT = UTC+1)
+def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, context: str = "", web_context: str = "") -> str:
     wat_offset = timedelta(hours=1)
     wat_timezone = timezone(wat_offset)
     now_wat = datetime.now(wat_timezone)
@@ -175,7 +225,6 @@ def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, context: 
     else: time_of_day = "night"
     
     datetime_info = f"{time_str} WAT, {date_str} ({time_of_day})"
-
     prompt_parts = [BASE_SYSTEM_PROMPT.format(datetime_info=datetime_info)]
 
     pref_language = profile.get("preferred_language", "english")
@@ -199,6 +248,9 @@ def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, context: 
     pref_lines.append("--- END PREFERENCES ---\n")
     prompt_parts.append("\n".join(pref_lines))
 
+    if web_context:
+        prompt_parts.append(f"\n--- WEB CONTEXT (Real-time data provided by system) ---\n{web_context}\n--- END WEB CONTEXT ---\n")
+
     if context:
         prompt_parts.append(f"\n--- RELEVANT MEMORY ---\n{context}\n--- END MEMORY ---\n")
 
@@ -206,11 +258,11 @@ def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, context: 
     return "\n".join(prompt_parts)
 
 # ─── GEMINI API ───
-async def get_gemini_response(user_text: str, user_id: str, chat_type: str, profile: dict = None, context: str = "") -> Optional[types.GenerateContentResponse]:
+async def get_gemini_response(user_text: str, user_id: str, chat_type: str, profile: dict = None, context: str = "", web_context: str = "") -> Optional[types.GenerateContentResponse]:
     if not gemini_client: return None
     try:
         if profile is None: profile = await get_user_profile_data(user_id)
-        prompt = build_enhanced_prompt(user_text, user_id, profile, context)
+        prompt = build_enhanced_prompt(user_text, user_id, profile, context, web_context)
 
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash-lite",
@@ -238,7 +290,7 @@ async def extract_topic(user_text: str, bot_response: str) -> str:
     except Exception:
         return "general"
 
-# ─── MEMORY FUNCTIONS ───
+# ── MEMORY FUNCTIONS ───
 async def save_chat_memory(user_id: str, username: str, message: str, response: str, chat_type: str, topic: str = "general"):
     if not supabase: return
     try:
@@ -306,7 +358,7 @@ async def get_relevant_context(user_id: str, query_text: str, limit: int = 15) -
         logger.error("Relevant context error: %s", e)
         return ""
 
-# ─── SMART MEMORY SEARCH ───
+# ── SMART MEMORY SEARCH ───
 def is_memory_search_query(user_text: str) -> bool:
     if not user_text: return False
     memory_keywords = [
@@ -356,9 +408,9 @@ async def search_memory_by_keyword(user_id: str, query_text: str) -> str:
 
         if not unique_results: return f"I don't recall us discussing {' '.join(keywords)}. Would you like to start a new conversation about it?"
 
-        lines = [f"🔍 I found {len(unique_results)} conversation(s) about that:"]
+        lines = [f" I found {len(unique_results)} conversation(s) about that:"]
         for i, row in enumerate(unique_results[:5], 1):
-            emoji = {"career": "💼", "finance": "💰", "tech": "💻", "sports": "⚽", "health": "🏥", "relationships": "❤️", "politics": "🏛️", "entertainment": "🎬", "education": "📚"}.get(row.get("topic"), "💬")
+            emoji = {"career": "💼", "finance": "", "tech": "💻", "sports": "⚽", "health": "🏥", "relationships": "❤️", "politics": "🏛️", "entertainment": "", "education": "📚"}.get(row.get("topic"), "💬")
             date = row.get("created_at", "")[:10] if row.get("created_at") else ""
             msg_preview = row["message"][:80] if row["message"] else ""
             resp_preview = row["response"][:120] if row["response"] else ""
@@ -382,7 +434,7 @@ async def search_memory(user_id: str) -> str:
         lines = [f"📊 Your Top Topics: {', '.join(f'{k} ({v}x)' for k, v in sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3])}",
                  f"💬 Total Chats: {total_chats}", "", "📝 Recent Conversations:"]
         for i, row in enumerate(memory_res.data[:5], 1):
-            emoji = {"career": "💼", "finance": "💰", "tech": "💻", "sports": "⚽", "health": "🏥", "relationships": "❤️", "politics": "🏛️", "entertainment": "🎬", "education": "📚"}.get(row.get("topic"), "💬")
+            emoji = {"career": "💼", "finance": "💰", "tech": "💻", "sports": "", "health": "🏥", "relationships": "❤️", "politics": "️", "entertainment": "🎬", "education": "📚"}.get(row.get("topic"), "💬")
             date = row.get("created_at", "")[:10] if row.get("created_at") else ""
             lines.append(f"{i}. {emoji} [{date}] {row['message'][:60]}...")
         lines.append("\nWant me to dive deeper? Just ask!")
@@ -402,7 +454,7 @@ async def handle_tool_command(user_id: str, chat_id: int, message_id: int, user_
                 "user_id": str(user_id), "tool_type": "stopwatch",
                 "start_time": datetime.now(timezone.utc).isoformat(), "is_active": True
             }).execute()
-            await send_text_chunks(chat_id, "⏱️ Stopwatch started! Say 'stop stopwatch' when you're done.", reply_to=message_id)
+            await send_text_chunks(chat_id, "️ Stopwatch started! Say 'stop stopwatch' when you're done.", reply_to=message_id)
             return True
 
         if re.search(r'\b(stop|end|finish)\s+(the\s+|a\s+)?stopwatch\b', text_lower):
@@ -586,7 +638,7 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
     if query: return True, query
     return False, ""
 
-# ─── MESSAGE PROCESSOR ───
+# ── MESSAGE PROCESSOR ───
 async def handle_message_async(update: Update):
     if not update.message: return
 
@@ -631,9 +683,34 @@ async def handle_message_async(update: Update):
         if "@askaimbot" in user_text.lower(): user_text = user_text.lower().replace("@askaimbot", "").strip()
         elif "askaimbot" in user_text.lower(): user_text = user_text.lower().replace("askaimbot", "").strip()
 
+    # --- WEB CONTEXT INJECTION ---
+    web_context = ""
+    
+    # 1. Check for Links
+    urls = detect_urls(user_text)
+    if urls:
+        logger.info("🔗 URLs detected: %s", urls)
+        link_contents = []
+        for url in urls:
+            content = fetch_url_content(url)
+            if content and content != "Failed to read the link content.":
+                link_contents.append(f"Content from {url}:\n{content}")
+        if link_contents:
+            web_context += "\n".join(link_contents)
+
+    # 2. Check for Search Intent
+    if is_search_query(user_text) and not web_context:
+        logger.info("🔍 Search intent detected for: %s", user_text)
+        search_results = search_web(user_text)
+        if search_results and "No search results found" not in search_results:
+            web_context += f"Web Search Results for '{user_text}':\n{search_results}"
+
+    # Normal message processing
     profile = await get_user_profile_data(user_id)
     context = await get_relevant_context(user_id, user_text)
-    response = await get_gemini_response(user_text, user_id, chat_type, profile, context)
+    
+    # Pass web_context to the AI
+    response = await get_gemini_response(user_text, user_id, chat_type, profile, context, web_context)
 
     if response and response.text:
         answer = response.text.strip()
@@ -650,9 +727,9 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v4.2",
+        "version": "v6.0",
         "model": "African Intelligence Model",
-        "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools"]
+        "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools", "web_search"]
     })
 
 @app.route("/webhook", methods=["POST"])
