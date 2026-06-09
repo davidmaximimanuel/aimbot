@@ -183,6 +183,16 @@ SEARCH_TRIGGER_PHRASES = [
     "who won afcon",
     "which team won",
     "which country qualified",
+    "who knocked Nigeria out of the world cup",
+    "who stopped which country from qualifying to the word cup",
+    "which club won the champions league",
+    "which club won the league",
+    "who was the topscorer",
+    "whowas the president",
+    "who was head of state",
+    "Help me check",
+    "is it true",
+    "which is it"
 
     # --- General factual / knowledge queries (NEW in v6.5) ---
     "who invented",
@@ -952,6 +962,7 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
     return False, ""
 
 # ─── MESSAGE PROCESSOR ───
+# ─── MESSAGE PROCESSOR ───
 async def handle_message_async(update: Update):
     """Process incoming messages."""
     if not update.message:
@@ -981,11 +992,6 @@ async def handle_message_async(update: Update):
         await process_inline_answer(chat.id, message_id, query_text, user_id)
         return
 
-    # Check for tool commands first (timers, stopwatch — no API tokens used)
-    tool_handled = await handle_tool_command(user_id, chat.id, message_id, user_text)
-    if tool_handled:
-        return
-
     # Check for memory search
     if is_memory_search_query(user_text):
         keywords = extract_search_keywords(user_text)
@@ -996,15 +1002,12 @@ async def handle_message_async(update: Update):
         await send_text_chunks(chat.id, memory_result, reply_to=message_id)
         return
 
-    # Group chat: only respond when mentioned or replied to
+    # Group mention check
     if chat_type in ("group", "supergroup"):
         mention_found = "@askaimbot" in user_text.lower() or "askaimbot" in user_text.lower()
         reply_to_bot = False
         if update.message.reply_to_message and update.message.reply_to_message.from_user:
-            reply_to_bot = (
-                update.message.reply_to_message.from_user.is_bot and
-                update.message.reply_to_message.from_user.username == "askaimbot"
-            )
+            reply_to_bot = update.message.reply_to_message.from_user.is_bot and update.message.reply_to_message.from_user.username == "askaimbot"
 
         if not mention_found and not reply_to_bot:
             logger.info("Ignoring group message (no @askaimbot)")
@@ -1015,12 +1018,18 @@ async def handle_message_async(update: Update):
         elif "askaimbot" in user_text.lower():
             user_text = user_text.lower().replace("askaimbot", "").strip()
 
-    # Pull relevant memory context
+    # --- PROCESS TOOLS (but don't block) ---
+    tool_handled = await handle_tool_command(user_id, chat.id, message_id, user_text)
+    
+    # If it was ONLY a tool command (no other text), return
+    if tool_handled and len(user_text.split()) <= 3:
+        return
+
+    # Continue with normal processing even if tool was handled
     context = await get_relevant_context(user_id, user_text)
-
-    # Build web context
+    
     web_context = ""
-
+    
     urls = detect_urls(user_text)
     if urls:
         logger.info("🔗 URLs detected: %s", urls)
@@ -1033,12 +1042,11 @@ async def handle_message_async(update: Update):
             web_context += "\n".join(link_contents)
 
     if is_search_query(user_text) and not web_context:
-        logger.info("🔍 Search intent detected, calling Brave for: '%s'", user_text[:60])
+        logger.info("🔍 Search intent detected for: %s", user_text)
         search_results = search_brave(user_text)
         if search_results and "No search results found" not in search_results:
             web_context += f"Web Search Results for '{user_text}':\n{search_results}"
 
-    # Generate response
     response = await get_gemini_response(user_text, user_id, chat_type, profile, context, web_context)
 
     if response and response.text:
