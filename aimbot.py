@@ -1,5 +1,5 @@
 """
-AIM Bot v6.2 — African Intelligence Model (Master Clean Build)
+AIM Bot v6.3 — African Intelligence Model (Brave Search Integration)
 Smart Memory + User Preferences + Professional Tone + Time Awareness + Tools + Web Search
 """
 
@@ -16,7 +16,6 @@ import requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
 
 from flask import Flask, request, jsonify
 from telegram import (
@@ -120,21 +119,47 @@ def check_timers_background():
 
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
 
-# ─── WEB SEARCH & LINK TOOLS ───
-def search_web(query: str, max_results: int = 3) -> str:
-    """Search DuckDuckGo and return a summary of results."""
+# ─── BRAVE SEARCH & WEB SCRAPING ───
+def search_brave(query: str, max_results: int = 3) -> str:
+    """Search Brave and scrape results."""
     try:
-        with DDGS() as ddgs:
-            results = [r for r in ddgs.text(query, max_results=max_results)]
+        # Construct Brave Search URL
+        search_url = f"https://search.brave.com/search?q={requests.utils.quote(query)}&lang=en"
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(search_url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Extract search results
+        results = []
+        result_divs = soup.find_all('div', class_='result') or soup.find_all('div', {'data-tid': 'result'})
+        
+        for div in result_divs[:max_results]:
+            title_elem = div.find('div', class_='title') or div.find('a')
+            desc_elem = div.find('div', class_='description') or div.find('span')
+            url_elem = div.find('a', href=True)
+            
+            if title_elem and desc_elem:
+                title = title_elem.get_text(strip=True)
+                desc = desc_elem.get_text(strip=True)
+                url = url_elem['href'] if url_elem else ""
+                results.append(f"- Title: {title}\n  Snippet: {desc}\n  Link: {url}")
+        
         if not results:
+            # Fallback: try to extract any text content
+            main_content = soup.find('main') or soup.find('div', id='results')
+            if main_content:
+                text = main_content.get_text(separator='\n', strip=True)[:1500]
+                if text:
+                    return f"Brave Search Results:\n{text}"
             return "No search results found."
         
-        formatted = []
-        for r in results:
-            formatted.append(f"- Title: {r.get('title', '')}\n  Snippet: {r.get('body', '')}\n  Link: {r.get('href', '')}")
-        return "\n\n".join(formatted)
+        return "\n\n".join(results)
     except Exception as e:
-        logger.error("Web search error: %s", e)
+        logger.error("Brave search error: %s", e)
         return "Web search is currently unavailable."
 
 def fetch_url_content(url: str) -> str:
@@ -166,7 +191,7 @@ def is_search_query(text: str) -> bool:
     """Detect if user wants a web search or is asking about current events."""
     text_lower = text.lower().strip()
     
-    # Explicit search commands - always search
+    # Explicit search commands
     explicit_triggers = ["search for", "google", "look up", "find out", "search the web", "browse", "search"]
     if any(trigger in text_lower for trigger in explicit_triggers):
         return True
@@ -189,7 +214,7 @@ def is_search_query(text: str) -> bool:
     if any(trigger in text_lower for trigger in sports_triggers):
         return True
     
-    # Time-sensitive questions - questions about "now" or recent events
+    # Time-sensitive questions
     time_words = [
         "today", "yesterday", "tomorrow", "tonight", "this week", 
         "currently", "right now", "latest", "new", "next", "recent",
@@ -207,24 +232,22 @@ def is_search_query(text: str) -> bool:
     factual_patterns = [
         "price of", "cost of", "exchange rate", "weather", "temperature",
         "stock price", "bitcoin", "crypto", "currency", "naira to dollar",
-        "dollar to naira", "fuel price", " petrol price", "flight",
+        "dollar to naira", "fuel price", "petrol price", "flight",
         "flight status", "traffic", "road condition", "event", "concert",
         "movie release", "album release", "song release"
     ]
     if any(pattern in text_lower for pattern in factual_patterns):
         return True
     
-    # Questions about specific people/entities that might have recent news
+    # Questions about specific people/entities
     entity_patterns = ["president", "governor", "minister", "ceo", "founder", "artist", "musician", "actor", "actress"]
     if any(pattern in text_lower for pattern in entity_patterns) and has_question:
         return True
     
     # If it's a question and seems factual, be more permissive
     if has_question and len(text_lower) > 10:
-        # Check if it's asking about something specific
         specific_words = ["is", "are", "was", "were", "do", "does", "did", "can", "could", "will", "would"]
         if any(word in text_lower.split() for word in specific_words):
-            # Be permissive for factual questions
             return True
     
     return False
@@ -251,7 +274,7 @@ CAPABILITIES & TOOLS:
 - Memory: You can recall and search past conversations by topic or keyword.
 - Time Tools: You can set timers (hours, minutes, seconds) and run stopwatches.
 - Time Awareness: You know the current time and date in Lagos (WAT).
-- Web Search: You have access to real-time web search results and can read links provided by the user.
+- Web Search: You have access to real-time web search results via Brave Search and can read links provided by the user.
 - If a user asks "What can you do?", list these features clearly and professionally.
 
 TIME AWARENESS:
@@ -618,7 +641,7 @@ async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = No
 
 # ─── INLINE QUERY HANDLER ───
 async def handle_inline_query_async(inline_query):
-    """Handle inline queries with fast path and fallback."""
+    """Handle inline queries with web search support."""
     query_id = inline_query.id
     query_text = inline_query.query.strip()
     user_id = inline_query.from_user.id if inline_query.from_user else ""
@@ -630,10 +653,31 @@ async def handle_inline_query_async(inline_query):
         return
 
     answer_text = None
+    
+    # --- WEB SEARCH FOR INLINE MODE ---
+    web_context = ""
+    
+    urls = detect_urls(query_text)
+    if urls:
+        logger.info("🔗 Inline URLs detected: %s", urls)
+        link_contents = []
+        for url in urls:
+            content = fetch_url_content(url)
+            if content and content != "Failed to read the link content.":
+                link_contents.append(f"Content from {url}:\n{content}")
+        if link_contents:
+            web_context += "\n".join(link_contents)
+    
+    if is_search_query(query_text) and not web_context:
+        logger.info("🔍 Inline search intent detected for: %s", query_text)
+        search_results = search_brave(query_text)
+        if search_results and "No search results found" not in search_results:
+            web_context += f"Web Search Results for '{query_text}':\n{search_results}"
+    
     try:
         profile = await get_user_profile_data(user_id)
         response = await asyncio.wait_for(
-            get_gemini_response(query_text, user_id, "private", profile),
+            get_gemini_response(query_text, user_id, "private", profile, "", web_context),
             timeout=8.0
         )
         if response and response.text:
@@ -809,7 +853,7 @@ async def handle_message_async(update: Update):
 
     if is_search_query(user_text) and not web_context:
         logger.info("🔍 Search intent detected for: %s", user_text)
-        search_results = search_web(user_text)
+        search_results = search_brave(user_text)
         if search_results and "No search results found" not in search_results:
             web_context += f"Web Search Results for '{user_text}':\n{search_results}"
 
@@ -831,9 +875,9 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v6.2",
+        "version": "v6.3",
         "model": "African Intelligence Model",
-        "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools", "web_search"]
+        "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools", "brave_search"]
     })
 
 @app.route("/webhook", methods=["POST"])
