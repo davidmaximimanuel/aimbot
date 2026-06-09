@@ -1,5 +1,5 @@
 """
-AIM Bot v6.3 — African Intelligence Model (Brave Search Integration)
+AIM Bot v6.4 — African Intelligence Model (Semantic Search Routing)
 Smart Memory + User Preferences + Professional Tone + Time Awareness + Tools + Web Search
 """
 
@@ -13,9 +13,11 @@ import threading
 import re
 import time
 import requests
+import numpy as np
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from bs4 import BeautifulSoup
+from sentence_transformers import SentenceTransformer
 
 from flask import Flask, request, jsonify
 from telegram import (
@@ -74,6 +76,76 @@ else:
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
+# ─── SEMANTIC ROUTER INITIALIZATION ───
+logger.info("🧠 Loading semantic router model...")
+semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Pre-define search trigger phrases (these represent "search intent")
+SEARCH_TRIGGER_PHRASES = [
+    "who won the match",
+    "what is the score",
+    "latest news about",
+    "current events",
+    "what happened today",
+    "search for information",
+    "look up",
+    "find out about",
+    "who knocked out",
+    "eliminated from",
+    "when did they win",
+    "what is the price",
+    "exchange rate",
+    "weather forecast",
+    "stock price",
+    "bitcoin price",
+    "currency conversion",
+    "flight status",
+    "traffic update",
+    "road conditions",
+    "event schedule",
+    "concert tickets",
+    "movie release date",
+    "album release",
+    "who is the president",
+    "who is the governor",
+    "latest update on",
+    "recent developments",
+    "breaking news",
+    "current situation",
+    "what is happening now",
+    "live update",
+    "real-time information",
+    "who won the election",
+    "match result",
+    "game outcome",
+    "tournament winner",
+    "championship result",
+    "final score",
+    "standings table",
+    "league table",
+    "fixture list",
+    "upcoming matches",
+    "next game",
+    "who is playing",
+    "schedule for",
+    "when is the match",
+    "kickoff time",
+    "venue information",
+    "ticket prices",
+    "how to watch",
+    "broadcast information",
+    "streaming options",
+    "what did this celebrity do",
+    "Politics",
+    "Sports ",
+    "Entertainment",
+]
+
+# Pre-compute embeddings for trigger phrases (do this once at startup)
+logger.info("🔢 Computing trigger embeddings...")
+trigger_embeddings = semantic_model.encode(SEARCH_TRIGGER_PHRASES)
+logger.info("✅ Semantic router ready!")
+
 # ─── ASYNCIO EVENT LOOP (daemon thread) ───
 _loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
 
@@ -123,7 +195,6 @@ threading.Thread(target=check_timers_background, daemon=True, name="timer-worker
 def search_brave(query: str, max_results: int = 3) -> str:
     """Search Brave and scrape results."""
     try:
-        # Construct Brave Search URL
         search_url = f"https://search.brave.com/search?q={requests.utils.quote(query)}&lang=en"
         
         headers = {
@@ -133,7 +204,6 @@ def search_brave(query: str, max_results: int = 3) -> str:
         response = requests.get(search_url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Extract search results
         results = []
         result_divs = soup.find_all('div', class_='result') or soup.find_all('div', {'data-tid': 'result'})
         
@@ -149,7 +219,6 @@ def search_brave(query: str, max_results: int = 3) -> str:
                 results.append(f"- Title: {title}\n  Snippet: {desc}\n  Link: {url}")
         
         if not results:
-            # Fallback: try to extract any text content
             main_content = soup.find('main') or soup.find('div', id='results')
             if main_content:
                 text = main_content.get_text(separator='\n', strip=True)[:1500]
@@ -187,70 +256,44 @@ def detect_urls(text: str) -> list:
     url_pattern = re.compile(r'https?://\S+')
     return url_pattern.findall(text)
 
+def is_search_query_semantic(text: str, threshold: float = 0.65) -> bool:
+    """
+    Use semantic similarity to detect search intent.
+    Returns True if the text is semantically similar to any trigger phrase.
+    """
+    try:
+        # Encode the user's message
+        query_embedding = semantic_model.encode([text])
+        
+        # Calculate cosine similarity with all trigger phrases
+        similarities = np.dot(trigger_embeddings, query_embedding.T).flatten()
+        
+        # Get the maximum similarity
+        max_similarity = np.max(similarities)
+        
+        # Log for debugging
+        logger.info(f"🔍 Semantic similarity for '{text[:50]}...': {max_similarity:.3f}")
+        
+        # Return True if similarity exceeds threshold
+        return max_similarity >= threshold
+    except Exception as e:
+        logger.error(f"Semantic routing error: {e}")
+        return False
+
 def is_search_query(text: str) -> bool:
-    """Detect if user wants a web search or is asking about current events."""
+    """
+    Hybrid approach: Check explicit triggers first (fast), then semantic (accurate).
+    """
     text_lower = text.lower().strip()
     
-    # Explicit search commands
+    # Fast path: Check for explicit trigger words
     explicit_triggers = ["search for", "google", "look up", "find out", "search the web", "browse", "search"]
     if any(trigger in text_lower for trigger in explicit_triggers):
+        logger.info("🔍 Explicit search trigger detected")
         return True
     
-    # News and current events
-    news_triggers = [
-        "latest news", "breaking news", "what happened", "what is happening", 
-        "current events", "news about", "recent news", "today's news"
-    ]
-    if any(trigger in text_lower for trigger in news_triggers):
-        return True
-    
-    # Sports - scores, fixtures, results
-    sports_triggers = [
-        "playing next", "next match", "who won", "what is the score", 
-        "fixture", "upcoming game", "standings", "next game", "match result",
-        "game result", "final score", "champions league", "premier league",
-        "la liga", "world cup", "afcon", "super eagles"
-    ]
-    if any(trigger in text_lower for trigger in sports_triggers):
-        return True
-    
-    # Time-sensitive questions
-    time_words = [
-        "today", "yesterday", "tomorrow", "tonight", "this week", 
-        "currently", "right now", "latest", "new", "next", "recent",
-        "now", "just now", "this morning", "this evening", "this afternoon"
-    ]
-    question_words = ["who", "what", "when", "where", "how", "which", "why"]
-    
-    has_question = any(qw in text_lower.split() for qw in question_words)
-    has_time = any(tw in text_lower for tw in time_words)
-    
-    if has_question and has_time:
-        return True
-    
-    # Factual questions that likely need current info
-    factual_patterns = [
-        "price of", "cost of", "exchange rate", "weather", "temperature",
-        "stock price", "bitcoin", "crypto", "currency", "naira to dollar",
-        "dollar to naira", "fuel price", "petrol price", "flight",
-        "flight status", "traffic", "road condition", "event", "concert",
-        "movie release", "album release", "song release"
-    ]
-    if any(pattern in text_lower for pattern in factual_patterns):
-        return True
-    
-    # Questions about specific people/entities
-    entity_patterns = ["president", "governor", "minister", "ceo", "founder", "artist", "musician", "actor", "actress"]
-    if any(pattern in text_lower for pattern in entity_patterns) and has_question:
-        return True
-    
-    # If it's a question and seems factual, be more permissive
-    if has_question and len(text_lower) > 10:
-        specific_words = ["is", "are", "was", "were", "do", "does", "did", "can", "could", "will", "would"]
-        if any(word in text_lower.split() for word in specific_words):
-            return True
-    
-    return False
+    # Semantic path: Use embeddings for intent detection
+    return is_search_query_semantic(text)
 
 # ─── BASE SYSTEM PROMPT ───
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
@@ -875,9 +918,9 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v6.3",
+        "version": "v6.4",
         "model": "African Intelligence Model",
-        "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools", "brave_search"]
+        "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools", "brave_search", "semantic_routing"]
     })
 
 @app.route("/webhook", methods=["POST"])
