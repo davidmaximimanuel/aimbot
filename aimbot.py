@@ -280,7 +280,7 @@ def is_search_query_semantic(text: str, threshold: float = 0.65) -> bool:
         logger.error(f"Semantic routing error: {e}")
         return False
 
-def is_search_query(text: str) -> bool:
+def is_search_query_semantic(text: str, threshold: float = 0.60) -> bool:
     """
     Hybrid approach: Check explicit triggers first (fast), then semantic (accurate).
     """
