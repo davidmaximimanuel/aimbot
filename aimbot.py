@@ -322,6 +322,9 @@ SPECIAL INSTRUCTIONS (CRITICAL - FOLLOW EXACTLY):
    - Real-time information (weather, prices, exchange rates, stock prices, etc.)
    - Anything you are not 100% certain about
    - Anything that happened recently (today, yesterday, this week, this month)
+   - Recent scores or results 
+   - data beyond your 2022 knowledge cap 
+   - ANYTHING YOU ARE NOT SURE OF
    
    DO NOT say "I don't know" or "I don't have access".
    DO NOT guess or make up information.
