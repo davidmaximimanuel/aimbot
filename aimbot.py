@@ -1,6 +1,26 @@
 """
-AIM Bot v7.0 — African Intelligence Model (Agentic AI + Deep Research)
+AIM Bot v7.1 — African Intelligence Model (Agentic AI + Deep Research)
 Smart Memory + User Preferences + Professional Tone + Time Awareness + Tools + Web Search + Bot Commands
+
+CHANGES FROM v7.0:
+  - FIXED: search_brave() was scraping search.brave.com directly, which blocks
+    automated requests (robots.txt disallows /search, page is JS-rendered SPA).
+    This caused every search to silently return "No search results found",
+    which triggered the agentic loop's failure branch ("I tried to search...
+    but couldn't find any results").
+  - NEW: search_web() is now the primary search function:
+      1) If BRAVE_API_KEY env var is set, uses the official Brave Search API
+         (api.search.brave.com) — returns clean JSON, free tier 2000 req/month.
+      2) Falls back to DuckDuckGo Lite (lite.duckduckgo.com/lite/), which is
+         server-rendered HTML and scrape-friendly, no API key required.
+  - deep_research() updated to use search_web() for link discovery instead of
+    scraping Brave's results page directly.
+  - search_brave() kept as a thin alias to search_web() for backward compatibility
+    with any other code paths that call it.
+  - Added more debug logging around search calls, plus a new /debug/search
+    endpoint so you can test the search pipeline directly in a browser.
+  - Restored expanded SEARCH_TRIGGER_PHRASES from v6.5 and lowered semantic
+    threshold from 0.65 -> 0.45 (this had been reverted in v7.0).
 """
 
 import os
@@ -42,6 +62,11 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
+# NEW in v7.1: optional Brave Search API key (https://api.search.brave.com)
+# Free tier: 2000 queries/month, no card required to start.
+# If not set, the bot falls back to DuckDuckGo Lite automatically.
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
+
 TELEGRAM_MAX_CHARS = 4096
 
 # ─── DUPLICATE PREVENTION ───
@@ -76,30 +101,157 @@ else:
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
+if BRAVE_API_KEY:
+    logger.info("✅ Brave Search API key found — using Brave API as primary search provider")
+else:
+    logger.warning("⚠️ BRAVE_API_KEY not set — using DuckDuckGo Lite as search provider")
+
 # ─── SEMANTIC ROUTER INITIALIZATION ───
 logger.info("🧠 Loading semantic router model...")
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
 
+# Expanded trigger phrases (restored from v6.5 — v7.0 had reverted to a shorter list)
 SEARCH_TRIGGER_PHRASES = [
-    "who won the match", "what is the score", "latest news about", "current events",
-    "what happened today", "search for information", "look up", "find out about",
-    "who knocked out", "eliminated from", "when did they win", "what is the price",
-    "exchange rate", "weather forecast", "stock price", "bitcoin price",
-    "currency conversion", "flight status", "traffic update", "road conditions",
-    "event schedule", "concert tickets", "movie release date", "album release",
-    "who is the president", "who is the governor", "latest update on",
-    "recent developments", "breaking news", "current situation", "what is happening now",
-    "live update", "real-time information", "who won the election", "match result",
-    "game outcome", "tournament winner", "championship result", "final score",
-    "standings table", "league table", "fixture list", "upcoming matches",
-    "next game", "who is playing", "schedule for", "when is the match",
-    "kickoff time", "venue information", "ticket prices", "how to watch",
-    "broadcast information", "streaming options"
+    # --- Live / real-time ---
+    "who won the match",
+    "what is the score",
+    "latest news about",
+    "current events",
+    "what happened today",
+    "search for information",
+    "look up",
+    "find out about",
+    "who knocked out",
+    "eliminated from",
+    "when did they win",
+    "what is the price",
+    "exchange rate",
+    "weather forecast",
+    "stock price",
+    "bitcoin price",
+    "currency conversion",
+    "flight status",
+    "traffic update",
+    "road conditions",
+    "event schedule",
+    "concert tickets",
+    "movie release date",
+    "album release",
+    "who is the president",
+    "who is the governor",
+    "latest update on",
+    "recent developments",
+    "breaking news",
+    "current situation",
+    "what is happening now",
+    "live update",
+    "real-time information",
+    "who won the election",
+    "match result",
+    "game outcome",
+    "tournament winner",
+    "championship result",
+    "final score",
+    "standings table",
+    "league table",
+    "fixture list",
+    "upcoming matches",
+    "next game",
+    "who is playing",
+    "schedule for",
+    "when is the match",
+    "kickoff time",
+    "venue information",
+    "ticket prices",
+    "how to watch",
+    "broadcast information",
+    "streaming options",
+    "what did this celebrity do",
+    "Politics",
+    "Sports",
+    "Entertainment",
+
+    # --- Historical / factual sports ---
+    "who stopped them from qualifying",
+    "who stopped nigeria",
+    "who knocked nigeria out",
+    "why did nigeria not qualify",
+    "who beat nigeria",
+    "did nigeria qualify",
+    "nigeria world cup",
+    "super eagles result",
+    "super eagles match",
+    "afcon result",
+    "african cup of nations",
+    "world cup qualification africa",
+    "who qualified for the world cup",
+    "who failed to qualify",
+    "nigeria football history",
+    "nigeria vs",
+    "what happened to nigeria in",
+    "past world cup results",
+    "previous tournament result",
+    "historical match result",
+    "sports history africa",
+    "who beat who in football",
+    "football result nigeria",
+    "ghana football result",
+    "senegal football result",
+    "south africa football result",
+    "african football news",
+    "premier league result",
+    "champions league result",
+    "world cup result",
+    "who won the world cup",
+    "who won afcon",
+    "which team won",
+    "which country qualified",
+
+    # --- General factual / knowledge queries ---
+    "who invented",
+    "what caused",
+    "why did",
+    "how did",
+    "when did",
+    "what year did",
+    "tell me about",
+    "give me information on",
+    "what do you know about",
+    "news about",
+    "update on",
+    "facts about",
+    "history of",
+    "background on",
+    "what is going on with",
+    "recent news",
+    "what happened with",
+    "explain what happened",
+
+    # --- Nigeria-specific context ---
+    "naira exchange rate",
+    "dollar to naira",
+    "fuel price nigeria",
+    "nigerian government",
+    "nigerian politics",
+    "tinubu",
+    "lagos news",
+    "abuja news",
+    "nigeria economy",
+    "cbdc nigeria",
+    "enaira",
+    "nigeria inflation",
+    "nigeria election",
+    "nass",
+    "nigerian army",
+    "borno attack",
+    "bandits",
+    "kidnapping nigeria",
+    "nigeria insecurity",
 ]
 
 logger.info("🔢 Computing trigger embeddings...")
 trigger_embeddings = semantic_model.encode(SEARCH_TRIGGER_PHRASES)
-logger.info("✅ Semantic router ready!")
+logger.info("✅ Semantic router ready with %d trigger phrases!", len(SEARCH_TRIGGER_PHRASES))
 
 # ─── ASYNCIO EVENT LOOP ───
 _loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
@@ -123,13 +275,13 @@ def check_timers_background():
         try:
             now_utc = datetime.now(timezone.utc).isoformat()
             res = supabase.table("user_tools").select("*").eq("tool_type", "timer").eq("is_active", True).lte("target_time", now_utc).execute()
-            
+
             if res.data:
                 for row in res.data:
                     user_id = row["user_id"]
                     duration = row.get("duration_seconds", 0)
                     supabase.table("user_tools").update({"is_active": False}).eq("id", row["id"]).execute()
-                    
+
                     mins = duration // 60
                     secs = duration % 60
                     time_str = ""
@@ -137,7 +289,7 @@ def check_timers_background():
                     if secs > 0:
                         if time_str: time_str += f" and {secs} second{'s' if secs != 1 else ''}"
                         else: time_str = f"{secs} second{'s' if secs != 1 else ''}"
-                        
+
                     msg = f"⏰ Time's up! Your {time_str.strip()} timer is over."
                     run_async(bot.send_message(chat_id=int(user_id), text=msg))
                     logger.info("⏰ Timer fired for user %s", user_id)
@@ -146,86 +298,166 @@ def check_timers_background():
 
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
 
-# ─── WEB SEARCH & DEEP RESEARCH ───
-def search_brave(query: str, max_results: int = 3) -> str:
-    """Search Brave and scrape results with robust error handling."""
+# ─── WEB SEARCH (v7.1 — FIXED) ───
+def _search_brave_api(query: str, max_results: int = 3) -> Optional[list]:
+    """
+    Use the official Brave Search API (api.search.brave.com).
+    Requires BRAVE_API_KEY. Returns a list of result dicts, or None on failure.
+    """
+    if not BRAVE_API_KEY:
+        return None
     try:
-        search_url = f"https://search.brave.com/search?q={requests.utils.quote(query)}&lang=en"
+        url = "https://api.search.brave.com/res/v1/web/search"
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": BRAVE_API_KEY,
         }
-        response = requests.get(search_url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
+        params = {"q": query, "count": max_results}
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+
+        if resp.status_code != 200:
+            logger.warning("⚠️ Brave API returned status %s for query '%s'", resp.status_code, query)
+            return None
+
+        data = resp.json()
+        web_results = data.get("web", {}).get("results", [])
+        if not web_results:
+            logger.info("ℹ️ Brave API returned 0 results for '%s'", query)
+            return None
+
         results = []
-        # Try multiple class names Brave might use
-        snippets = soup.find_all('div', class_='snippet') or soup.find_all('div', class_='result')
-        
-        for div in snippets[:max_results]:
-            title_elem = div.find('div', class_='title') or div.find('a')
-            desc_elem = div.find('div', class_='description') or div.find('span')
-            url_elem = div.find('a', href=True)
-            
-            if title_elem and desc_elem:
-                title = title_elem.get_text(strip=True)
-                desc = desc_elem.get_text(strip=True)
-                url = url_elem['href'] if url_elem else ""
-                results.append(f"- Title: {title}\n  Snippet: {desc}\n  Link: {url}")
-        
-        if not results:
-            main = soup.find('main') or soup.find('div', id='results') or soup.find('div', class_='content')
-            if main:
-                text = main.get_text(separator='\n', strip=True)[:1500]
-                if text and len(text) > 50:
-                    return f"Brave Search Results:\n{text}"
-            return "No search results found."
-        
-        return "\n\n".join(results)
+        for item in web_results[:max_results]:
+            results.append({
+                "title": item.get("title", ""),
+                "description": item.get("description", ""),
+                "url": item.get("url", ""),
+            })
+        logger.info("✅ Brave API returned %d results for '%s'", len(results), query)
+        return results
     except Exception as e:
-        logger.error(f"Brave search error: {e}")
-        return "Web search is currently unavailable."
+        logger.error("Brave API error for '%s': %s", query, e)
+        return None
+
+def _search_duckduckgo_lite(query: str, max_results: int = 3) -> Optional[list]:
+    """
+    Use DuckDuckGo Lite (lite.duckduckgo.com/lite/) — server-rendered HTML,
+    no API key required. This is the no-setup fallback search provider.
+    Returns a list of result dicts, or None on failure.
+    """
+    try:
+        url = "https://lite.duckduckgo.com/lite/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = requests.post(url, data={"q": query}, headers=headers, timeout=10)
+
+        if resp.status_code != 200:
+            logger.warning("⚠️ DuckDuckGo Lite returned status %s for query '%s'", resp.status_code, query)
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+
+        # DuckDuckGo Lite renders results as a series of <tr> rows:
+        #   one row with a.result-link (title + href)
+        #   next row with td.result-snippet (description)
+        link_tags = soup.find_all("a", class_="result-link")
+
+        for link in link_tags[:max_results]:
+            title = link.get_text(strip=True)
+            href = link.get("href", "")
+
+            description = ""
+            # Walk forward through siblings to find the snippet text
+            row = link.find_parent("tr")
+            if row:
+                next_row = row.find_next_sibling("tr")
+                if next_row:
+                    snippet_td = next_row.find("td", class_="result-snippet")
+                    if snippet_td:
+                        description = snippet_td.get_text(strip=True)
+
+            if title and href:
+                results.append({"title": title, "description": description, "url": href})
+
+        if not results:
+            logger.info("ℹ️ DuckDuckGo Lite returned 0 parsed results for '%s'", query)
+            return None
+
+        logger.info("✅ DuckDuckGo Lite returned %d results for '%s'", len(results), query)
+        return results
+    except Exception as e:
+        logger.error("DuckDuckGo Lite error for '%s': %s", query, e)
+        return None
+
+def search_web(query: str, max_results: int = 3) -> str:
+    """
+    Primary search entry point.
+    1) Try Brave Search API (if BRAVE_API_KEY is set)
+    2) Fall back to DuckDuckGo Lite (no key required)
+    Returns a formatted string of results, or a descriptive failure string.
+    """
+    results = _search_brave_api(query, max_results)
+    provider = "Brave API"
+
+    if results is None:
+        results = _search_duckduckgo_lite(query, max_results)
+        provider = "DuckDuckGo Lite"
+
+    if not results:
+        logger.warning("❌ All search providers failed for query: '%s'", query)
+        return "No search results found."
+
+    logger.info("🔍 Search for '%s' served by %s", query, provider)
+
+    formatted = []
+    for r in results:
+        formatted.append(f"- Title: {r['title']}\n  Snippet: {r['description']}\n  Link: {r['url']}")
+    return "\n\n".join(formatted)
+
+# Backward-compatible alias — old code paths called search_brave()
+def search_brave(query: str, max_results: int = 3) -> str:
+    return search_web(query, max_results)
 
 def deep_research(query: str, max_links: int = 3) -> str:
-    """Deep research: search and visit top links for full content."""
+    """Deep research: search for links, then visit each one for full content."""
     try:
-        search_url = f"https://search.brave.com/search?q={requests.utils.quote(query)}&lang=en"
+        results = _search_brave_api(query, max_links) or _search_duckduckgo_lite(query, max_links)
+
+        if not results:
+            return "Deep research failed to retrieve any search results."
+
+        urls = [r["url"] for r in results if r.get("url", "").startswith("http")]
+
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(search_url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        urls = []
-        result_divs = soup.find_all('div', class_='result') or soup.find_all('div', {'data-tid': 'result'})
-        for div in result_divs[:max_links]:
-            url_elem = div.find('a', href=True)
-            if url_elem and url_elem['href'].startswith('http'):
-                urls.append(url_elem['href'])
-        
         deep_content = []
-        for url in urls:
+        for url in urls[:max_links]:
             try:
                 resp = requests.get(url, headers=headers, timeout=10)
                 page_soup = BeautifulSoup(resp.text, 'html.parser')
-                
+
                 for script in page_soup(["script", "style"]):
                     script.extract()
-                
+
                 text = page_soup.get_text(separator=' ', strip=True)
                 lines = (line.strip() for line in text.splitlines())
                 chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
                 text = ' '.join(chunk for chunk in chunks if chunk)
-                
+
                 deep_content.append(f"\n--- Content from {url} ---\n{text[:1500]}")
             except Exception as e:
                 logger.error(f"Failed to fetch {url}: {e}")
                 continue
-        
+
         if not deep_content:
-            return "Deep research failed to retrieve content."
-        
+            # Fall back to just the search snippets if we couldn't fetch any pages
+            formatted = []
+            for r in results:
+                formatted.append(f"- Title: {r['title']}\n  Snippet: {r['description']}\n  Link: {r['url']}")
+            return "\n\n".join(formatted)
+
         return "\n".join(deep_content)
     except Exception as e:
         logger.error("Deep research error: %s", e)
@@ -237,15 +469,15 @@ def fetch_url_content(url: str) -> str:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
-        
+
         for script in soup(["script", "style"]):
             script.extract()
-            
+
         text = soup.get_text(separator=' ', strip=True)
         lines = (line.strip() for line in text.splitlines())
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
         text = ' '.join(chunk for chunk in chunks if chunk)
-        
+
         return text[:2000]
     except Exception as e:
         logger.error("URL fetch error: %s", e)
@@ -256,13 +488,22 @@ def detect_urls(text: str) -> list:
     url_pattern = re.compile(r'https?://\S+')
     return url_pattern.findall(text)
 
-def is_search_query_semantic(text: str, threshold: float = 0.65) -> bool:
-    """Use semantic similarity to detect search intent."""
+def is_search_query_semantic(text: str, threshold: float = 0.45) -> bool:
+    """
+    Use semantic similarity to detect search intent.
+    v7.1: threshold lowered from 0.65 -> 0.45 (restored from v6.5 fix).
+    """
     try:
         query_embedding = semantic_model.encode([text])
         similarities = np.dot(trigger_embeddings, query_embedding.T).flatten()
-        max_similarity = np.max(similarities)
-        logger.info(f"🔍 Semantic similarity for '{text[:50]}...': {max_similarity:.3f}")
+        max_similarity = float(np.max(similarities))
+        best_match_idx = int(np.argmax(similarities))
+        best_match_phrase = SEARCH_TRIGGER_PHRASES[best_match_idx]
+        logger.info(
+            "🔍 Semantic score for '%s': %.3f (best match: '%s', threshold: %.2f, result: %s)",
+            text[:60], max_similarity, best_match_phrase, threshold,
+            "SEARCH" if max_similarity >= threshold else "NO SEARCH"
+        )
         return max_similarity >= threshold
     except Exception as e:
         logger.error(f"Semantic routing error: {e}")
@@ -271,12 +512,12 @@ def is_search_query_semantic(text: str, threshold: float = 0.65) -> bool:
 def is_search_query(text: str) -> bool:
     """Hybrid approach: Check explicit triggers first, then semantic."""
     text_lower = text.lower().strip()
-    
+
     explicit_triggers = ["search for", "google", "look up", "find out", "search the web", "browse", "search"]
     if any(trigger in text_lower for trigger in explicit_triggers):
         logger.info("🔍 Explicit search trigger detected")
         return True
-    
+
     return is_search_query_semantic(text)
 
 # ─── BASE SYSTEM PROMPT ───
@@ -301,7 +542,7 @@ CAPABILITIES & TOOLS:
 - Memory: You can recall and search past conversations by topic or keyword.
 - Time Tools: You can set timers (hours, minutes, seconds) and run stopwatches.
 - Time Awareness: You know the current time and date in Lagos (WAT).
-- Web Search: You have access to real-time web search results via Brave Search and can read links provided by the user.
+- Web Search: You have access to real-time web search results and can read links provided by the user.
 - If a user asks "What can you do?", list these features clearly and professionally.
 
 TIME AWARENESS:
@@ -320,7 +561,7 @@ SPECIAL INSTRUCTIONS (CRITICAL - FOLLOW EXACTLY):
    [TIMER:Xs] or [TIMER:Xm] or [TIMER:Xh]
    Example: User says "set a 30 second timer" → You respond normally, then add [TIMER:30s] at the end.
    Example: User says "give me 5 questions and set a 15 second timer" → You give 5 questions, then add [TIMER:15s] at the end.
-   
+
    For stopwatch: [STOPWATCH:START] or [STOPWATCH:STOP]
 
 2. WHEN TO USE SEARCH TRIGGER (CRITICAL):
@@ -330,50 +571,54 @@ SPECIAL INSTRUCTIONS (CRITICAL - FOLLOW EXACTLY):
    - Anything you are not 100 percent certain about
    - Anything that happened recently (today, yesterday, this week, this month)
    - Recent scores or results
-   - Data beyond your 2022 knowledge cap
+   - Data beyond your knowledge cutoff
    - ANYTHING YOU ARE NOT SURE OF
-   
+
    DO NOT say "I don't know" or "I don't have access".
    DO NOT guess or make up information.
-   
+
    INSTEAD, respond with EXACTLY this format (nothing else):
    SEARCH_TRIGGER: [your search query]
-   
+
    Examples:
    - User: "Who won the Champions League final?"
      You: SEARCH_TRIGGER: Champions League final 2026 winner
-   
+
    - User: "What's the weather in Lagos?"
      You: SEARCH_TRIGGER: Lagos Nigeria weather today
-   
+
    - User: "Did Super Eagles win last night?"
-     You: SEARCH_TRIGGER: Nigeria Super Eagles match result June 10 2026
-   
+     You: SEARCH_TRIGGER: Nigeria Super Eagles match result June 2026
+
    - User: "What's the exchange rate?"
      You: SEARCH_TRIGGER: Naira to Dollar exchange rate today
 
 3. WHEN YOU RECEIVE WEB SEARCH RESULTS (CRITICAL):
    When you see "WEB CONTEXT" or "Web Search Results" in your input, this means the system has already searched for you.
-   
+
    YOU MUST:
    - Read the search results carefully
    - Synthesize the information into a clear answer
    - Answer the user's question using ONLY the search results
    - Be specific and provide details from the results
-   
+
    YOU MUST NOT:
    - Say "I don't know" or "I don't have access"
    - Output SEARCH_TRIGGER again (this creates an infinite loop)
    - Make up information not in the search results
-   
+
    Example:
    User: "Who won the Champions League?"
    [System searches and provides results]
    You: "Based on the search results, PSG won the 2026 Champions League final 4-3 on penalties against Arsenal on May 30, 2026."
 
-4. GENERAL KNOWLEDGE:
+4. IF SEARCH RESULTS ARE EMPTY OR UNAVAILABLE:
+   If the WEB CONTEXT says no results were found or search is unavailable, do NOT output SEARCH_TRIGGER again.
+   Instead, tell the user honestly that you couldn't find current information on this, and offer to help with anything else you do know.
+
+5. GENERAL KNOWLEDGE:
    For historical facts, general knowledge, and information you're confident about, answer directly without using SEARCH_TRIGGER.
-   
+
    Example:
    User: "Who is the president of Nigeria?"
    You: "The current president of Nigeria is Bola Ahmed Tinubu, who took office on May 29, 2023."
@@ -393,16 +638,16 @@ def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, context: 
     wat_offset = timedelta(hours=1)
     wat_timezone = timezone(wat_offset)
     now_wat = datetime.now(wat_timezone)
-    
+
     date_str = now_wat.strftime("%A, %B %d, %Y")
     time_str = now_wat.strftime("%I:%M %p")
-    
+
     hour = now_wat.hour
     if 5 <= hour < 12: time_of_day = "morning"
     elif 12 <= hour < 17: time_of_day = "afternoon"
     elif 17 <= hour < 21: time_of_day = "evening"
     else: time_of_day = "night"
-    
+
     datetime_info = f"{time_str} WAT, {date_str} ({time_of_day})"
     prompt_parts = [BASE_SYSTEM_PROMPT.format(datetime_info=datetime_info)]
 
@@ -504,7 +749,7 @@ async def update_user_profile(user_id: str, username: str, topic: str):
     except Exception as e:
         logger.error("❌ Profile update failed: %s", e)
 
-# ─── IMPROVED CONTEXT RETRIEVAL (Fix for conversation continuity) ───
+# ─── CONTEXT RETRIEVAL ───
 async def get_relevant_context(user_id: str, query_text: str, limit: int = 15) -> str:
     """Get context with emphasis on recent conversation flow."""
     if not supabase: return ""
@@ -513,12 +758,10 @@ async def get_relevant_context(user_id: str, query_text: str, limit: int = 15) -
             .eq("user_id", str(user_id)).order("created_at", desc=True).limit(30).execute()
         if not rows.data: return ""
 
-        # ALWAYS include last 5 messages in chronological order (most recent first)
         recent_context = []
         for row in rows.data[:5]:
             recent_context.append(f"[{row.get('topic', 'general')}] User: {row['message']}\nAIM: {row['response']}")
-        
-        # For older messages, use relevance scoring
+
         older_rows = rows.data[5:]
         if older_rows:
             query_lower = query_text.lower()
@@ -548,7 +791,6 @@ async def get_relevant_context(user_id: str, query_text: str, limit: int = 15) -
         else:
             older_context = []
 
-        # Combine: recent first, then relevant older
         all_context = recent_context + older_context
         return "\n\n".join(all_context[:limit])
     except Exception as e:
@@ -627,7 +869,7 @@ async def search_memory(user_id: str) -> str:
         topic_counts = profile.get("topic_counts", {})
         total_chats = profile.get("total_chats", 0)
         memory_res = supabase.table("chat_memory").select("message, response, topic, created_at").eq("user_id", str(user_id)).order("created_at", desc=True).limit(10).execute()
-        
+
         lines = [f"📊 Your Top Topics: {', '.join(f'{k} ({v}x)' for k, v in sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3])}",
                  f"💬 Total Chats: {total_chats}", "", "📝 Recent Conversations:"]
         for i, row in enumerate(memory_res.data[:5], 1):
@@ -644,7 +886,7 @@ async def search_memory(user_id: str) -> str:
 async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_text: str) -> bool:
     """Handle /commands like /search, /deep, /help, /timer, /stopwatch"""
     text_lower = user_text.lower().strip()
-    
+
     if text_lower.startswith("/help"):
         help_text = """🤖 <b>AIM Bot Commands</b>
 
@@ -673,26 +915,28 @@ You can also just ask naturally! AIM understands:
 """
         await send_text_chunks(chat_id, help_text, reply_to=message_id)
         return True
-    
+
     elif text_lower.startswith("/search "):
         query = user_text[8:].strip()
         if query:
             await send_text_chunks(chat_id, "🔍 Searching the web...", reply_to=message_id)
-            search_results = search_brave(query)
-            
-            # Force Gemini to use the results with a strict instruction
+            search_results = search_web(query)
+
+            if search_results == "No search results found.":
+                await send_text_chunks(chat_id, "I couldn't find any results for that. Try rephrasing your search.", reply_to=message_id)
+                return True
+
             search_prompt = f"User asked: {query}\n\nWeb Search Results:\n{search_results}\n\nINSTRUCTION: Answer the user's question using ONLY the web search results above. Do not say you don't know. Do not output SEARCH_TRIGGER."
-            
+
             try:
                 response = gemini_client.models.generate_content(
                     model="gemini-2.5-flash-lite",
                     contents=[types.Content(role="user", parts=[types.Part(text=search_prompt)])],
                     config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=1024)
                 )
-                
+
                 if response and response.text:
                     final_text = response.text.strip()
-                    # Clean up any accidental SEARCH_TRIGGER output
                     if "SEARCH_TRIGGER:" in final_text:
                         final_text = "I found some information but couldn't synthesize a clear answer. Here are the raw results:\n\n" + search_results
                     await send_text_chunks(chat_id, final_text, reply_to=message_id)
@@ -702,7 +946,7 @@ You can also just ask naturally! AIM understands:
                 logger.error(f"Search command error: {e}")
                 await send_text_chunks(chat_id, "Search failed. Please try again.", reply_to=message_id)
         return True
-    
+
     elif text_lower.startswith("/deep "):
         query = user_text[6:].strip()
         if query:
@@ -715,7 +959,7 @@ You can also just ask naturally! AIM understands:
             else:
                 await send_text_chunks(chat_id, deep_results, reply_to=message_id)
         return True
-    
+
     elif text_lower.startswith("/timer "):
         time_str = user_text[7:].strip()
         match = re.match(r'(\d+)(s|m|h)', time_str.lower())
@@ -726,7 +970,7 @@ You can also just ask naturally! AIM understands:
             elif unit == 'm': duration_secs = amount * 60
             elif unit == 'h': duration_secs = amount * 3600
             else: duration_secs = amount * 60
-            
+
             target_time = datetime.now(timezone.utc) + timedelta(seconds=duration_secs)
             supabase.table("user_tools").insert({
                 "user_id": str(user_id), "tool_type": "timer",
@@ -734,12 +978,12 @@ You can also just ask naturally! AIM understands:
                 "duration_seconds": duration_secs, "target_time": target_time.isoformat(),
                 "is_active": True
             }).execute()
-            
+
             await send_text_chunks(chat_id, f"⏲️ Timer set for {time_str}!", reply_to=message_id)
         else:
             await send_text_chunks(chat_id, "❌ Invalid format. Use: /timer 5m, /timer 30s, /timer 1h", reply_to=message_id)
         return True
-    
+
     elif text_lower == "/stopwatch":
         res = supabase.table("user_tools").select("*").eq("user_id", str(user_id)).eq("tool_type", "stopwatch").eq("is_active", True).order("created_at", desc=True).limit(1).execute()
         if res.data:
@@ -758,7 +1002,7 @@ You can also just ask naturally! AIM understands:
             }).execute()
             await send_text_chunks(chat_id, "⏱️ Stopwatch started! Use /stopwatch again to stop.", reply_to=message_id)
         return True
-    
+
     return False
 
 # ─── SEND MESSAGE ───
@@ -794,7 +1038,7 @@ async def handle_inline_query_async(inline_query):
 
     answer_text = None
     web_context = ""
-    
+
     urls = detect_urls(query_text)
     if urls:
         logger.info("🔗 Inline URLs detected: %s", urls)
@@ -805,13 +1049,13 @@ async def handle_inline_query_async(inline_query):
                 link_contents.append(f"Content from {url}:\n{content}")
         if link_contents:
             web_context += "\n".join(link_contents)
-    
+
     if is_search_query(query_text) and not web_context:
         logger.info("🔍 Inline search intent detected for: %s", query_text)
-        search_results = search_brave(query_text)
+        search_results = search_web(query_text)
         if search_results and "No search results found" not in search_results:
             web_context += f"Web Search Results for '{query_text}':\n{search_results}"
-    
+
     try:
         profile = await get_user_profile_data(user_id)
         response = await asyncio.wait_for(
@@ -921,7 +1165,7 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
     logger.info("⚠️ Found 'Asking AIM' + 'Processing' but no query extracted")
     return False, ""
 
-# ─── MESSAGE PROCESSOR (Updated for Agentic AI) ───
+# ─── MESSAGE PROCESSOR (Agentic AI) ───
 async def handle_message_async(update: Update):
     """Process incoming messages with agentic loop."""
     if not update.message:
@@ -984,7 +1228,7 @@ async def handle_message_async(update: Update):
 
     try:
         context = await get_relevant_context(user_id, user_text)
-        
+
         web_context = ""
         urls = detect_urls(user_text)
         if urls:
@@ -999,28 +1243,30 @@ async def handle_message_async(update: Update):
 
         if is_search_query(user_text) and not web_context:
             logger.info("🔍 Search intent detected for: %s", user_text)
-            search_results = search_brave(user_text)
+            search_results = search_web(user_text)
             if search_results and "No search results found" not in search_results:
                 web_context += f"Web Search Results for '{user_text}':\n{search_results}"
+            else:
+                logger.info("ℹ️ Pre-emptive search returned nothing; letting Gemini decide whether to SEARCH_TRIGGER")
 
         # ─── AGENTIC LOOP (Up to 3 iterations) ───
         max_iterations = 3
         iteration = 0
         final_answer = None
         tool_status = ""
-        
+
         while iteration < max_iterations:
             iteration += 1
             logger.info(f"🔄 Agentic loop iteration {iteration}")
-            
+
             response = await get_gemini_response(user_text, user_id, chat_type, profile, context, web_context, tool_status)
-            
+
             if not response or not response.text:
                 final_answer = "🔥 AIM is experiencing high demand right now. Please try again in 30 seconds."
                 break
-            
+
             answer = response.text.strip()
-            
+
             # Check for SEARCH_TRIGGER
             if "SEARCH_TRIGGER:" in answer:
                 logger.info("🔍 Gemini triggered search")
@@ -1028,19 +1274,24 @@ async def handle_message_async(update: Update):
                 if match:
                     search_query = match.group(1).strip()
                     logger.info(f"🔍 Searching for: {search_query}")
-                    search_results = search_brave(search_query)
-                    
-                    # CRITICAL FIX: If search fails, BREAK the loop
-                    if "unavailable" in search_results.lower() or "no search results" in search_results.lower():
-                        final_answer = "I tried to search the web for that information, but I couldn't find any results right now. Please try again later."
-                        break
-                    
+                    search_results = search_web(search_query)
+
+                    if search_results == "No search results found.":
+                        # Tell Gemini explicitly so it can give an honest answer
+                        # instead of looping forever or making things up.
+                        web_context += (
+                            f"\n\nWeb Search Results for '{search_query}': "
+                            "No results were found. Inform the user you couldn't "
+                            "find current information on this topic, and offer to help with anything else."
+                        )
+                        continue
+
                     web_context += f"\n\nWeb Search Results for '{search_query}':\n{search_results}"
                     continue
                 else:
                     final_answer = answer
                     break
-            
+
             # Check for timer/stopwatch codes
             timer_match = re.search(r'\[TIMER:(\d+)(s|m|h)\]', answer, re.IGNORECASE)
             if timer_match:
@@ -1050,7 +1301,7 @@ async def handle_message_async(update: Update):
                 elif unit == 'm': duration_secs = amount * 60
                 elif unit == 'h': duration_secs = amount * 3600
                 else: duration_secs = amount * 60
-                
+
                 target_time = datetime.now(timezone.utc) + timedelta(seconds=duration_secs)
                 supabase.table("user_tools").insert({
                     "user_id": str(user_id), "tool_type": "timer",
@@ -1058,11 +1309,11 @@ async def handle_message_async(update: Update):
                     "duration_seconds": duration_secs, "target_time": target_time.isoformat(),
                     "is_active": True
                 }).execute()
-                
+
                 answer = re.sub(r'\[TIMER:\d+[smh]\]', '', answer, flags=re.IGNORECASE).strip()
                 tool_status = f"✅ Timer set for {amount}{unit}"
                 answer += f"\n\n_{tool_status}_"
-            
+
             stopwatch_match = re.search(r'\[STOPWATCH:(START|STOP)\]', answer, re.IGNORECASE)
             if stopwatch_match:
                 action = stopwatch_match.group(1).upper()
@@ -1085,15 +1336,17 @@ async def handle_message_async(update: Update):
                         time_str = f"{mins} minute{'s' if mins != 1 else ''} and {secs} second{'s' if secs != 1 else ''}" if mins > 0 else f"{secs} second{'s' if secs != 1 else ''}"
                         answer = re.sub(r'\[STOPWATCH:STOP\]', '', answer, flags=re.IGNORECASE).strip()
                         answer += f"\n\n_⏱️ Stopwatch stopped! Time elapsed: {time_str}_"
-            
+
             final_answer = answer
             break
-        
-        if final_answer:
-            await send_text_chunks(chat.id, final_answer, reply_to=message_id)
-            topic = await extract_topic(user_text, final_answer)
-            await save_chat_memory(user_id, username, user_text, final_answer, chat_type, topic)
-            await update_user_profile(user_id, username, topic)
+
+        if final_answer is None:
+            final_answer = "I tried to search the web for that information, but I couldn't find any results right now. Please try again later."
+
+        await send_text_chunks(chat.id, final_answer, reply_to=message_id)
+        topic = await extract_topic(user_text, final_answer)
+        await save_chat_memory(user_id, username, user_text, final_answer, chat_type, topic)
+        await update_user_profile(user_id, username, topic)
     except Exception as e:
         logger.error(f"Critical error in message handler: {e}")
         await send_text_chunks(chat.id, "🛠️ AIM's engine is warming up. Please try again in a few seconds.", reply_to=message_id)
@@ -1103,9 +1356,10 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v7.0",
+        "version": "v7.1",
         "model": "African Intelligence Model (Agentic AI)",
-        "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools", "brave_search", "semantic_routing", "agentic_loop", "deep_research", "bot_commands"]
+        "search_provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
+        "features": ["smart_memory", "user_preferences", "topic_search", "inline_mode", "tools", "web_search", "semantic_routing", "agentic_loop", "deep_research", "bot_commands"]
     })
 
 @app.route("/webhook", methods=["POST"])
@@ -1170,6 +1424,24 @@ def debug_supabase():
             "chat_memory_rows": chat_rows.count if hasattr(chat_rows, 'count') else len(chat_rows.data),
             "user_profiles_rows": profile_rows.count if hasattr(profile_rows, 'count') else len(profile_rows.data),
             "tables": ["chat_memory", "user_profiles", "auth_states", "user_tools"]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/debug/search", methods=["GET"])
+def debug_search():
+    """NEW in v7.1: quick way to test the search pipeline directly.
+    Usage: /debug/search?q=your+query
+    """
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"error": "Provide a query, e.g. /debug/search?q=Nigeria news"}), 400
+    try:
+        results = search_web(query)
+        return jsonify({
+            "query": query,
+            "provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
+            "results": results
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
