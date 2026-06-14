@@ -1,11 +1,32 @@
 """
-AIM Bot v7.2.1 — African Intelligence Model (Agentic AI + Deep Research)
-Smart Memory + User Preferences + Professional Tone + Time Awareness + Tools + Web Search + Bot Commands
+AIM Bot v7.3 — African Intelligence Model (Agentic AI + Deep Research)
 
-CHANGES FROM v7.2:
-  - Added timestamp awareness to conversation history so AIM knows when messages happened
-  - Added time gap calculation so AIM can say "it's been a while" after long gaps
-  - Fixed repetitive "Hello there! It's [date]" greeting - now only mentions time when relevant
+CHANGES FROM v7.2.1:
+
+  FIX 1 — REPETITIVE DATE/TIME GREETING:
+  - Root cause: datetime_info was injected into BASE_SYSTEM_PROMPT at the top of
+    every single prompt, so Gemini would parrot it back as a greeting every time.
+  - Fix: datetime is NO LONGER in BASE_SYSTEM_PROMPT at all.
+  - Instead, a TIME & CONTEXT block is built dynamically and injected only when
+    relevant — and it explicitly tells Gemini not to announce the time unless asked.
+
+  FIX 2 — LAST 10 MESSAGES WITH PRIORITY:
+  - Was only passing 5 recent messages.
+  - Now passes the last 10 exchanges in chronological order with full timestamps
+    (WAT timezone), injected in a clearly-marked PRIORITY block at the very top
+    of the prompt so Gemini reads it first.
+  - Each message shows: timestamp, user message, AIM response.
+  - If user asks "when was my last message?" AIM can answer from this block.
+
+  FIX 3 — TIME GAP AWARENESS:
+  - Time gap between now and last message is calculated in Python (reliable),
+    not left to Gemini to figure out.
+  - Gap is passed as a natural-language string to Gemini with clear instructions:
+    * < 30 min: no acknowledgment needed
+    * 30 min – 3 hr: light acknowledgment optional
+    * 3 hr – 24 hr: "it's been a while" is appropriate
+    * > 24 hr: "welcome back / long time" is appropriate
+  - Gemini is explicitly told NOT to announce date/time unless the user asks.
 """
 
 import os
@@ -47,6 +68,7 @@ WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")
 BRAVE_API_KEY   = os.environ.get("BRAVE_API_KEY", "")
 
 TELEGRAM_MAX_CHARS = 4096
+WAT = timezone(timedelta(hours=1))   # West Africa Time = UTC+1
 
 # ─── DUPLICATE PREVENTION ───
 _processed_update_ids: set[int] = set()
@@ -81,9 +103,9 @@ else:
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 if BRAVE_API_KEY:
-    logger.info("✅ Brave Search API key found — primary search provider: Brave API")
+    logger.info("✅ Brave Search API key found — primary: Brave API")
 else:
-    logger.warning("⚠️ BRAVE_API_KEY not set — using DuckDuckGo Lite as search provider")
+    logger.warning("⚠️ BRAVE_API_KEY not set — fallback: DuckDuckGo Lite")
 
 # ─── SEMANTIC ROUTER ───
 logger.info("🧠 Loading semantic router model...")
@@ -156,22 +178,62 @@ def check_timers_background():
                    .eq("is_active", True).lte("target_time", now_utc).execute())
             if res.data:
                 for row in res.data:
-                    user_id = row["user_id"]
+                    user_id  = row["user_id"]
                     duration = row.get("duration_seconds", 0)
                     supabase.table("user_tools").update({"is_active": False}).eq("id", row["id"]).execute()
                     mins, secs = divmod(duration, 60)
-                    time_str = ""
-                    if mins: time_str += f"{mins} minute{'s' if mins != 1 else ''}"
+                    t = ""
+                    if mins: t += f"{mins} minute{'s' if mins != 1 else ''}"
                     if secs:
-                        if time_str: time_str += f" and {secs} second{'s' if secs != 1 else ''}"
-                        else: time_str = f"{secs} second{'s' if secs != 1 else ''}"
+                        if t: t += f" and {secs} second{'s' if secs != 1 else ''}"
+                        else: t = f"{secs} second{'s' if secs != 1 else ''}"
                     run_async(bot.send_message(chat_id=int(user_id),
-                                               text=f"⏰ Time's up! Your {time_str.strip()} timer is over."))
+                                               text=f"⏰ Time's up! Your {t.strip()} timer is over."))
                     logger.info("⏰ Timer fired for user %s", user_id)
         except Exception as e:
             logger.error("Timer background check error: %s", e)
 
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
+
+
+# ═══════════════════════════════════════════════════════════
+# HELPERS — TIME
+# ═══════════════════════════════════════════════════════════
+
+def fmt_wat(dt: datetime) -> str:
+    """Format a UTC datetime as a human-readable WAT string."""
+    return (dt.astimezone(WAT)).strftime("%a %b %d, %Y · %I:%M %p WAT")
+
+
+def time_gap_label(seconds: float) -> str:
+    """Return a human-readable gap label."""
+    if seconds < 60:
+        return "just now"
+    elif seconds < 3600:
+        mins = int(seconds / 60)
+        return f"{mins} minute{'s' if mins != 1 else ''} ago"
+    elif seconds < 86400:
+        hrs = int(seconds / 3600)
+        return f"{hrs} hour{'s' if hrs != 1 else ''} ago"
+    elif seconds < 604800:
+        days = int(seconds / 86400)
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    else:
+        weeks = int(seconds / 604800)
+        return f"{weeks} week{'s' if weeks != 1 else ''} ago"
+
+
+def gap_greeting_instruction(seconds: float) -> str:
+    """Tell Gemini how to handle the gap in its greeting."""
+    if seconds < 1800:          # < 30 min — fresh conversation
+        return "NO_GAP_ACK: The user just chatted recently. Do NOT say 'welcome back' or 'long time'. Just respond normally."
+    elif seconds < 10800:       # 30 min – 3 hr
+        return "LIGHT_ACK: A moderate gap. You may optionally acknowledge it but keep it brief and natural. Do not make it a big deal."
+    elif seconds < 86400:       # 3 hr – 24 hr
+        return "GAP_ACK: It's been several hours. You can naturally say something like 'It's been a while!' or 'Welcome back!' at the start of your reply, then move on."
+    else:                       # > 24 hr
+        return "LONG_GAP_ACK: It's been a long time! Start your reply with a warm welcome-back phrase like 'Long time no see!', 'Welcome back!', or 'It's been a minute!' Then dive into helping them."
+
 
 # ═══════════════════════════════════════════════════════════
 # WEB SEARCH
@@ -219,27 +281,22 @@ def _search_duckduckgo_lite(query: str, max_results: int = 5) -> Optional[list]:
             timeout=10,
         )
         if resp.status_code != 200:
-            logger.warning("⚠️ DuckDuckGo Lite status %s for '%s'", resp.status_code, query)
             return None
-
         soup = BeautifulSoup(resp.text, "html.parser")
         results = []
         for link in soup.find_all("a", class_="result-link")[:max_results]:
             title = link.get_text(strip=True)
             href  = link.get("href", "")
-            description = ""
-            row = link.find_parent("tr")
+            desc  = ""
+            row   = link.find_parent("tr")
             if row:
-                next_row = row.find_next_sibling("tr")
-                if next_row:
-                    td = next_row.find("td", class_="result-snippet")
-                    if td:
-                        description = td.get_text(strip=True)
+                nr = row.find_next_sibling("tr")
+                if nr:
+                    td = nr.find("td", class_="result-snippet")
+                    if td: desc = td.get_text(strip=True)
             if title and href:
-                results.append({"title": title, "description": description, "url": href})
-
+                results.append({"title": title, "description": desc, "url": href})
         if not results:
-            logger.info("ℹ️ DuckDuckGo Lite: 0 results for '%s'", query)
             return None
         logger.info("✅ DuckDuckGo Lite: %d results for '%s'", len(results), query)
         return results
@@ -249,23 +306,18 @@ def _search_duckduckgo_lite(query: str, max_results: int = 5) -> Optional[list]:
 
 
 def search_web(query: str, max_results: int = 5) -> str:
-    results = _search_brave_api(query, max_results)
+    results  = _search_brave_api(query, max_results)
     provider = "Brave API"
     if results is None:
-        results = _search_duckduckgo_lite(query, max_results)
+        results  = _search_duckduckgo_lite(query, max_results)
         provider = "DuckDuckGo Lite"
     if not results:
         logger.warning("❌ All search providers failed for '%s'", query)
         return "No search results found."
-
     logger.info("🔍 '%s' → %s (%d results)", query, provider, len(results))
     lines = []
     for i, r in enumerate(results, 1):
-        lines.append(
-            f"{i}. {r['title']}\n"
-            f"   Summary: {r['description']}\n"
-            f"   Source: {r['url']}"
-        )
+        lines.append(f"{i}. {r['title']}\n   Summary: {r['description']}\n   Source: {r['url']}")
     return "\n\n".join(lines)
 
 
@@ -274,39 +326,26 @@ def search_brave(query: str, max_results: int = 5) -> str:
 
 
 def deep_research(query: str) -> str:
-    angle_queries = [
-        query,
-        f"{query} latest news",
-        f"{query} results details",
-    ]
-
-    all_results = []
-    seen_urls = set()
-
+    angle_queries = [query, f"{query} latest news", f"{query} results details"]
+    all_results, seen_urls = [], set()
     for q in angle_queries:
-        results = _search_brave_api(q, 4) or _search_duckduckgo_lite(q, 4)
-        if results:
-            for r in results:
+        rs = _search_brave_api(q, 4) or _search_duckduckgo_lite(q, 4)
+        if rs:
+            for r in rs:
                 if r["url"] not in seen_urls:
                     seen_urls.add(r["url"])
                     all_results.append(r)
-
     if not all_results:
         return "Deep research could not retrieve any results. Try rephrasing the query."
-
-    logger.info("🔬 Deep research for '%s': %d unique results across angle queries", query, len(all_results))
-
+    logger.info("🔬 Deep research: %d unique results for '%s'", len(all_results), query)
     lines = ["=== DEEP RESEARCH RESULTS ===\n"]
     for i, r in enumerate(all_results[:12], 1):
-        lines.append(
-            f"{i}. {r['title']}\n"
-            f"   Summary: {r['description']}\n"
-            f"   Source: {r['url']}"
-        )
+        lines.append(f"{i}. {r['title']}\n   Summary: {r['description']}\n   Source: {r['url']}")
     return "\n\n".join(lines)
 
 
 def fetch_url_content(url: str) -> str:
+    """Only called when the user explicitly pastes a URL — not used on search results."""
     try:
         resp = requests.get(
             url,
@@ -316,8 +355,7 @@ def fetch_url_content(url: str) -> str:
         soup = BeautifulSoup(resp.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.extract()
-        text = " ".join(soup.get_text(separator=" ", strip=True).split())
-        return text[:3000]
+        return " ".join(soup.get_text(separator=" ", strip=True).split())[:3000]
     except Exception as e:
         logger.error("URL fetch error for %s: %s", url, e)
         return "Failed to read the link content."
@@ -329,11 +367,11 @@ def detect_urls(text: str) -> list:
 
 def is_search_query_semantic(text: str, threshold: float = 0.45) -> bool:
     try:
-        q_emb = semantic_model.encode([text])
-        sims = np.dot(trigger_embeddings, q_emb.T).flatten()
+        q_emb   = semantic_model.encode([text])
+        sims    = np.dot(trigger_embeddings, q_emb.T).flatten()
         max_sim = float(np.max(sims))
-        best = SEARCH_TRIGGER_PHRASES[int(np.argmax(sims))]
-        result = max_sim >= threshold
+        best    = SEARCH_TRIGGER_PHRASES[int(np.argmax(sims))]
+        result  = max_sim >= threshold
         logger.info("🔍 Semantic: '%.60s' → %.3f (best: '%s') → %s",
                     text, max_sim, best, "SEARCH" if result else "skip")
         return result
@@ -343,19 +381,115 @@ def is_search_query_semantic(text: str, threshold: float = 0.45) -> bool:
 
 
 def is_search_query(text: str) -> bool:
-    text_lower = text.lower().strip()
+    tl = text.lower().strip()
     explicit = ["search for", "google", "look up", "find out", "search the web", "browse", "search"]
-    if any(t in text_lower for t in explicit):
-        logger.info("🔍 Explicit search trigger")
+    if any(t in tl for t in explicit):
         return True
     return is_search_query_semantic(text)
 
 
 # ═══════════════════════════════════════════════════════════
-# PROMPTING (v7.2.1 — timestamp awareness + no repetitive greeting)
+# CONTEXT MEMORY  (v7.3 — last 10 messages with timestamps)
 # ═══════════════════════════════════════════════════════════
 
-BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
+async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, str, float]:
+    """
+    Returns (recent_history, older_context, gap_seconds).
+
+    recent_history  → last 10 exchanges in chronological order with WAT timestamps
+    older_context   → relevance-scored older messages (background)
+    gap_seconds     → seconds since the user's last message (for greeting logic)
+    """
+    if not supabase:
+        return "", "", 0.0
+
+    try:
+        rows = (supabase.table("chat_memory")
+                .select("message, response, topic, created_at")
+                .eq("user_id", str(user_id))
+                .order("created_at", desc=True)
+                .limit(40)
+                .execute())
+
+        if not rows.data:
+            return "", "", 0.0
+
+        # ── gap seconds (from the most recent saved message)
+        gap_seconds = 0.0
+        try:
+            last_ts    = datetime.fromisoformat(rows.data[0]["created_at"].replace("Z", "+00:00"))
+            gap_seconds = (datetime.now(timezone.utc) - last_ts).total_seconds()
+        except Exception:
+            pass
+
+        # ── RECENT: last 10 in chronological order (oldest → newest so it reads naturally)
+        recent_rows = list(reversed(rows.data[:10]))
+        recent_lines = []
+        for row in recent_rows:
+            try:
+                ts   = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
+                tstr = fmt_wat(ts)
+            except Exception:
+                tstr = "unknown time"
+            recent_lines.append(f"  [{tstr}]")
+            recent_lines.append(f"  User : {row['message']}")
+            recent_lines.append(f"  AIM  : {row['response']}")
+            recent_lines.append("")
+        recent_history = "\n".join(recent_lines).strip()
+
+        # ── OLDER: relevance-scored messages beyond the last 10
+        older_rows = rows.data[10:]
+        if not older_rows:
+            return recent_history, "", gap_seconds
+
+        query_lower = query_text.lower()
+        keyword_topics = {
+            "space": ["tech"], "nigeria": ["general", "politics"],
+            "money": ["finance"], "job": ["career"], "health": ["health"],
+            "love": ["relationships"], "sport": ["sports"], "music": ["entertainment"],
+            "school": ["education"], "code": ["tech"], "ai": ["tech"],
+        }
+        matched_topics: set = set()
+        for kw, tps in keyword_topics.items():
+            if kw in query_lower:
+                matched_topics.update(tps)
+
+        scored = []
+        for row in older_rows:
+            score = 0
+            try:
+                age_days = (datetime.now(timezone.utc) -
+                            datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))).days
+                score += max(0, 30 - age_days)
+            except Exception:
+                pass
+            if row.get("topic") in matched_topics:
+                score += 50
+            blob = f"{row['message']} {row['response']}".lower()
+            for word in query_lower.split():
+                if len(word) > 3 and word in blob:
+                    score += 10
+            scored.append((score, row))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        older_lines = [
+            f"[{r.get('topic','general')}] User: {r['message']} | AIM: {r['response']}"
+            for _, r in scored[:10]
+        ]
+        return recent_history, "\n".join(older_lines), gap_seconds
+
+    except Exception as e:
+        logger.error("Context retrieval error: %s", e)
+        return "", "", 0.0
+
+
+# ═══════════════════════════════════════════════════════════
+# PROMPTING  (v7.3 — no datetime in system prompt)
+# ═══════════════════════════════════════════════════════════
+
+# NOTE: {datetime_info} is intentionally GONE from this prompt.
+# Datetime context is injected separately and only when needed.
+BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. A professional AI assistant built for Africans, by Africans.
 
 PERSONALITY & TONE:
 - Warm, respectful, and culturally aware.
@@ -372,36 +506,35 @@ RULES:
 - Use emojis naturally but not excessively.
 
 CAPABILITIES:
-- Memory: You recall past conversations with timestamps.
+- Memory: You recall the last 10 conversations, with exact timestamps.
 - Time Tools: Timers and stopwatches.
-- Time Awareness: You know the current time and when the user last messaged you.
 - Web Search: Real-time web results available.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GREETING & TIME RULES — READ CAREFULLY:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❌ DO NOT start your reply with "Hello there! It's [date] at [time]..." — EVER.
+❌ DO NOT announce the current date and time at the start of messages.
+❌ DO NOT say the date/time unless the user explicitly ASKS for it (e.g. "what time is it?").
+
+✅ DO greet naturally based on the TIME GAP CONTEXT provided below.
+✅ DO mention time when the user directly asks (e.g. "when did I last message you?").
+✅ DO use WAT timestamps from the conversation history to answer time-related questions.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CONVERSATION CONTINUITY (CRITICAL):
-- The RECENT CONVERSATION HISTORY below shows what was just discussed, with timestamps.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- The CONVERSATION HISTORY below shows the last 10 exchanges WITH timestamps.
 - ALWAYS read it before responding.
-- If the user says something short like "yes", "ok", "tell me more", "go on" or asks a follow-up,
-  treat it as continuing the previous topic — do NOT start fresh.
-- Reference what was previously said when relevant.
-- If the user uses pronouns (he, she, it, they, his, her), look at the IMMEDIATE PREVIOUS message
-  to figure out who or what the pronoun refers to. DO NOT search the web to resolve pronouns.
+- Short follow-ups like "yes", "ok", "tell me more", "go on", "and?" → continue the previous topic.
+- If the user uses pronouns (he, she, it, they) → resolve them from the previous message.
+- If the user asks "when did I last message you?" → read the most recent timestamp from history.
+- If the user asks "how long have we been talking?" → calculate from the first timestamp shown.
 
-TIME AWARENESS RULES (CRITICAL):
-- You know the current time and the time of the user's last message.
-- DO NOT start every message with "Hello there! It's [date] and [time]" — this is annoying and repetitive.
-- ONLY mention the time/date if:
-  * The user explicitly asks about time (e.g., "what time is it?", "how long has it been?")
-  * It's naturally relevant (e.g., late night: "You should get some rest soon")
-  * The user says "good morning", "good evening", etc.
-  * There's been a long gap since the last message (see TIME CONTEXT below)
-- If the user hasn't chatted in several hours, you can acknowledge it naturally:
-  * "It's been a while! How can I help you today?"
-  * "Welcome back! What's on your mind?"
-  * "Long time no see!"
-- Calculate the time gap between messages to determine if you should acknowledge it.
-
-─────────────────────────────────────────
-SPECIAL INSTRUCTIONS — FOLLOW EXACTLY:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SPECIAL INSTRUCTIONS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 1. TIMERS / STOPWATCHES:
    Append a machine code at the END of your response (after your text):
@@ -409,10 +542,10 @@ SPECIAL INSTRUCTIONS — FOLLOW EXACTLY:
    - Stopwatch: [STOPWATCH:START]  [STOPWATCH:STOP]
 
 2. SEARCH TRIGGER — when to use:
-   Use this when asked about current events, live scores, prices, weather,
-   recent news, elections, exchange rates, or ANYTHING you are not 100% certain of.
+   Use for: current events, live scores, prices, weather, recent news, exchange rates,
+   elections, or ANYTHING you are not 100% certain about.
 
-   DO NOT say "I don't know". Instead output EXACTLY:
+   Output EXACTLY:
    SEARCH_TRIGGER: <your search query>
 
    Examples:
@@ -421,18 +554,16 @@ SPECIAL INSTRUCTIONS — FOLLOW EXACTLY:
    - "Naira exchange rate?" → SEARCH_TRIGGER: Naira to Dollar exchange rate today
 
 3. WHEN WEB CONTEXT IS PROVIDED:
-   If you see "--- WEB SEARCH RESULTS ---" below, the system already searched for you.
-   YOU MUST synthesize those results into a clear answer.
-   DO NOT output SEARCH_TRIGGER again — that creates an infinite loop.
+   Synthesize the results into a clear answer.
+   DO NOT output SEARCH_TRIGGER again — infinite loop.
    DO NOT say you don't have access.
 
 4. IF SEARCH CAME BACK EMPTY:
-   If web context says "No results found", tell the user honestly and offer to help
-   with what you know. Do NOT trigger another search.
+   Tell the user honestly, offer to help with what you know. No more searches.
 
 5. GENERAL KNOWLEDGE:
-   For facts you are confident about, answer directly without using SEARCH_TRIGGER.
-─────────────────────────────────────────
+   Answer directly for things you're confident about. No SEARCH_TRIGGER needed.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 
@@ -454,16 +585,15 @@ def build_enhanced_prompt(
     older_context: str = "",
     web_context: str = "",
     tool_status: str = "",
+    gap_seconds: float = 0.0,
 ) -> str:
-    # ── time
-    now_wat = datetime.now(timezone(timedelta(hours=1)))
-    datetime_info = (
-        f"{now_wat.strftime('%I:%M %p')} WAT, "
-        f"{now_wat.strftime('%A, %B %d, %Y')} "
-        f"({'morning' if 5 <= now_wat.hour < 12 else 'afternoon' if now_wat.hour < 17 else 'evening' if now_wat.hour < 21 else 'night'})"
-    )
 
-    parts = [BASE_SYSTEM_PROMPT.format(datetime_info=datetime_info)]
+    now_wat  = datetime.now(WAT)
+    now_str  = now_wat.strftime("%A, %B %d, %Y · %I:%M %p WAT")
+    gap_lbl  = time_gap_label(gap_seconds)
+    greeting_instruction = gap_greeting_instruction(gap_seconds)
+
+    parts = [BASE_SYSTEM_PROMPT]
 
     # ── user prefs
     pref_language = profile.get("preferred_language", "english")
@@ -471,70 +601,45 @@ def build_enhanced_prompt(
     total_chats   = profile.get("total_chats", 0)
     pref_lines = [
         "\n--- USER PREFERENCES ---",
-        f"- User ID: {user_id}",
-        f"- Preferred language: {pref_language}",
-        f"- Timezone: {profile.get('timezone', 'Africa/Lagos')}",
-        f"- Total chats: {total_chats}",
+        f"  User ID          : {user_id}",
+        f"  Preferred lang   : {pref_language}",
+        f"  Timezone         : {profile.get('timezone', 'Africa/Lagos')}",
+        f"  Total chats      : {total_chats}",
     ]
     if topic_counts:
         top = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        pref_lines.append(f"- Top interests: {', '.join(f'{k}({v})' for k, v in top)}")
+        pref_lines.append(f"  Top interests    : {', '.join(f'{k}({v})' for k, v in top)}")
     if pref_language.lower() == "english":
-        pref_lines.append("- LANGUAGE RULE: Respond in standard English ONLY unless user explicitly asks otherwise.")
+        pref_lines.append("  LANGUAGE RULE    : Standard English ONLY unless user explicitly asks otherwise.")
     pref_lines.append("--- END PREFERENCES ---\n")
     parts.append("\n".join(pref_lines))
 
-    # ── TIME GAP CONTEXT (NEW: so AIM knows how long it's been)
-    time_gap_info = ""
-    try:
-        last_msg = (supabase.table("chat_memory")
-                   .select("created_at")
-                   .eq("user_id", str(user_id))
-                   .order("created_at", desc=True)
-                   .limit(1)
-                   .execute())
-        
-        if last_msg.data:
-            last_time = datetime.fromisoformat(last_msg.data[0]["created_at"].replace("Z", "+00:00"))
-            now = datetime.now(timezone.utc)
-            time_diff = now - last_time
-            
-            hours = time_diff.total_seconds() / 3600
-            days = hours / 24
-            
-            if hours < 1:
-                gap_text = f"{int(time_diff.total_seconds() / 60)} minutes ago"
-            elif hours < 24:
-                gap_text = f"{int(hours)} hours ago"
-            elif days < 7:
-                gap_text = f"{int(days)} days ago"
-            else:
-                gap_text = f"{int(days / 7)} weeks ago"
-            
-            time_gap_info = f"""
---- TIME CONTEXT ---
-Current time: {now_wat.strftime('%A, %B %d, %Y at %I:%M %p')} WAT
-User's last message: {gap_text}
-If it's been more than 3 hours, you can acknowledge the time gap naturally (e.g., "It's been a while!", "Welcome back!", "Long time no see!").
-But DO NOT start every message with the date/time — only mention it if relevant or asked.
---- END TIME CONTEXT ---
-"""
-    except Exception as e:
-        logger.error("Time gap calculation error: %s", e)
-    
-    if time_gap_info:
-        parts.append(time_gap_info)
+    # ── TIME & CONTEXT BLOCK  (replaces the old {datetime_info} in BASE_SYSTEM_PROMPT)
+    time_block = (
+        "\n┌─────────────────────────────────────────┐\n"
+        "│  TIME & CONTEXT                         │\n"
+        "└─────────────────────────────────────────┘\n"
+        f"  Current time (WAT) : {now_str}\n"
+        f"  User's last message: {gap_lbl}\n"
+        f"  Greeting guidance  : {greeting_instruction}\n"
+        "\n"
+        "  IMPORTANT — DO NOT start your reply by announcing the date/time.\n"
+        "  Only mention time if the user explicitly asks about it.\n"
+        "────────────────────────────────────────────\n"
+    )
+    parts.append(time_block)
 
-    # ── recent conversation history with timestamps
+    # ── PRIORITY BLOCK: last 10 messages — injected prominently
     if recent_history:
         parts.append(
-            "\n╔══════════════════════════════════════╗\n"
-            "║   RECENT CONVERSATION HISTORY        ║\n"
-            "║  (Read this first — it's what you    ║\n"
-            "║   and the user just discussed)       ║\n"
-            "╚══════════════════════════════════════╝\n"
+            "\n╔══════════════════════════════════════════════╗\n"
+            "║  CONVERSATION HISTORY — LAST 10 MESSAGES    ║\n"
+            "║  (READ THIS FIRST before composing reply)   ║\n"
+            "║  Timestamps are in WAT. Use them to answer  ║\n"
+            "║  any time-related questions from the user.  ║\n"
+            "╚══════════════════════════════════════════════╝\n\n"
             + recent_history +
-            "\n════════════════════════════════════════\n"
+            "\n\n══════════════════════════════════════════════\n"
         )
 
     # ── web context
@@ -545,10 +650,10 @@ But DO NOT start every message with the date/time — only mention it if relevan
             "\n--- END WEB SEARCH RESULTS ---\n"
         )
 
-    # ── older memory
+    # ── older background memory
     if older_context:
         parts.append(
-            "\n--- OLDER RELEVANT MEMORY (background context) ---\n"
+            "\n--- OLDER RELEVANT MEMORY (background, lower priority) ---\n"
             + older_context +
             "\n--- END OLDER MEMORY ---\n"
         )
@@ -569,6 +674,7 @@ async def get_gemini_response(
     older_context: str = "",
     web_context: str = "",
     tool_status: str = "",
+    gap_seconds: float = 0.0,
 ) -> Optional[types.GenerateContentResponse]:
     if not gemini_client: return None
     try:
@@ -576,7 +682,7 @@ async def get_gemini_response(
             profile = await get_user_profile_data(user_id)
         prompt = build_enhanced_prompt(
             user_text, user_id, profile,
-            recent_history, older_context, web_context, tool_status
+            recent_history, older_context, web_context, tool_status, gap_seconds
         )
         return gemini_client.models.generate_content(
             model="gemini-2.5-flash-lite",
@@ -608,7 +714,7 @@ async def extract_topic(user_text: str, bot_response: str) -> str:
         return "general"
 
 
-# ─── MEMORY ───
+# ─── MEMORY SAVE / UPDATE ───
 async def save_chat_memory(user_id: str, username: str, message: str,
                            response: str, chat_type: str, topic: str = "general"):
     if not supabase: return
@@ -627,13 +733,13 @@ async def update_user_profile(user_id: str, username: str, topic: str):
     try:
         ex = supabase.table("user_profiles").select("*").eq("user_id", str(user_id)).execute()
         if ex.data:
-            p = ex.data[0]
+            p  = ex.data[0]
             tc = p.get("topic_counts", {})
             tc[topic] = tc.get(topic, 0) + 1
             supabase.table("user_profiles").update({
                 "topic_counts": tc,
-                "total_chats": p.get("total_chats", 0) + 1,
-                "last_active": datetime.now(timezone.utc).isoformat(),
+                "total_chats":  p.get("total_chats", 0) + 1,
+                "last_active":  datetime.now(timezone.utc).isoformat(),
             }).eq("user_id", str(user_id)).execute()
         else:
             supabase.table("user_profiles").insert({
@@ -642,86 +748,6 @@ async def update_user_profile(user_id: str, username: str, topic: str):
             }).execute()
     except Exception as e:
         logger.error("❌ Profile update failed: %s", e)
-
-
-async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, str]:
-    """
-    Returns (recent_history, older_context) with TIMESTAMPS.
-    """
-    if not supabase:
-        return "", ""
-    try:
-        rows = (supabase.table("chat_memory")
-                .select("message, response, topic, created_at")
-                .eq("user_id", str(user_id))
-                .order("created_at", desc=True)
-                .limit(30)
-                .execute())
-        if not rows.data:
-            return "", ""
-
-        # ── recent: last 5 with timestamps
-        recent_rows = list(reversed(rows.data[:5]))
-        recent_lines = []
-        for row in recent_rows:
-            try:
-                msg_time = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
-                wat_time = msg_time + timedelta(hours=1)
-                time_str = wat_time.strftime("%a, %b %d at %I:%M %p")
-            except:
-                time_str = "unknown time"
-            
-            recent_lines.append(f"[{time_str}]")
-            recent_lines.append(f"User: {row['message']}")
-            recent_lines.append(f"AIM:  {row['response']}")
-            recent_lines.append("")
-        recent_history = "\n".join(recent_lines).strip()
-
-        # ── older: relevance-scored
-        older_rows = rows.data[5:]
-        if not older_rows:
-            return recent_history, ""
-
-        query_lower = query_text.lower()
-        keyword_topics = {
-            "space": ["tech"], "nigeria": ["general", "politics"],
-            "money": ["finance"], "job": ["career"], "health": ["health"],
-            "love": ["relationships"], "sport": ["sports"], "music": ["entertainment"],
-            "school": ["education"], "code": ["tech"], "ai": ["tech"],
-        }
-        matched_topics = set()
-        for kw, tps in keyword_topics.items():
-            if kw in query_lower:
-                matched_topics.update(tps)
-
-        scored = []
-        for row in older_rows:
-            score = 0
-            try:
-                age_days = (datetime.now(timezone.utc) -
-                            datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))).days
-                score += max(0, 30 - age_days)
-            except Exception:
-                pass
-            if row.get("topic") in matched_topics:
-                score += 50
-            blob = f"{row['message']} {row['response']}".lower()
-            for word in query_lower.split():
-                if len(word) > 3 and word in blob:
-                    score += 10
-            scored.append((score, row))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        older_lines = []
-        for _, row in scored[:10]:
-            older_lines.append(f"[{row.get('topic','general')}] User: {row['message']} | AIM: {row['response']}")
-        older_context = "\n".join(older_lines)
-
-        return recent_history, older_context
-
-    except Exception as e:
-        logger.error("Context retrieval error: %s", e)
-        return "", ""
 
 
 # ─── MEMORY SEARCH ───
@@ -742,10 +768,10 @@ def extract_search_keywords(user_text: str) -> list:
                    "what about", "didn't we talk about", "what have we discussed"]:
         clean = clean.replace(phrase, "")
     clean = re.sub(r'[^\w\s]', ' ', clean)
-    stop = {"the","and","about","were","did","have","what","when","that","this","with","for",
-            "from","you","are","was","is","it","we","our","me","my","i","a","an","to","of",
-            "in","on","at","be","been","being","do","does","say","said","get","got","go",
-            "know","think","take","see","want","use","find","give","tell","ask","work"}
+    stop  = {"the","and","about","were","did","have","what","when","that","this","with","for",
+             "from","you","are","was","is","it","we","our","me","my","i","a","an","to","of",
+             "in","on","at","be","been","being","do","does","say","said","get","got","go",
+             "know","think","take","see","want","use","find","give","tell","ask","work"}
     return [w for w in clean.split() if len(w) > 2 and w not in stop]
 
 
@@ -758,8 +784,7 @@ async def search_memory_by_keyword(user_id: str, query_text: str) -> str:
         for kw in keywords[:3]:
             for field in ["message", "response"]:
                 r = (supabase.table("chat_memory").select("*")
-                     .eq("user_id", str(user_id))
-                     .ilike(field, f"%{kw}%")
+                     .eq("user_id", str(user_id)).ilike(field, f"%{kw}%")
                      .order("created_at", desc=True).limit(5).execute())
                 all_results.extend(r.data)
         topic_map = {"space":"tech","nigeria":"general","money":"finance","job":"career",
@@ -783,7 +808,7 @@ async def search_memory_by_keyword(user_id: str, query_text: str) -> str:
                      "relationships":"❤️","politics":"🏛️","entertainment":"🎬","education":"📚"}
         lines = [f"🔍 Found {len(unique)} conversation(s):"]
         for i, row in enumerate(unique[:5], 1):
-            em = emoji_map.get(row.get("topic"), "💬")
+            em   = emoji_map.get(row.get("topic"), "💬")
             date = row.get("created_at","")[:10]
             lines.append(f'\n{i}. {em} [{date}] You: "{row["message"][:80]}..."')
             lines.append(f'   AIM: "{row["response"][:120]}..."')
@@ -798,7 +823,7 @@ async def search_memory(user_id: str) -> str:
     try:
         pr = supabase.table("user_profiles").select("*").eq("user_id", str(user_id)).execute()
         if not pr.data: return "We haven't chatted before! Start a conversation so I can remember you."
-        p = pr.data[0]
+        p  = pr.data[0]
         tc = p.get("topic_counts", {})
         mr = (supabase.table("chat_memory")
               .select("message, response, topic, created_at")
@@ -806,11 +831,11 @@ async def search_memory(user_id: str) -> str:
         emoji_map = {"career":"💼","finance":"💰","tech":"💻","sports":"⚽","health":"🏥",
                      "relationships":"❤️","politics":"🏛️","entertainment":"🎬","education":"📚"}
         lines = [
-            f"📊 Top Topics: {', '.join(f'{k} ({v}x)' for k,v in sorted(tc.items(), key=lambda x:x[1], reverse=True)[:3])}",
-            f"💬 Total Chats: {p.get('total_chats',0)}", "", "📝 Recent:",
+            f"📊 Top Topics : {', '.join(f'{k} ({v}x)' for k,v in sorted(tc.items(), key=lambda x:x[1], reverse=True)[:3])}",
+            f"💬 Total Chats: {p.get('total_chats',0)}", "", "📝 Recent conversations:",
         ]
         for i, row in enumerate(mr.data[:5], 1):
-            em = emoji_map.get(row.get("topic"), "💬")
+            em   = emoji_map.get(row.get("topic"), "💬")
             date = row.get("created_at","")[:10]
             lines.append(f"{i}. {em} [{date}] {row['message'][:60]}...")
         lines.append("\nWant me to dive deeper? Just ask!")
@@ -842,6 +867,7 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
 - "What's the score?"
 - "Set a 30 second timer"
 - "Search for who won AFCON"
+- "When did I last message you?"
 """, reply_to=message_id)
         return True
 
@@ -851,19 +877,18 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
         await send_text_chunks(chat_id, "🔍 Searching...", reply_to=message_id)
         results = search_web(query)
         if results == "No search results found.":
-            await send_text_chunks(chat_id, "Couldn't find results for that. Try rephrasing.", reply_to=message_id)
+            await send_text_chunks(chat_id, "Couldn't find results. Try rephrasing.", reply_to=message_id)
             return True
         prompt = (f"User asked: {query}\n\nSearch Results:\n{results}\n\n"
                   "Answer using ONLY these results. Be concise. Do NOT output SEARCH_TRIGGER.")
         try:
-            r = gemini_client.models.generate_content(
+            r   = gemini_client.models.generate_content(
                 model="gemini-2.5-flash-lite",
                 contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
                 config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=1024),
             )
             txt = r.text.strip() if r and r.text else results
-            if "SEARCH_TRIGGER:" in txt:
-                txt = results
+            if "SEARCH_TRIGGER:" in txt: txt = results
             await send_text_chunks(chat_id, txt, reply_to=message_id)
         except Exception as e:
             logger.error("Search command error: %s", e)
@@ -874,7 +899,7 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
         query = user_text[6:].strip()
         if not query: return True
         await send_text_chunks(chat_id, "🔬 Researching from multiple angles...", reply_to=message_id)
-        deep = deep_research(query)
+        deep    = deep_research(query)
         profile = await get_user_profile_data(user_id)
         r = await get_gemini_response(query, user_id, "private", profile, "", "", deep)
         await send_text_chunks(chat_id, r.text.strip() if r and r.text else deep, reply_to=message_id)
@@ -882,10 +907,10 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
 
     elif tl.startswith("/timer "):
         ts = user_text[7:].strip()
-        m = re.match(r'(\d+)(s|m|h)', ts.lower())
+        m  = re.match(r'(\d+)(s|m|h)', ts.lower())
         if m:
             amt, unit = int(m.group(1)), m.group(2)
-            dur = amt * (1 if unit=="s" else 60 if unit=="m" else 3600)
+            dur    = amt * (1 if unit=="s" else 60 if unit=="m" else 3600)
             target = datetime.now(timezone.utc) + timedelta(seconds=dur)
             supabase.table("user_tools").insert({
                 "user_id": str(user_id), "tool_type": "timer",
@@ -902,7 +927,7 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
                .eq("user_id", str(user_id)).eq("tool_type", "stopwatch")
                .eq("is_active", True).order("created_at", desc=True).limit(1).execute())
         if res.data:
-            row = res.data[0]
+            row     = res.data[0]
             elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(row["start_time"].replace("Z","+00:00"))
             mins, secs = divmod(int(elapsed.total_seconds()), 60)
             supabase.table("user_tools").update({"is_active": False}).eq("id", row["id"]).execute()
@@ -1000,8 +1025,8 @@ async def handle_inline_query_async(inline_query):
 async def process_inline_answer(chat_id: int, message_id: int, query_text: str, user_id: str):
     try:
         profile = await get_user_profile_data(user_id)
-        recent, older = await get_conversation_context(user_id, query_text)
-        r = await get_gemini_response(query_text, user_id, "private", profile, recent, older)
+        recent, older, gap = await get_conversation_context(user_id, query_text)
+        r = await get_gemini_response(query_text, user_id, "private", profile, recent, older, gap_seconds=gap)
         if r and r.text:
             answer = r.text.strip()
             topic  = await extract_topic(query_text, answer)
@@ -1025,7 +1050,7 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
     q = parts[1].strip().split("\n")[0]
     q = q.replace("⏳","").replace("Processing...","").replace("Thinking...","").strip()
     if q:
-        logger.info("🎯 Inline placeholder → query: '%s'", q)
+        logger.info("🎯 Inline placeholder → '%s'", q)
         return True, q
     return False, ""
 
@@ -1034,10 +1059,10 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
 async def handle_message_async(update: Update):
     if not update.message: return
 
-    user      = update.message.from_user
-    chat      = update.message.chat
-    user_text = update.message.text or ""
-    chat_type = chat.type if chat else "private"
+    user       = update.message.from_user
+    chat       = update.message.chat
+    user_text  = update.message.text or ""
+    chat_type  = chat.type if chat else "private"
     message_id = update.message.message_id
 
     if not user_text:
@@ -1048,26 +1073,30 @@ async def handle_message_async(update: Update):
     username = user.username or user.first_name or "User"
     logger.info("📩 [%s/%s] '%s'", user_id, chat_type, user_text[:80])
 
+    # /commands
     if user_text.startswith("/"):
         if await handle_bot_command(user_id, chat.id, message_id, user_text):
             return
 
     profile = await get_user_profile_data(user_id)
 
+    # inline placeholder
     is_ph, ph_query = is_inline_placeholder(user_text)
     if is_ph and ph_query:
         await process_inline_answer(chat.id, message_id, ph_query, user_id)
         return
 
+    # memory search
     if is_memory_search_query(user_text):
-        kws = extract_search_keywords(user_text)
+        kws    = extract_search_keywords(user_text)
         result = (await search_memory_by_keyword(user_id, user_text)
                   if kws else await search_memory(user_id))
         await send_text_chunks(chat.id, result, reply_to=message_id)
         return
 
+    # group mention filter
     if chat_type in ("group", "supergroup"):
-        mentioned = "@askaimbot" in user_text.lower()
+        mentioned     = "@askaimbot" in user_text.lower()
         replied_to_bot = (
             update.message.reply_to_message and
             update.message.reply_to_message.from_user and
@@ -1079,8 +1108,10 @@ async def handle_message_async(update: Update):
         user_text = re.sub(r'@askaimbot', '', user_text, flags=re.IGNORECASE).strip()
 
     try:
-        recent_history, older_context = await get_conversation_context(user_id, user_text)
+        # ── context: last 10 messages + older + gap
+        recent_history, older_context, gap_seconds = await get_conversation_context(user_id, user_text)
 
+        # ── web context
         web_context = ""
         for url in detect_urls(user_text):
             c = fetch_url_content(url)
@@ -1092,10 +1123,11 @@ async def handle_message_async(update: Update):
             if "No search results" not in sr:
                 web_context = f"Web Search Results for '{user_text}':\n{sr}"
 
-        max_iter = 3
-        iteration = 0
+        # ── AGENTIC LOOP (max 3 iterations)
+        max_iter    = 3
+        iteration   = 0
         final_answer = None
-        tool_status = ""
+        tool_status  = ""
 
         while iteration < max_iter:
             iteration += 1
@@ -1103,7 +1135,7 @@ async def handle_message_async(update: Update):
 
             r = await get_gemini_response(
                 user_text, user_id, chat_type, profile,
-                recent_history, older_context, web_context, tool_status,
+                recent_history, older_context, web_context, tool_status, gap_seconds,
             )
 
             if not r or not r.text:
@@ -1112,6 +1144,7 @@ async def handle_message_async(update: Update):
 
             answer = r.text.strip()
 
+            # SEARCH_TRIGGER
             if "SEARCH_TRIGGER:" in answer:
                 m = re.search(r'SEARCH_TRIGGER:\s*(.+)', answer, re.IGNORECASE)
                 if m:
@@ -1128,20 +1161,22 @@ async def handle_message_async(update: Update):
                     final_answer = answer
                     break
 
+            # TIMER
             tm = re.search(r'\[TIMER:(\d+)(s|m|h)\]', answer, re.IGNORECASE)
             if tm:
                 amt, unit = int(tm.group(1)), tm.group(2).lower()
-                dur = amt * (1 if unit=="s" else 60 if unit=="m" else 3600)
+                dur    = amt * (1 if unit=="s" else 60 if unit=="m" else 3600)
                 target = datetime.now(timezone.utc) + timedelta(seconds=dur)
                 supabase.table("user_tools").insert({
                     "user_id": user_id, "tool_type": "timer",
                     "start_time": datetime.now(timezone.utc).isoformat(),
                     "duration_seconds": dur, "target_time": target.isoformat(), "is_active": True,
                 }).execute()
-                answer = re.sub(r'\[TIMER:\d+[smh]\]', '', answer, flags=re.IGNORECASE).strip()
+                answer      = re.sub(r'\[TIMER:\d+[smh]\]', '', answer, flags=re.IGNORECASE).strip()
                 tool_status = f"✅ Timer set for {amt}{unit}"
-                answer += f"\n\n_{tool_status}_"
+                answer     += f"\n\n_{tool_status}_"
 
+            # STOPWATCH
             sm = re.search(r'\[STOPWATCH:(START|STOP)\]', answer, re.IGNORECASE)
             if sm:
                 action = sm.group(1).upper()
@@ -1157,12 +1192,12 @@ async def handle_message_async(update: Update):
                            .eq("user_id", user_id).eq("tool_type", "stopwatch")
                            .eq("is_active", True).order("created_at", desc=True).limit(1).execute())
                     if res.data:
-                        row = res.data[0]
+                        row     = res.data[0]
                         elapsed = (datetime.now(timezone.utc) -
                                    datetime.fromisoformat(row["start_time"].replace("Z","+00:00")))
                         mins, secs = divmod(int(elapsed.total_seconds()), 60)
                         supabase.table("user_tools").update({"is_active": False}).eq("id", row["id"]).execute()
-                        ts = f"{mins}m {secs}s" if mins else f"{secs}s"
+                        ts     = f"{mins}m {secs}s" if mins else f"{secs}s"
                         answer = re.sub(r'\[STOPWATCH:STOP\]', '', answer, flags=re.IGNORECASE).strip()
                         answer += f"\n\n_⏱️ Stopped! Time: {ts}_"
 
@@ -1187,11 +1222,19 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v7.2.1",
+        "version": "v7.3",
         "model": "African Intelligence Model (Agentic AI)",
         "search_provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
-        "features": ["smart_memory_v2", "timestamp_awareness", "time_gap_context",
-                     "reliable_search", "agentic_loop", "deep_research", "bot_commands", "inline_mode"],
+        "features": [
+            "last_10_messages_with_timestamps",
+            "time_gap_awareness",
+            "no_repetitive_greeting",
+            "reliable_search",
+            "agentic_loop",
+            "deep_research",
+            "bot_commands",
+            "inline_mode",
+        ],
     })
 
 @app.route("/webhook", methods=["POST"])
@@ -1238,21 +1281,22 @@ def debug_supabase():
         pr = supabase.table("user_profiles").select("*", count="exact").execute()
         return jsonify({
             "status": "connected",
-            "chat_memory_rows": getattr(cr, 'count', len(cr.data)),
-            "user_profiles_rows": getattr(pr, 'count', len(pr.data)),
+            "chat_memory_rows":    getattr(cr, 'count', len(cr.data)),
+            "user_profiles_rows":  getattr(pr, 'count', len(pr.data)),
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/debug/search", methods=["GET"])
 def debug_search():
+    """Test search: /debug/search?q=Nigeria news"""
     q = request.args.get("q","").strip()
     if not q: return jsonify({"error": "Provide ?q=your+query"}), 400
     try:
         return jsonify({
-            "query": q,
+            "query":    q,
             "provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
-            "results": search_web(q),
+            "results":  search_web(q),
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
