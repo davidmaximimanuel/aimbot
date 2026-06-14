@@ -1,33 +1,11 @@
 """
-AIM Bot v7.2 — African Intelligence Model (Agentic AI + Deep Research)
+AIM Bot v7.2.1 — African Intelligence Model (Agentic AI + Deep Research)
 Smart Memory + User Preferences + Professional Tone + Time Awareness + Tools + Web Search + Bot Commands
 
-CHANGES FROM v7.1:
-
-  FIX 1 — CONTEXT MEMORY:
-  - The old approach buried conversation history deep inside a long prompt blob,
-    so Gemini would often ignore it and lose track of the conversation.
-  - Fixed by injecting the last 5 messages in a proper conversational format
-    at the TOP of the prompt (right after the system prompt), clearly labeled
-    "RECENT CONVERSATION HISTORY". This is the most important context and
-    Gemini attends to it much better when it's near the top.
-  - Older relevant messages are still passed but clearly separated as
-    "OLDER RELEVANT MEMORY" so Gemini knows what's recent vs. background.
-
-  FIX 2 — SEARCH RELIABILITY:
-  - deep_research() was trying to scrape actual websites (requests.get on links).
-    This is extremely unreliable — most sites use JS rendering, Cloudflare, 
-    paywalls, or block bots. It caused crashes and empty responses.
-  - REMOVED page scraping entirely from deep_research().
-  - NEW APPROACH: deep_research() now runs MULTIPLE search queries (3 angles
-    on the same topic) and aggregates all the snippets. DuckDuckGo and Brave
-    snippets are actually detailed enough for Gemini to synthesize good answers.
-  - search_web() now returns up to 5 results by default (was 3) for better
-    coverage per query.
-  - fetch_url_content() still exists for when users paste a direct URL —
-    but it's no longer called blindly on search results.
-  - Added a 3-second timeout safety and better error messages so crashes
-    don't bubble up to the user.
+CHANGES FROM v7.2:
+  - Added timestamp awareness to conversation history so AIM knows when messages happened
+  - Added time gap calculation so AIM can say "it's been a while" after long gaps
+  - Fixed repetitive "Hello there! It's [date]" greeting - now only mentions time when relevant
 """
 
 import os
@@ -66,7 +44,7 @@ GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "")
 WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")
-BRAVE_API_KEY   = os.environ.get("BRAVE_API_KEY", "")   # optional — falls back to DDG Lite
+BRAVE_API_KEY   = os.environ.get("BRAVE_API_KEY", "")
 
 TELEGRAM_MAX_CHARS = 4096
 
@@ -112,7 +90,6 @@ logger.info("🧠 Loading semantic router model...")
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 SEARCH_TRIGGER_PHRASES = [
-    # Live / real-time
     "who won the match", "what is the score", "latest news about", "current events",
     "what happened today", "search for information", "look up", "find out about",
     "who knocked out", "eliminated from", "when did they win", "what is the price",
@@ -128,7 +105,6 @@ SEARCH_TRIGGER_PHRASES = [
     "kickoff time", "venue information", "ticket prices", "how to watch",
     "broadcast information", "streaming options", "what did this celebrity do",
     "Politics", "Sports", "Entertainment",
-    # Historical / factual sports
     "who stopped them from qualifying", "who stopped nigeria", "who knocked nigeria out",
     "why did nigeria not qualify", "who beat nigeria", "did nigeria qualify",
     "nigeria world cup", "super eagles result", "super eagles match", "afcon result",
@@ -139,12 +115,10 @@ SEARCH_TRIGGER_PHRASES = [
     "football result nigeria", "african football news", "premier league result",
     "champions league result", "world cup result", "who won the world cup",
     "who won afcon", "which team won", "which country qualified",
-    # General factual / knowledge
     "who invented", "what caused", "why did", "how did", "when did", "what year did",
     "tell me about", "give me information on", "what do you know about",
     "news about", "update on", "facts about", "history of", "background on",
     "what is going on with", "recent news", "what happened with", "explain what happened",
-    # Nigeria-specific
     "naira exchange rate", "dollar to naira", "fuel price nigeria",
     "nigerian government", "nigerian politics", "tinubu", "lagos news", "abuja news",
     "nigeria economy", "cbdc nigeria", "enaira", "nigeria inflation", "nigeria election",
@@ -200,11 +174,10 @@ def check_timers_background():
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
 
 # ═══════════════════════════════════════════════════════════
-# WEB SEARCH  (v7.2 — reliable snippet-based approach)
+# WEB SEARCH
 # ═══════════════════════════════════════════════════════════
 
 def _search_brave_api(query: str, max_results: int = 5) -> Optional[list]:
-    """Brave Search API — requires BRAVE_API_KEY env var."""
     if not BRAVE_API_KEY:
         return None
     try:
@@ -234,10 +207,6 @@ def _search_brave_api(query: str, max_results: int = 5) -> Optional[list]:
 
 
 def _search_duckduckgo_lite(query: str, max_results: int = 5) -> Optional[list]:
-    """
-    DuckDuckGo Lite — server-rendered HTML, no key required.
-    Only uses the summary snippets already on the page (no page scraping).
-    """
     try:
         resp = requests.post(
             "https://lite.duckduckgo.com/lite/",
@@ -280,13 +249,6 @@ def _search_duckduckgo_lite(query: str, max_results: int = 5) -> Optional[list]:
 
 
 def search_web(query: str, max_results: int = 5) -> str:
-    """
-    Primary search entry point.
-    Tries Brave API first, falls back to DuckDuckGo Lite.
-    Returns a formatted string of results ready to pass to Gemini.
-    NOTE: We use SNIPPETS only — no page scraping. Snippets are reliable
-    and sufficient for Gemini to give good answers.
-    """
     results = _search_brave_api(query, max_results)
     provider = "Brave API"
     if results is None:
@@ -307,18 +269,11 @@ def search_web(query: str, max_results: int = 5) -> str:
     return "\n\n".join(lines)
 
 
-# Backward-compatible alias
 def search_brave(query: str, max_results: int = 5) -> str:
     return search_web(query, max_results)
 
 
 def deep_research(query: str) -> str:
-    """
-    Deep research v7.2 — runs multiple search queries on the same topic
-    and aggregates all snippets. NO page scraping (was causing crashes).
-    Multiple angles give Gemini enough material for a thorough answer.
-    """
-    # Build 3 angle-variants of the query
     angle_queries = [
         query,
         f"{query} latest news",
@@ -352,10 +307,6 @@ def deep_research(query: str) -> str:
 
 
 def fetch_url_content(url: str) -> str:
-    """
-    Fetch text content from a URL the USER explicitly pasted.
-    Not used on search result links (too unreliable). Only for direct user links.
-    """
     try:
         resp = requests.get(
             url,
@@ -401,7 +352,7 @@ def is_search_query(text: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
-# PROMPTING  (v7.2 — context memory fix)
+# PROMPTING (v7.2.1 — timestamp awareness + no repetitive greeting)
 # ═══════════════════════════════════════════════════════════
 
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional AI assistant built for Africans, by Africans.
@@ -421,17 +372,33 @@ RULES:
 - Use emojis naturally but not excessively.
 
 CAPABILITIES:
-- Memory: You recall past conversations.
+- Memory: You recall past conversations with timestamps.
 - Time Tools: Timers and stopwatches.
-- Time Awareness: Current time in Lagos (WAT): {datetime_info}
+- Time Awareness: You know the current time and when the user last messaged you.
 - Web Search: Real-time web results available.
 
 CONVERSATION CONTINUITY (CRITICAL):
-- The RECENT CONVERSATION HISTORY below shows what was just discussed.
+- The RECENT CONVERSATION HISTORY below shows what was just discussed, with timestamps.
 - ALWAYS read it before responding.
 - If the user says something short like "yes", "ok", "tell me more", "go on" or asks a follow-up,
   treat it as continuing the previous topic — do NOT start fresh.
 - Reference what was previously said when relevant.
+- If the user uses pronouns (he, she, it, they, his, her), look at the IMMEDIATE PREVIOUS message
+  to figure out who or what the pronoun refers to. DO NOT search the web to resolve pronouns.
+
+TIME AWARENESS RULES (CRITICAL):
+- You know the current time and the time of the user's last message.
+- DO NOT start every message with "Hello there! It's [date] and [time]" — this is annoying and repetitive.
+- ONLY mention the time/date if:
+  * The user explicitly asks about time (e.g., "what time is it?", "how long has it been?")
+  * It's naturally relevant (e.g., late night: "You should get some rest soon")
+  * The user says "good morning", "good evening", etc.
+  * There's been a long gap since the last message (see TIME CONTEXT below)
+- If the user hasn't chatted in several hours, you can acknowledge it naturally:
+  * "It's been a while! How can I help you today?"
+  * "Welcome back! What's on your mind?"
+  * "Long time no see!"
+- Calculate the time gap between messages to determine if you should acknowledge it.
 
 ─────────────────────────────────────────
 SPECIAL INSTRUCTIONS — FOLLOW EXACTLY:
@@ -483,8 +450,8 @@ def build_enhanced_prompt(
     user_text: str,
     user_id: str,
     profile: dict,
-    recent_history: str = "",   # ← last 5 exchanges, formatted conversationally
-    older_context: str = "",    # ← older relevant memory
+    recent_history: str = "",
+    older_context: str = "",
     web_context: str = "",
     tool_status: str = "",
 ) -> str:
@@ -517,7 +484,48 @@ def build_enhanced_prompt(
     pref_lines.append("--- END PREFERENCES ---\n")
     parts.append("\n".join(pref_lines))
 
-    # ── FIX: recent conversation history injected PROMINENTLY near the top
+    # ── TIME GAP CONTEXT (NEW: so AIM knows how long it's been)
+    time_gap_info = ""
+    try:
+        last_msg = (supabase.table("chat_memory")
+                   .select("created_at")
+                   .eq("user_id", str(user_id))
+                   .order("created_at", desc=True)
+                   .limit(1)
+                   .execute())
+        
+        if last_msg.data:
+            last_time = datetime.fromisoformat(last_msg.data[0]["created_at"].replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            time_diff = now - last_time
+            
+            hours = time_diff.total_seconds() / 3600
+            days = hours / 24
+            
+            if hours < 1:
+                gap_text = f"{int(time_diff.total_seconds() / 60)} minutes ago"
+            elif hours < 24:
+                gap_text = f"{int(hours)} hours ago"
+            elif days < 7:
+                gap_text = f"{int(days)} days ago"
+            else:
+                gap_text = f"{int(days / 7)} weeks ago"
+            
+            time_gap_info = f"""
+--- TIME CONTEXT ---
+Current time: {now_wat.strftime('%A, %B %d, %Y at %I:%M %p')} WAT
+User's last message: {gap_text}
+If it's been more than 3 hours, you can acknowledge the time gap naturally (e.g., "It's been a while!", "Welcome back!", "Long time no see!").
+But DO NOT start every message with the date/time — only mention it if relevant or asked.
+--- END TIME CONTEXT ---
+"""
+    except Exception as e:
+        logger.error("Time gap calculation error: %s", e)
+    
+    if time_gap_info:
+        parts.append(time_gap_info)
+
+    # ── recent conversation history with timestamps
     if recent_history:
         parts.append(
             "\n╔══════════════════════════════════════╗\n"
@@ -529,7 +537,7 @@ def build_enhanced_prompt(
             "\n════════════════════════════════════════\n"
         )
 
-    # ── web context (search results)
+    # ── web context
     if web_context:
         parts.append(
             "\n--- WEB SEARCH RESULTS (real-time data) ---\n"
@@ -537,7 +545,7 @@ def build_enhanced_prompt(
             "\n--- END WEB SEARCH RESULTS ---\n"
         )
 
-    # ── older memory (lower priority)
+    # ── older memory
     if older_context:
         parts.append(
             "\n--- OLDER RELEVANT MEMORY (background context) ---\n"
@@ -638,12 +646,7 @@ async def update_user_profile(user_id: str, username: str, topic: str):
 
 async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, str]:
     """
-    Returns (recent_history, older_context) as two separate strings.
-
-    recent_history  → last 5 exchanges in conversational format (injected prominently)
-    older_context   → relevance-scored older messages (background info)
-
-    This separation is the key fix for context memory.
+    Returns (recent_history, older_context) with TIMESTAMPS.
     """
     if not supabase:
         return "", ""
@@ -657,13 +660,21 @@ async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, 
         if not rows.data:
             return "", ""
 
-        # ── recent: last 5 in chronological order (oldest first = natural flow)
+        # ── recent: last 5 with timestamps
         recent_rows = list(reversed(rows.data[:5]))
         recent_lines = []
         for row in recent_rows:
+            try:
+                msg_time = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
+                wat_time = msg_time + timedelta(hours=1)
+                time_str = wat_time.strftime("%a, %b %d at %I:%M %p")
+            except:
+                time_str = "unknown time"
+            
+            recent_lines.append(f"[{time_str}]")
             recent_lines.append(f"User: {row['message']}")
             recent_lines.append(f"AIM:  {row['response']}")
-            recent_lines.append("")   # blank line between exchanges
+            recent_lines.append("")
         recent_history = "\n".join(recent_lines).strip()
 
         # ── older: relevance-scored
@@ -1037,20 +1048,17 @@ async def handle_message_async(update: Update):
     username = user.username or user.first_name or "User"
     logger.info("📩 [%s/%s] '%s'", user_id, chat_type, user_text[:80])
 
-    # ── /commands
     if user_text.startswith("/"):
         if await handle_bot_command(user_id, chat.id, message_id, user_text):
             return
 
     profile = await get_user_profile_data(user_id)
 
-    # ── inline placeholder
     is_ph, ph_query = is_inline_placeholder(user_text)
     if is_ph and ph_query:
         await process_inline_answer(chat.id, message_id, ph_query, user_id)
         return
 
-    # ── memory search
     if is_memory_search_query(user_text):
         kws = extract_search_keywords(user_text)
         result = (await search_memory_by_keyword(user_id, user_text)
@@ -1058,7 +1066,6 @@ async def handle_message_async(update: Update):
         await send_text_chunks(chat.id, result, reply_to=message_id)
         return
 
-    # ── group mention filter
     if chat_type in ("group", "supergroup"):
         mentioned = "@askaimbot" in user_text.lower()
         replied_to_bot = (
@@ -1072,10 +1079,8 @@ async def handle_message_async(update: Update):
         user_text = re.sub(r'@askaimbot', '', user_text, flags=re.IGNORECASE).strip()
 
     try:
-        # ── get context (split into recent + older — KEY FIX)
         recent_history, older_context = await get_conversation_context(user_id, user_text)
 
-        # ── web context
         web_context = ""
         for url in detect_urls(user_text):
             c = fetch_url_content(url)
@@ -1087,7 +1092,6 @@ async def handle_message_async(update: Update):
             if "No search results" not in sr:
                 web_context = f"Web Search Results for '{user_text}':\n{sr}"
 
-        # ── AGENTIC LOOP (max 3 iterations)
         max_iter = 3
         iteration = 0
         final_answer = None
@@ -1108,7 +1112,6 @@ async def handle_message_async(update: Update):
 
             answer = r.text.strip()
 
-            # ── SEARCH_TRIGGER
             if "SEARCH_TRIGGER:" in answer:
                 m = re.search(r'SEARCH_TRIGGER:\s*(.+)', answer, re.IGNORECASE)
                 if m:
@@ -1125,7 +1128,6 @@ async def handle_message_async(update: Update):
                     final_answer = answer
                     break
 
-            # ── TIMER
             tm = re.search(r'\[TIMER:(\d+)(s|m|h)\]', answer, re.IGNORECASE)
             if tm:
                 amt, unit = int(tm.group(1)), tm.group(2).lower()
@@ -1140,7 +1142,6 @@ async def handle_message_async(update: Update):
                 tool_status = f"✅ Timer set for {amt}{unit}"
                 answer += f"\n\n_{tool_status}_"
 
-            # ── STOPWATCH
             sm = re.search(r'\[STOPWATCH:(START|STOP)\]', answer, re.IGNORECASE)
             if sm:
                 action = sm.group(1).upper()
@@ -1186,11 +1187,11 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v7.2",
+        "version": "v7.2.1",
         "model": "African Intelligence Model (Agentic AI)",
         "search_provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
-        "features": ["smart_memory_v2", "context_fix", "reliable_search",
-                     "agentic_loop", "deep_research", "bot_commands", "inline_mode"],
+        "features": ["smart_memory_v2", "timestamp_awareness", "time_gap_context",
+                     "reliable_search", "agentic_loop", "deep_research", "bot_commands", "inline_mode"],
     })
 
 @app.route("/webhook", methods=["POST"])
@@ -1245,7 +1246,6 @@ def debug_supabase():
 
 @app.route("/debug/search", methods=["GET"])
 def debug_search():
-    """Test search pipeline: /debug/search?q=Nigeria news"""
     q = request.args.get("q","").strip()
     if not q: return jsonify({"error": "Provide ?q=your+query"}), 400
     try:
