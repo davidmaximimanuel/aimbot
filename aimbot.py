@@ -1,5 +1,5 @@
 """
-AIM Bot v8.0 — African Intelligence Model (Rolling Memory + Multi-Language + All Sports)
+AIM Bot v8.1 — African Intelligence Model (API Integration + Fixed Topics)
 """
 
 import os
@@ -29,13 +29,15 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("aimbot")
 
-# ─── CONFIG ───
+# ─── CONFIG ──
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "")
 WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")
 BRAVE_API_KEY   = os.environ.get("BRAVE_API_KEY", "")
+GNEWS_API_KEY   = os.environ.get("GNEWS_API_KEY", "")
+SPORTAPI_KEY    = os.environ.get("SPORTAPI_KEY", "")
 
 TELEGRAM_MAX_CHARS = 4096
 
@@ -76,12 +78,21 @@ if BRAVE_API_KEY:
 else:
     logger.warning("⚠️ BRAVE_API_KEY not set — using DuckDuckGo Lite")
 
+if GNEWS_API_KEY:
+    logger.info("✅ GNews API key found")
+else:
+    logger.warning("⚠️ GNEWS_API_KEY not set")
+
+if SPORTAPI_KEY:
+    logger.info("✅ SportAPI key found")
+else:
+    logger.warning("⚠️ SPORTAPI_KEY not set")
+
 # ── SEMANTIC ROUTER ───
 logger.info("🧠 Loading semantic router model...")
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 SEARCH_TRIGGER_PHRASES = [
-    # Live / real-time
     "who won the match", "what is the score", "latest news about", "current events",
     "what happened today", "search for information", "look up", "find out about",
     "who knocked out", "eliminated from", "when did they win", "what is the price",
@@ -97,7 +108,6 @@ SEARCH_TRIGGER_PHRASES = [
     "kickoff time", "venue information", "ticket prices", "how to watch",
     "broadcast information", "streaming options", "what did this celebrity do",
     "Politics", "Sports", "Entertainment",
-    # All Sports (Expanded)
     "formula 1 result", "f1 race winner", "grand prix results", "max verstappen", "lewis hamilton",
     "nba score", "basketball result", "lebron james", "steph curry",
     "tennis result", "wimbledon winner", "us open tennis", "rafael nadal",
@@ -113,12 +123,10 @@ SEARCH_TRIGGER_PHRASES = [
     "football result nigeria", "african football news", "premier league result",
     "champions league result", "world cup result", "who won the world cup",
     "who won afcon", "which team won", "which country qualified",
-    # General factual / knowledge
     "who invented", "what caused", "why did", "how did", "when did", "what year did",
     "tell me about", "give me information on", "what do you know about",
     "news about", "update on", "facts about", "history of", "background on",
     "what is going on with", "recent news", "what happened with", "explain what happened",
-    # Nigeria-specific
     "naira exchange rate", "dollar to naira", "fuel price nigeria",
     "nigerian government", "nigerian politics", "tinubu", "lagos news", "abuja news",
     "nigeria economy", "cbdc nigeria", "enaira", "nigeria inflation", "nigeria election",
@@ -174,8 +182,143 @@ def check_timers_background():
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
 
 # ═══════════════════════════════════════════════════════════
-# WEB SEARCH
+# APIs (GNews + SportAPI)
 # ═══════════════════════════════════════════════════════════
+
+def get_latest_news(query: str, max_results: int = 5) -> str:
+    """Fetch latest news from GNews API."""
+    if not GNEWS_API_KEY:
+        return search_web(query, max_results)
+    
+    try:
+        url = "https://gnews.io/api/v4/search"
+        params = {
+            "q": query,
+            "apikey": GNEWS_API_KEY,
+            "lang": "en",
+            "country": "ng",  # Nigeria
+            "max": max_results,
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        
+        if resp.status_code != 200:
+            logger.warning("⚠️ GNews API status %s for '%s'", resp.status_code, query)
+            return search_web(query, max_results)
+        
+        data = resp.json()
+        articles = data.get("articles", [])
+        
+        if not articles:
+            logger.info("ℹ️ GNews: 0 results for '%s'", query)
+            return search_web(query, max_results)
+        
+        logger.info("✅ GNews: %d results for '%s'", len(articles), query)
+        
+        lines = []
+        for i, article in enumerate(articles[:max_results], 1):
+            title = article.get("title", "")
+            desc = article.get("description", "")
+            source = article.get("source", {}).get("name", "")
+            url = article.get("url", "")
+            published = article.get("publishedAt", "")[:16].replace("T", " ") if article.get("publishedAt") else ""
+            
+            lines.append(f"{i}. {title}\n   Source: {source} | {published}\n   Summary: {desc}\n   Link: {url}")
+        
+        return "\n\n".join(lines)
+    except Exception as e:
+        logger.error("GNews API error: %s", e)
+        return search_web(query, max_results)
+
+
+def get_sports_data(query: str) -> str:
+    """Fetch sports data from SportAPI (RapidAPI)."""
+    if not SPORTAPI_KEY:
+        return search_web(query, 5)
+    
+    try:
+        # SportAPI base URL
+        base_url = "https://sportapi7.p.rapidapi.com/api/v1"
+        headers = {
+            "X-RapidAPI-Key": SPORTAPI_KEY,
+            "X-RapidAPI-Host": "sportapi7.p.rapidapi.com"
+        }
+        
+        # Check if query is about live events
+        if "live" in query.lower() or "now" in query.lower():
+            endpoint = f"{base_url}/event/live"
+        # Check if query is about a specific sport/category
+        elif "football" in query.lower() or "soccer" in query.lower():
+            endpoint = f"{base_url}/event/scheduled/date"
+        else:
+            # Default to scheduled events
+            endpoint = f"{base_url}/event/scheduled/date"
+        
+        params = {"lang": "en"}
+        resp = requests.get(endpoint, headers=headers, params=params, timeout=10)
+        
+        if resp.status_code != 200:
+            logger.warning("⚠️ SportAPI status %s for '%s'", resp.status_code, query)
+            return search_web(query, 5)
+        
+        data = resp.json()
+        
+        # Parse the response based on the endpoint
+        if "live" in endpoint:
+            events = data.get("data", [])
+            if not events:
+                return "No live events at the moment."
+            
+            lines = ["🔴 LIVE EVENTS:\n"]
+            for event in events[:5]:
+                home = event.get("home", {}).get("name", "")
+                away = event.get("away", {}).get("name", "")
+                score = event.get("score", {})
+                home_score = score.get("home", 0)
+                away_score = score.get("away", 0)
+                lines.append(f"⚽ {home} {home_score} - {away_score} {away}")
+            
+            return "\n".join(lines)
+        else:
+            # Scheduled events
+            events = data.get("data", [])
+            if not events:
+                return search_web(query, 5)
+            
+            lines = ["📅 UPCOMING EVENTS:\n"]
+            for event in events[:5]:
+                home = event.get("home", {}).get("name", "")
+                away = event.get("away", {}).get("name", "")
+                start_time = event.get("startTimestamp", 0)
+                if start_time:
+                    dt = datetime.fromtimestamp(start_time, tz=timezone.utc)
+                    time_str = dt.strftime("%b %d, %H:%M")
+                else:
+                    time_str = "TBD"
+                lines.append(f"⚽ {home} vs {away}\n   Time: {time_str}")
+            
+            return "\n".join(lines)
+    except Exception as e:
+        logger.error("SportAPI error: %s", e)
+        return search_web(query, 5)
+
+
+def search_web(query: str, max_results: int = 5) -> str:
+    """Fallback web search using Brave or DuckDuckGo."""
+    results = _search_brave_api(query, max_results) if BRAVE_API_KEY else None
+    provider = "Brave API"
+    if results is None:
+        results = _search_duckduckgo_lite(query, max_results)
+        provider = "DuckDuckGo Lite"
+    if not results:
+        logger.warning("❌ All search providers failed for '%s'", query)
+        return "No search results found."
+
+    logger.info("🔍 '%s' → %s (%d results)", query, provider, len(results))
+    lines = []
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r['title']}\n   Summary: {r['description']}\n   Source: {r['url']}")
+    return "\n\n".join(lines)
+
 
 def _search_brave_api(query: str, max_results: int = 5) -> Optional[list]:
     if not BRAVE_API_KEY:
@@ -188,15 +331,12 @@ def _search_brave_api(query: str, max_results: int = 5) -> Optional[list]:
             timeout=10,
         )
         if resp.status_code != 200:
-            logger.warning("⚠️ Brave API status %s for '%s'", resp.status_code, query)
             return None
         items = resp.json().get("web", {}).get("results", [])
         if not items:
             return None
-        results = [{"title": i.get("title",""), "description": i.get("description",""), "url": i.get("url","")}
-                   for i in items[:max_results]]
-        logger.info("✅ Brave API: %d results for '%s'", len(results), query)
-        return results
+        return [{"title": i.get("title",""), "description": i.get("description",""), "url": i.get("url","")}
+                for i in items[:max_results]]
     except Exception as e:
         logger.error("Brave API error for '%s': %s", query, e)
         return None
@@ -211,7 +351,6 @@ def _search_duckduckgo_lite(query: str, max_results: int = 5) -> Optional[list]:
             timeout=10,
         )
         if resp.status_code != 200:
-            logger.warning("️ DuckDuckGo Lite status %s for '%s'", resp.status_code, query)
             return None
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -229,36 +368,10 @@ def _search_duckduckgo_lite(query: str, max_results: int = 5) -> Optional[list]:
                         description = td.get_text(strip=True)
             if title and href:
                 results.append({"title": title, "description": description, "url": href})
-
-        if not results:
-            logger.info("ℹ️ DuckDuckGo Lite: 0 results for '%s'", query)
-            return None
-        logger.info("✅ DuckDuckGo Lite: %d results for '%s'", len(results), query)
-        return results
+        return results if results else None
     except Exception as e:
         logger.error("DuckDuckGo Lite error for '%s': %s", query, e)
         return None
-
-
-def search_web(query: str, max_results: int = 5) -> str:
-    results = _search_brave_api(query, max_results)
-    provider = "Brave API"
-    if results is None:
-        results = _search_duckduckgo_lite(query, max_results)
-        provider = "DuckDuckGo Lite"
-    if not results:
-        logger.warning("❌ All search providers failed for '%s'", query)
-        return "No search results found."
-
-    logger.info("🔍 '%s' → %s (%d results)", query, provider, len(results))
-    lines = []
-    for i, r in enumerate(results, 1):
-        lines.append(f"{i}. {r['title']}\n   Summary: {r['description']}\n   Source: {r['url']}")
-    return "\n\n".join(lines)
-
-
-def search_brave(query: str, max_results: int = 5) -> str:
-    return search_web(query, max_results)
 
 
 def deep_research(query: str) -> str:
@@ -266,7 +379,9 @@ def deep_research(query: str) -> str:
     all_results = []
     seen_urls = set()
     for q in angle_queries:
-        results = _search_brave_api(q, 4) or _search_duckduckgo_lite(q, 4)
+        results = _search_brave_api(q, 4) if BRAVE_API_KEY else None
+        if results is None:
+            results = _search_duckduckgo_lite(q, 4)
         if results:
             for r in results:
                 if r["url"] not in seen_urls:
@@ -322,7 +437,7 @@ def is_search_query(text: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
-# PROMPTING (v8.0 — Rolling Memory + Multi-Language + All Sports)
+# PROMPTING (v8.1 — API Integration + Fixed Topics)
 # ═══════════════════════════════════════════════════════════
 
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional, highly intelligent AI assistant built for Africans, by Africans.
@@ -350,6 +465,8 @@ CAPABILITIES:
 - Time Awareness: You know the current time and when we last spoke.
 - Web Search: Real-time web results available.
 - Sports: You cover ALL sports (Football, F1, Basketball, Tennis, Boxing, UFC, Rugby, Cricket, etc.).
+- News: Real-time news from Nigeria and worldwide.
+- Entertainment: Movies, TV shows, reality TV, music, celebrities.
 
 CONVERSATION CONTINUITY:
 - Read the "SESSION SUMMARY" and "RECENT HISTORY" before responding.
@@ -407,10 +524,8 @@ async def get_session_summary(user_id: str) -> str:
             now = datetime.now(timezone.utc)
             hours_since = (now - last_active).total_seconds() / 3600
             
-            # TIME DECAY: If > 3 hours, discard summary
             if hours_since > 3:
                 logger.info("🕒 Time decay triggered (>3h). Clearing session summary for user %s", user_id)
-                # Clear it in DB
                 supabase.table("user_profiles").update({"session_summary": ""}).eq("user_id", str(user_id)).execute()
                 return ""
             return summary
@@ -426,14 +541,13 @@ async def update_session_summary(user_id: str, recent_messages: list, current_su
     if not gemini_client or not supabase: return
     
     try:
-        # Format recent messages for summarization
         msg_text = "\n".join([f"User: {m['message']}\nAIM: {m['response']}" for m in recent_messages])
         
         prompt = f"""Current Summary: {current_summary if current_summary else 'None yet'}
 New Messages:
 {msg_text}
 
-Task: Create a concise, updated summary of the conversation. Include key facts about the user, ongoing topics, and important context. Keep it under 150 words. If the new messages are just greetings, keep the old summary."""
+Task: Create a concise, updated summary of the conversation. Include key facts about the user, ongoing topics, and important context. Keep it under 150 words."""
 
         r = gemini_client.models.generate_content(
             model="gemini-2.5-flash-lite",
@@ -468,7 +582,6 @@ def build_enhanced_prompt(
 
     parts = [BASE_SYSTEM_PROMPT.format(datetime_info=datetime_info)]
 
-    # ── user prefs
     pref_language = profile.get("preferred_language", "english")
     topic_counts  = profile.get("topic_counts", {})
     total_chats   = profile.get("total_chats", 0)
@@ -485,7 +598,6 @@ def build_enhanced_prompt(
     pref_lines.append("--- END PREFERENCES ---\n")
     parts.append("\n".join(pref_lines))
 
-    # ── TIME GAP CONTEXT
     time_gap_info = ""
     try:
         last_msg = (supabase.table("chat_memory")
@@ -515,7 +627,7 @@ def build_enhanced_prompt(
 --- TIME CONTEXT ---
 Current time: {now_wat.strftime('%A, %B %d, %Y at %I:%M %p')} WAT
 User's last message: {gap_text}
-If it's been more than 3 hours, acknowledge the time gap naturally (e.g., "It's been a while!", "Welcome back!").
+If it's been more than 3 hours, acknowledge the time gap naturally.
 DO NOT start every message with the date/time.
 --- END TIME CONTEXT ---
 """
@@ -525,7 +637,6 @@ DO NOT start every message with the date/time.
     if time_gap_info:
         parts.append(time_gap_info)
 
-    # ── SESSION SUMMARY (Rolling Memory)
     if session_summary:
         parts.append(
             "\n╔══════════════════════════════════════╗\n"
@@ -536,7 +647,6 @@ DO NOT start every message with the date/time.
             "\n════════════════════════════════════════\n"
         )
 
-    # ── recent conversation history with timestamps
     if recent_history:
         parts.append(
             "\n╔══════════════════════════════════════╗\n"
@@ -547,7 +657,6 @@ DO NOT start every message with the date/time.
             "\n════════════════════════════════════════\n"
         )
 
-    # ── web context
     if web_context:
         parts.append(
             "\n--- WEB SEARCH RESULTS (real-time data) ---\n"
@@ -555,7 +664,6 @@ DO NOT start every message with the date/time.
             "\n--- END WEB SEARCH RESULTS ---\n"
         )
 
-    # ── older memory
     if older_context:
         parts.append(
             "\n--- OLDER RELEVANT MEMORY (background context) ---\n"
@@ -599,14 +707,32 @@ async def get_gemini_response(
         return None
 
 
-# ─── TOPIC EXTRACTION ───
+# ─── TOPIC EXTRACTION (FIXED) ───
 async def extract_topic(user_text: str, bot_response: str) -> str:
     if not gemini_client: return "general"
-    topics = ["career", "finance", "tech", "sports", "health", "relationships",
+    topics = ["career", "finance", "tech", "sports", "health", "relationships", 
               "politics", "entertainment", "education", "general"]
-    prompt = (f"Classify this conversation into ONE topic from: {', '.join(topics)}.\n"
-              f"User: {user_text[:200]}\nAIM: {bot_response[:200]}\n"
-              "Return ONLY the topic word, nothing else.")
+    
+    prompt = f"""Classify this conversation into ONE topic from: {', '.join(topics)}.
+
+User: {user_text[:200]}
+AIM: {bot_response[:200]}
+
+Examples:
+- "I love my girlfriend" → relationships
+- "My heart is troubled" → health
+- "I'm stressed about work" → career
+- "How to invest money" → finance
+- "Who won the match" → sports
+- "Python code error" → tech
+- "Math homework help" → education
+- "New movie release" → entertainment
+- "Election results" → politics
+- "Reality TV show" → entertainment
+- "Music artist" → entertainment
+
+Return ONLY the topic word, nothing else."""
+
     try:
         r = gemini_client.models.generate_content(
             model="gemini-2.5-flash-lite",
@@ -657,7 +783,6 @@ async def update_user_profile(user_id: str, username: str, topic: str):
 
 
 async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, str]:
-    """Returns (recent_history, older_context) with TIMESTAMPS."""
     if not supabase:
         return "", ""
     try:
@@ -670,7 +795,6 @@ async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, 
         if not rows.data:
             return "", ""
 
-        # ─ recent: last 5 with timestamps
         recent_rows = list(reversed(rows.data[:5]))
         recent_lines = []
         for row in recent_rows:
@@ -687,7 +811,6 @@ async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, 
             recent_lines.append("")
         recent_history = "\n".join(recent_lines).strip()
 
-        # ── older: relevance-scored
         older_rows = rows.data[5:]
         if not older_rows:
             return recent_history, ""
@@ -859,7 +982,15 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
         query = user_text[8:].strip()
         if not query: return True
         await send_text_chunks(chat_id, "🔍 Searching...", reply_to=message_id)
-        results = search_web(query)
+        
+        # Smart routing: check if it's news, sports, or general
+        if "news" in query.lower() or "latest" in query.lower():
+            results = get_latest_news(query)
+        elif any(sport in query.lower() for sport in ["football", "match", "score", "team", "player"]):
+            results = get_sports_data(query)
+        else:
+            results = search_web(query)
+        
         if results == "No search results found.":
             await send_text_chunks(chat_id, "Couldn't find results for that. Try rephrasing.", reply_to=message_id)
             return True
@@ -970,7 +1101,13 @@ async def handle_inline_query_async(inline_query):
             web_ctx += f"Content from {url}:\n{c}\n"
 
     if is_search_query(qtext) and not web_ctx:
-        sr = search_web(qtext)
+        # Smart routing for inline mode too
+        if "news" in qtext.lower() or "latest" in qtext.lower():
+            sr = get_latest_news(qtext)
+        elif any(sport in qtext.lower() for sport in ["football", "match", "score", "team"]):
+            sr = get_sports_data(qtext)
+        else:
+            sr = search_web(qtext)
         if "No search results" not in sr:
             web_ctx = f"Web Search Results for '{qtext}':\n{sr}"
 
@@ -1089,13 +1226,9 @@ async def handle_message_async(update: Update):
         user_text = re.sub(r'@askaimbot', '', user_text, flags=re.IGNORECASE).strip()
 
     try:
-        # 1. Get Rolling Session Summary (Time-decay handled inside)
         session_summary = await get_session_summary(user_id)
-        
-        # 2. Get Conversation Context
         recent_history, older_context = await get_conversation_context(user_id, user_text)
 
-        # 3. Web context
         web_context = ""
         for url in detect_urls(user_text):
             c = fetch_url_content(url)
@@ -1103,11 +1236,20 @@ async def handle_message_async(update: Update):
                 web_context += f"Content from {url}:\n{c}\n"
 
         if is_search_query(user_text) and not web_context:
-            sr = search_web(user_text)
+            # SMART ROUTING: Check what type of query it is
+            if "news" in user_text.lower() or "latest" in user_text.lower() or "today" in user_text.lower():
+                logger.info("📰 Routing to GNews API")
+                sr = get_latest_news(user_text)
+            elif any(sport in user_text.lower() for sport in ["football", "match", "score", "team", "player", "league"]):
+                logger.info("⚽ Routing to SportAPI")
+                sr = get_sports_data(user_text)
+            else:
+                logger.info("🔍 Routing to web search")
+                sr = search_web(user_text)
+            
             if "No search results" not in sr:
                 web_context = f"Web Search Results for '{user_text}':\n{sr}"
 
-        # 4. AGENTIC LOOP
         max_iter = 3
         iteration = 0
         final_answer = None
@@ -1133,7 +1275,13 @@ async def handle_message_async(update: Update):
                 if m:
                     sq = m.group(1).strip()
                     logger.info("🔍 SEARCH_TRIGGER: '%s'", sq)
-                    sr = search_web(sq)
+                    # Smart routing for search trigger too
+                    if "news" in sq.lower() or "latest" in sq.lower():
+                        sr = get_latest_news(sq)
+                    elif any(sport in sq.lower() for sport in ["football", "match", "score", "team"]):
+                        sr = get_sports_data(sq)
+                    else:
+                        sr = search_web(sq)
                     if sr == "No search results found.":
                         web_context += (f"\n\nSearch for '{sq}': No results found. "
                                         "Tell the user you couldn't find current info and offer to help otherwise.")
@@ -1190,15 +1338,11 @@ async def handle_message_async(update: Update):
 
         await send_text_chunks(chat.id, final_answer, reply_to=message_id)
         
-        # 5. Save Memory & Update Profile
         topic = await extract_topic(user_text, final_answer)
         await save_chat_memory(user_id, username, user_text, final_answer, chat_type, topic)
         await update_user_profile(user_id, username, topic)
         
-        # 6. Trigger Summarization (Every 4 messages to save tokens)
-        # We check the total_chats count. If it's a multiple of 4, we summarize.
         if profile.get("total_chats", 0) % 4 == 0:
-            # Get last 4 messages for summarization
             recent_msgs = (supabase.table("chat_memory")
                           .select("message, response")
                           .eq("user_id", str(user_id))
@@ -1206,7 +1350,6 @@ async def handle_message_async(update: Update):
                           .limit(4)
                           .execute())
             if recent_msgs.data:
-                # Reverse to chronological order
                 recent_msgs.data.reverse()
                 run_async(update_session_summary(user_id, recent_msgs.data, session_summary))
 
@@ -1220,11 +1363,16 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v8.0",
-        "model": "African Intelligence Model (Rolling Memory)",
+        "version": "v8.1",
+        "model": "African Intelligence Model (API Integration)",
         "search_provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
+        "apis": {
+            "gnews": "✅" if GNEWS_API_KEY else "❌",
+            "sportapi": "✅" if SPORTAPI_KEY else "❌",
+        },
         "features": ["rolling_memory", "time_decay", "multi_language", "all_sports",
-                     "reliable_search", "agentic_loop", "deep_research", "bot_commands", "inline_mode"],
+                     "news_api", "sports_api", "smart_routing", "reliable_search",
+                     "agentic_loop", "deep_research", "bot_commands", "inline_mode"],
     })
 
 @app.route("/webhook", methods=["POST"])
@@ -1282,10 +1430,15 @@ def debug_search():
     q = request.args.get("q","").strip()
     if not q: return jsonify({"error": "Provide ?q=your+query"}), 400
     try:
+        if "news" in q.lower():
+            results = get_latest_news(q)
+        elif any(sport in q.lower() for sport in ["football", "match", "score"]):
+            results = get_sports_data(q)
+        else:
+            results = search_web(q)
         return jsonify({
             "query": q,
-            "provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
-            "results": search_web(q),
+            "results": results,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
