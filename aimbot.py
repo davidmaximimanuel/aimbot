@@ -1,5 +1,6 @@
 """
-AIM Bot v8.1 — African Intelligence Model (API Integration + Fixed Topics)
+AIM Bot v9.0 — African Intelligence Model (DeepSeek + API Integration)
+Migrated from Gemini to DeepSeek for lower cost and higher limits.
 """
 
 import os
@@ -15,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
+from openai import AsyncOpenAI
 
 from flask import Flask, request, jsonify
 from telegram import (
@@ -22,16 +24,14 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from supabase import create_client, Client
-from google import genai
-from google.genai import types
 
 # ─── LOGGING ───
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("aimbot")
 
-# ─── CONFIG ──
+# ─── CONFIG ───
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")  # NEW: DeepSeek instead of Gemini
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "")
 WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")
@@ -71,7 +71,16 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     logger.warning("⚠️ Supabase not configured")
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# DeepSeek Client (Async)
+ai_client: Optional[AsyncOpenAI] = None
+if DEEPSEEK_API_KEY:
+    ai_client = AsyncOpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com"
+    )
+    logger.info("✅ DeepSeek API client initialized")
+else:
+    logger.warning("⚠️ DEEPSEEK_API_KEY not set")
 
 if BRAVE_API_KEY:
     logger.info("✅ Brave Search API key found")
@@ -88,7 +97,7 @@ if SPORTAPI_KEY:
 else:
     logger.warning("⚠️ SPORTAPI_KEY not set")
 
-# ── SEMANTIC ROUTER ───
+# ─── SEMANTIC ROUTER ───
 logger.info("🧠 Loading semantic router model...")
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -150,7 +159,7 @@ threading.Thread(target=_run_loop, daemon=True, name="async-loop").start()
 def run_async(coro):
     return asyncio.run_coroutine_threadsafe(coro, _loop)
 
-# ── BACKGROUND TIMER WORKER ───
+# ─── BACKGROUND TIMER WORKER ───
 def check_timers_background():
     logger.info("⏲️ Timer background worker started.")
     while True:
@@ -196,7 +205,7 @@ def get_latest_news(query: str, max_results: int = 5) -> str:
             "q": query,
             "apikey": GNEWS_API_KEY,
             "lang": "en",
-            "country": "ng",  # Nigeria
+            "country": "ng",
             "max": max_results,
         }
         resp = requests.get(url, params=params, timeout=10)
@@ -236,21 +245,17 @@ def get_sports_data(query: str) -> str:
         return search_web(query, 5)
     
     try:
-        # SportAPI base URL
         base_url = "https://sportapi7.p.rapidapi.com/api/v1"
         headers = {
             "X-RapidAPI-Key": SPORTAPI_KEY,
             "X-RapidAPI-Host": "sportapi7.p.rapidapi.com"
         }
         
-        # Check if query is about live events
         if "live" in query.lower() or "now" in query.lower():
             endpoint = f"{base_url}/event/live"
-        # Check if query is about a specific sport/category
         elif "football" in query.lower() or "soccer" in query.lower():
             endpoint = f"{base_url}/event/scheduled/date"
         else:
-            # Default to scheduled events
             endpoint = f"{base_url}/event/scheduled/date"
         
         params = {"lang": "en"}
@@ -262,7 +267,6 @@ def get_sports_data(query: str) -> str:
         
         data = resp.json()
         
-        # Parse the response based on the endpoint
         if "live" in endpoint:
             events = data.get("data", [])
             if not events:
@@ -279,7 +283,6 @@ def get_sports_data(query: str) -> str:
             
             return "\n".join(lines)
         else:
-            # Scheduled events
             events = data.get("data", [])
             if not events:
                 return search_web(query, 5)
@@ -389,7 +392,7 @@ def deep_research(query: str) -> str:
                     all_results.append(r)
     if not all_results:
         return "Deep research could not retrieve any results. Try rephrasing the query."
-    logger.info(" Deep research for '%s': %d unique results", query, len(all_results))
+    logger.info("🔬 Deep research for '%s': %d unique results", query, len(all_results))
     lines = ["=== DEEP RESEARCH RESULTS ===\n"]
     for i, r in enumerate(all_results[:12], 1):
         lines.append(f"{i}. {r['title']}\n   Summary: {r['description']}\n   Source: {r['url']}")
@@ -437,7 +440,7 @@ def is_search_query(text: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
-# PROMPTING (v8.1 — API Integration + Fixed Topics)
+# PROMPTING (v9.0 — DeepSeek)
 # ═══════════════════════════════════════════════════════════
 
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional, highly intelligent AI assistant built for Africans, by Africans.
@@ -537,8 +540,8 @@ async def get_session_summary(user_id: str) -> str:
 
 
 async def update_session_summary(user_id: str, recent_messages: list, current_summary: str):
-    """Uses Gemini to create a rolling summary of the conversation."""
-    if not gemini_client or not supabase: return
+    """Uses DeepSeek to create a rolling summary of the conversation."""
+    if not ai_client or not supabase: return
     
     try:
         msg_text = "\n".join([f"User: {m['message']}\nAIM: {m['response']}" for m in recent_messages])
@@ -549,16 +552,17 @@ New Messages:
 
 Task: Create a concise, updated summary of the conversation. Include key facts about the user, ongoing topics, and important context. Keep it under 150 words."""
 
-        r = gemini_client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-            config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=200),
+        response = await ai_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=200
         )
         
-        if r and r.text:
-            new_summary = r.text.strip()
+        if response.choices and response.choices[0].message.content:
+            new_summary = response.choices[0].message.content.strip()
             supabase.table("user_profiles").update({"session_summary": new_summary}).eq("user_id", str(user_id)).execute()
-            logger.info(" Session summary updated for user %s", user_id)
+            logger.info("📝 Session summary updated for user %s", user_id)
     except Exception as e:
         logger.error("Summarization error: %s", e)
 
@@ -678,7 +682,8 @@ DO NOT start every message with the date/time.
     return "\n".join(parts)
 
 
-async def get_gemini_response(
+# DeepSeek Response Function
+async def get_ai_response(
     user_text: str,
     user_id: str,
     chat_type: str,
@@ -688,8 +693,8 @@ async def get_gemini_response(
     older_context: str = "",
     web_context: str = "",
     tool_status: str = "",
-) -> Optional[types.GenerateContentResponse]:
-    if not gemini_client: return None
+) -> Optional[str]:
+    if not ai_client: return None
     try:
         if profile is None:
             profile = await get_user_profile_data(user_id)
@@ -697,19 +702,26 @@ async def get_gemini_response(
             user_text, user_id, profile,
             session_summary, recent_history, older_context, web_context, tool_status
         )
-        return gemini_client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-            config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=1024),
+        
+        response = await ai_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": BASE_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1024
         )
+        
+        return response.choices[0].message.content if response.choices else None
     except Exception as e:
-        logger.error("Gemini error: %s", e)
+        logger.error("DeepSeek error: %s", e)
         return None
 
 
-# ─── TOPIC EXTRACTION (FIXED) ───
+# ─── TOPIC EXTRACTION (DeepSeek) ───
 async def extract_topic(user_text: str, bot_response: str) -> str:
-    if not gemini_client: return "general"
+    if not ai_client: return "general"
     topics = ["career", "finance", "tech", "sports", "health", "relationships", 
               "politics", "entertainment", "education", "general"]
     
@@ -734,18 +746,19 @@ Examples:
 Return ONLY the topic word, nothing else."""
 
     try:
-        r = gemini_client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=20),
+        response = await ai_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=20
         )
-        t = r.text.strip().lower() if r and r.text else "general"
+        t = response.choices[0].message.content.strip().lower() if response.choices else "general"
         return t if t in topics else "general"
     except Exception:
         return "general"
 
 
-# ── MEMORY ───
+# ─── MEMORY ───
 async def save_chat_memory(user_id: str, username: str, message: str,
                            response: str, chat_type: str, topic: str = "general"):
     if not supabase: return
@@ -914,7 +927,7 @@ async def search_memory_by_keyword(user_id: str, query_text: str) -> str:
             return f"I don't recall us discussing {' '.join(keywords)}. Want to start a conversation about it?"
         emoji_map = {"career":"💼","finance":"💰","tech":"💻","sports":"⚽","health":"🏥",
                      "relationships":"❤️","politics":"🏛️","entertainment":"🎬","education":"📚"}
-        lines = [f" Found {len(unique)} conversation(s):"]
+        lines = [f"🔍 Found {len(unique)} conversation(s):"]
         for i, row in enumerate(unique[:5], 1):
             em = emoji_map.get(row.get("topic"), "💬")
             date = row.get("created_at","")[:10]
@@ -937,10 +950,10 @@ async def search_memory(user_id: str) -> str:
               .select("message, response, topic, created_at")
               .eq("user_id", str(user_id)).order("created_at", desc=True).limit(10).execute())
         emoji_map = {"career":"💼","finance":"💰","tech":"💻","sports":"⚽","health":"🏥",
-                     "relationships":"❤️","politics":"️","entertainment":"🎬","education":"📚"}
+                     "relationships":"❤️","politics":"🏛️","entertainment":"🎬","education":"📚"}
         lines = [
             f"📊 Top Topics: {', '.join(f'{k} ({v}x)' for k,v in sorted(tc.items(), key=lambda x:x[1], reverse=True)[:3])}",
-            f"💬 Total Chats: {p.get('total_chats',0)}", "", " Recent:",
+            f"💬 Total Chats: {p.get('total_chats',0)}", "", "📝 Recent:",
         ]
         for i, row in enumerate(mr.data[:5], 1):
             em = emoji_map.get(row.get("topic"), "💬")
@@ -983,7 +996,6 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
         if not query: return True
         await send_text_chunks(chat_id, "🔍 Searching...", reply_to=message_id)
         
-        # Smart routing: check if it's news, sports, or general
         if "news" in query.lower() or "latest" in query.lower():
             results = get_latest_news(query)
         elif any(sport in query.lower() for sport in ["football", "match", "score", "team", "player"]):
@@ -997,12 +1009,13 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
         prompt = (f"User asked: {query}\n\nSearch Results:\n{results}\n\n"
                   "Answer using ONLY these results. Be concise. Do NOT output SEARCH_TRIGGER.")
         try:
-            r = gemini_client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-                config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=1024),
+            response = await ai_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=1024
             )
-            txt = r.text.strip() if r and r.text else results
+            txt = response.choices[0].message.content.strip() if response.choices else results
             if "SEARCH_TRIGGER:" in txt:
                 txt = results
             await send_text_chunks(chat_id, txt, reply_to=message_id)
@@ -1017,8 +1030,8 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
         await send_text_chunks(chat_id, "🔬 Researching from multiple angles...", reply_to=message_id)
         deep = deep_research(query)
         profile = await get_user_profile_data(user_id)
-        r = await get_gemini_response(query, user_id, "private", profile, "", "", "", deep)
-        await send_text_chunks(chat_id, r.text.strip() if r and r.text else deep, reply_to=message_id)
+        r_text = await get_ai_response(query, user_id, "private", profile, "", "", "", deep)
+        await send_text_chunks(chat_id, r_text if r_text else deep, reply_to=message_id)
         return True
 
     elif tl.startswith("/timer "):
@@ -1054,7 +1067,7 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
                 "user_id": str(user_id), "tool_type": "stopwatch",
                 "start_time": datetime.now(timezone.utc).isoformat(), "is_active": True,
             }).execute()
-            await send_text_chunks(chat_id, "️ Stopwatch started! Use /stopwatch again to stop.", reply_to=message_id)
+            await send_text_chunks(chat_id, "⏱️ Stopwatch started! Use /stopwatch again to stop.", reply_to=message_id)
         return True
 
     return False
@@ -1084,7 +1097,7 @@ async def send_text_chunks(chat_id: int, text: str,
             logger.error("Fallback send failed: %s", e2)
 
 
-# ─── INLINE QUERY ──
+# ─── INLINE QUERY ───
 async def handle_inline_query_async(inline_query):
     qid   = inline_query.id
     qtext = inline_query.query.strip()
@@ -1101,7 +1114,6 @@ async def handle_inline_query_async(inline_query):
             web_ctx += f"Content from {url}:\n{c}\n"
 
     if is_search_query(qtext) and not web_ctx:
-        # Smart routing for inline mode too
         if "news" in qtext.lower() or "latest" in qtext.lower():
             sr = get_latest_news(qtext)
         elif any(sport in qtext.lower() for sport in ["football", "match", "score", "team"]):
@@ -1114,16 +1126,16 @@ async def handle_inline_query_async(inline_query):
     answer_text = None
     try:
         profile = await get_user_profile_data(uid)
-        r = await asyncio.wait_for(
-            get_gemini_response(qtext, uid, "private", profile, "", "", "", web_ctx),
-            timeout=8.0,
+        r_text = await asyncio.wait_for(
+            get_ai_response(qtext, uid, "private", profile, "", "", "", web_ctx),
+            timeout=15.0,  # DeepSeek can be slightly slower
         )
-        if r and r.text:
-            answer_text = r.text.strip()[:300]
+        if r_text:
+            answer_text = r_text.strip()[:300]
     except asyncio.TimeoutError:
         pass
     except Exception as e:
-        logger.error("Inline Gemini error: %s", e)
+        logger.error("Inline DeepSeek error: %s", e)
 
     result = InlineQueryResultArticle(
         id=str(uuid.uuid4()),
@@ -1131,7 +1143,7 @@ async def handle_inline_query_async(inline_query):
         description=(answer_text or "Click to get AIM's answer")[:100],
         input_message_content=InputTextMessageContent(
             message_text=(
-                f" <b>AIM says:</b>\n\n{answer_text}\n\n<i>via @askaimbot</i>"
+                f"🤖 <b>AIM says:</b>\n\n{answer_text}\n\n<i>via @askaimbot</i>"
                 if answer_text else
                 f"🤖 Asking AIM: {qtext}\n⏳ Processing..."
             ),
@@ -1148,9 +1160,9 @@ async def process_inline_answer(chat_id: int, message_id: int, query_text: str, 
     try:
         profile = await get_user_profile_data(user_id)
         recent, older = await get_conversation_context(user_id, query_text)
-        r = await get_gemini_response(query_text, user_id, "private", profile, "", recent, older)
-        if r and r.text:
-            answer = r.text.strip()
+        r_text = await get_ai_response(query_text, user_id, "private", profile, "", recent, older)
+        if r_text:
+            answer = r_text.strip()
             topic  = await extract_topic(query_text, answer)
             await save_chat_memory(user_id, "", query_text, answer, "inline", topic)
             await update_user_profile(user_id, "", topic)
@@ -1159,7 +1171,7 @@ async def process_inline_answer(chat_id: int, message_id: int, query_text: str, 
             await send_text_chunks(chat_id, "🔥 High demand — try again in 30 seconds.", reply_to=message_id)
     except Exception as e:
         logger.error("Inline answer error: %s", e)
-        await send_text_chunks(chat_id, "️ Something went wrong. Try again shortly.", reply_to=message_id)
+        await send_text_chunks(chat_id, "🛠️ Something went wrong. Try again shortly.", reply_to=message_id)
 
 
 def is_inline_placeholder(text: str) -> Tuple[bool, str]:
@@ -1177,7 +1189,7 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
     return False, ""
 
 
-# ─── MAIN MESSAGE HANDLER ──
+# ─── MAIN MESSAGE HANDLER ───
 async def handle_message_async(update: Update):
     if not update.message: return
 
@@ -1236,7 +1248,6 @@ async def handle_message_async(update: Update):
                 web_context += f"Content from {url}:\n{c}\n"
 
         if is_search_query(user_text) and not web_context:
-            # SMART ROUTING: Check what type of query it is
             if "news" in user_text.lower() or "latest" in user_text.lower() or "today" in user_text.lower():
                 logger.info("📰 Routing to GNews API")
                 sr = get_latest_news(user_text)
@@ -1259,23 +1270,22 @@ async def handle_message_async(update: Update):
             iteration += 1
             logger.info("🔄 Agentic iteration %d", iteration)
 
-            r = await get_gemini_response(
+            answer = await get_ai_response(
                 user_text, user_id, chat_type, profile,
                 session_summary, recent_history, older_context, web_context, tool_status,
             )
 
-            if not r or not r.text:
+            if not answer:
                 final_answer = "🔥 High demand right now — please try again in 30 seconds."
                 break
 
-            answer = r.text.strip()
+            answer = answer.strip()
 
             if "SEARCH_TRIGGER:" in answer:
                 m = re.search(r'SEARCH_TRIGGER:\s*(.+)', answer, re.IGNORECASE)
                 if m:
                     sq = m.group(1).strip()
                     logger.info("🔍 SEARCH_TRIGGER: '%s'", sq)
-                    # Smart routing for search trigger too
                     if "news" in sq.lower() or "latest" in sq.lower():
                         sr = get_latest_news(sq)
                     elif any(sport in sq.lower() for sport in ["football", "match", "score", "team"]):
@@ -1315,7 +1325,7 @@ async def handle_message_async(update: Update):
                         "start_time": datetime.now(timezone.utc).isoformat(), "is_active": True,
                     }).execute()
                     answer = re.sub(r'\[STOPWATCH:START\]', '', answer, flags=re.IGNORECASE).strip()
-                    answer += "\n\n_️ Stopwatch started!_"
+                    answer += "\n\n_⏱️ Stopwatch started!_"
                 elif action == "STOP":
                     res = (supabase.table("user_tools").select("*")
                            .eq("user_id", user_id).eq("tool_type", "stopwatch")
@@ -1363,8 +1373,8 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v8.1",
-        "model": "African Intelligence Model (API Integration)",
+        "version": "v9.0",
+        "model": "African Intelligence Model (DeepSeek)",
         "search_provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
         "apis": {
             "gnews": "✅" if GNEWS_API_KEY else "❌",
