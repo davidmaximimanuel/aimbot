@@ -1,6 +1,6 @@
 """
-AIM Bot v9.0 — African Intelligence Model (DeepSeek + API Integration)
-Migrated from Gemini to DeepSeek for lower cost and higher limits.
+AIM Bot v9.1 — African Intelligence Model (Switchable AI + API Integration)
+Supports both Gemini and DeepSeek - switch via USE_DEEPSEEK variable
 """
 
 import os
@@ -24,6 +24,8 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from supabase import create_client, Client
+from google import genai
+from google.genai import types
 
 # ─── LOGGING ───
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -31,7 +33,10 @@ logger = logging.getLogger("aimbot")
 
 # ─── CONFIG ───
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")  # NEW: DeepSeek instead of Gemini
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+USE_DEEPSEEK = os.environ.get("USE_DEEPSEEK", "false").lower() == "true"  # NEW: Switch
+
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "")
 WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")
@@ -71,16 +76,20 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     logger.warning("⚠️ Supabase not configured")
 
-# DeepSeek Client (Async)
-ai_client: Optional[AsyncOpenAI] = None
-if DEEPSEEK_API_KEY:
-    ai_client = AsyncOpenAI(
+# AI Client Setup - Switchable
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+deepseek_client: Optional[AsyncOpenAI] = None
+
+if USE_DEEPSEEK and DEEPSEEK_API_KEY:
+    deepseek_client = AsyncOpenAI(
         api_key=DEEPSEEK_API_KEY,
         base_url="https://api.deepseek.com"
     )
-    logger.info("✅ DeepSeek API client initialized")
+    logger.info("✅ Using DeepSeek API")
+elif GEMINI_API_KEY:
+    logger.info("✅ Using Gemini API")
 else:
-    logger.warning("⚠️ DEEPSEEK_API_KEY not set")
+    logger.warning("⚠️ No AI API configured!")
 
 if BRAVE_API_KEY:
     logger.info("✅ Brave Search API key found")
@@ -440,7 +449,7 @@ def is_search_query(text: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
-# PROMPTING (v9.0 — DeepSeek)
+# PROMPTING (v9.1 — Switchable AI)
 # ═══════════════════════════════════════════════════════════
 
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional, highly intelligent AI assistant built for Africans, by Africans.
@@ -540,9 +549,10 @@ async def get_session_summary(user_id: str) -> str:
 
 
 async def update_session_summary(user_id: str, recent_messages: list, current_summary: str):
-    """Uses DeepSeek to create a rolling summary of the conversation."""
-    if not ai_client or not supabase: return
+    """Uses AI to create a rolling summary of the conversation."""
+    if not supabase: return
     
+    # Use whichever AI is active
     try:
         msg_text = "\n".join([f"User: {m['message']}\nAIM: {m['response']}" for m in recent_messages])
         
@@ -552,15 +562,25 @@ New Messages:
 
 Task: Create a concise, updated summary of the conversation. Include key facts about the user, ongoing topics, and important context. Keep it under 150 words."""
 
-        response = await ai_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=200
-        )
+        if USE_DEEPSEEK and deepseek_client:
+            response = await deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=200
+            )
+            new_summary = response.choices[0].message.content.strip() if response.choices else None
+        elif gemini_client:
+            response = gemini_client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+                config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=200),
+            )
+            new_summary = response.text.strip() if response and response.text else None
+        else:
+            return
         
-        if response.choices and response.choices[0].message.content:
-            new_summary = response.choices[0].message.content.strip()
+        if new_summary:
             supabase.table("user_profiles").update({"session_summary": new_summary}).eq("user_id", str(user_id)).execute()
             logger.info("📝 Session summary updated for user %s", user_id)
     except Exception as e:
@@ -682,7 +702,7 @@ DO NOT start every message with the date/time.
     return "\n".join(parts)
 
 
-# DeepSeek Response Function
+# ─── SWITCHABLE AI RESPONSE FUNCTION ───
 async def get_ai_response(
     user_text: str,
     user_id: str,
@@ -694,7 +714,7 @@ async def get_ai_response(
     web_context: str = "",
     tool_status: str = "",
 ) -> Optional[str]:
-    if not ai_client: return None
+    """Calls either DeepSeek or Gemini based on USE_DEEPSEEK flag."""
     try:
         if profile is None:
             profile = await get_user_profile_data(user_id)
@@ -703,25 +723,36 @@ async def get_ai_response(
             session_summary, recent_history, older_context, web_context, tool_status
         )
         
-        response = await ai_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": BASE_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=1024
-        )
-        
-        return response.choices[0].message.content if response.choices else None
+        if USE_DEEPSEEK and deepseek_client:
+            logger.info("🤖 Using DeepSeek for response")
+            response = await deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": BASE_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=1024
+            )
+            return response.choices[0].message.content if response.choices else None
+        elif gemini_client:
+            logger.info("🤖 Using Gemini for response")
+            response = gemini_client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+                config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=1024),
+            )
+            return response.text if response and response.text else None
+        else:
+            logger.error("❌ No AI client available!")
+            return None
     except Exception as e:
-        logger.error("DeepSeek error: %s", e)
+        logger.error("AI response error: %s", e)
         return None
 
 
-# ─── TOPIC EXTRACTION (DeepSeek) ───
+# ─── TOPIC EXTRACTION (Switchable) ───
 async def extract_topic(user_text: str, bot_response: str) -> str:
-    if not ai_client: return "general"
     topics = ["career", "finance", "tech", "sports", "health", "relationships", 
               "politics", "entertainment", "education", "general"]
     
@@ -740,19 +771,28 @@ Examples:
 - "Math homework help" → education
 - "New movie release" → entertainment
 - "Election results" → politics
-- "Reality TV show" → entertainment
-- "Music artist" → entertainment
 
 Return ONLY the topic word, nothing else."""
 
     try:
-        response = await ai_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=20
-        )
-        t = response.choices[0].message.content.strip().lower() if response.choices else "general"
+        if USE_DEEPSEEK and deepseek_client:
+            response = await deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=20
+            )
+            t = response.choices[0].message.content.strip().lower() if response.choices else "general"
+        elif gemini_client:
+            response = gemini_client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+                config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=20),
+            )
+            t = response.text.strip().lower() if response and response.text else "general"
+        else:
+            return "general"
+        
         return t if t in topics else "general"
     except Exception:
         return "general"
@@ -1009,13 +1049,8 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
         prompt = (f"User asked: {query}\n\nSearch Results:\n{results}\n\n"
                   "Answer using ONLY these results. Be concise. Do NOT output SEARCH_TRIGGER.")
         try:
-            response = await ai_client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=1024
-            )
-            txt = response.choices[0].message.content.strip() if response.choices else results
+            response_text = await get_ai_response(prompt, user_id, "private")
+            txt = response_text.strip() if response_text else results
             if "SEARCH_TRIGGER:" in txt:
                 txt = results
             await send_text_chunks(chat_id, txt, reply_to=message_id)
@@ -1128,14 +1163,14 @@ async def handle_inline_query_async(inline_query):
         profile = await get_user_profile_data(uid)
         r_text = await asyncio.wait_for(
             get_ai_response(qtext, uid, "private", profile, "", "", "", web_ctx),
-            timeout=15.0,  # DeepSeek can be slightly slower
+            timeout=15.0,
         )
         if r_text:
             answer_text = r_text.strip()[:300]
     except asyncio.TimeoutError:
         pass
     except Exception as e:
-        logger.error("Inline DeepSeek error: %s", e)
+        logger.error("Inline AI error: %s", e)
 
     result = InlineQueryResultArticle(
         id=str(uuid.uuid4()),
@@ -1371,10 +1406,11 @@ async def handle_message_async(update: Update):
 # ─── ROUTES ───
 @app.route("/", methods=["GET"])
 def health():
+    ai_provider = "DeepSeek" if USE_DEEPSEEK else "Gemini"
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v9.0",
-        "model": "African Intelligence Model (DeepSeek)",
+        "version": "v9.1",
+        "model": f"African Intelligence Model ({ai_provider})",
         "search_provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
         "apis": {
             "gnews": "✅" if GNEWS_API_KEY else "❌",
@@ -1382,7 +1418,7 @@ def health():
         },
         "features": ["rolling_memory", "time_decay", "multi_language", "all_sports",
                      "news_api", "sports_api", "smart_routing", "reliable_search",
-                     "agentic_loop", "deep_research", "bot_commands", "inline_mode"],
+                     "agentic_loop", "deep_research", "bot_commands", "inline_mode", "switchable_ai"],
     })
 
 @app.route("/webhook", methods=["POST"])
