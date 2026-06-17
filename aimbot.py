@@ -634,7 +634,7 @@ Task: Create a concise, updated summary of the conversation. Include key facts a
 
         if USE_DEEPSEEK and deepseek_client:
             response = await deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
+                model="deepseek-v4-flash",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=200
@@ -796,7 +796,7 @@ async def get_ai_response(
         if USE_DEEPSEEK and deepseek_client:
             logger.info("🤖 Using DeepSeek V4 Pro for response")
             response = await deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
+                model="deepseek-v4-flash",
                 messages=[
                     {"role": "system", "content": BASE_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
@@ -847,7 +847,7 @@ Return ONLY the topic word, nothing else."""
     try:
         if USE_DEEPSEEK and deepseek_client:
             response = await deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
+                model="deepseek-v4-flash",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=20
