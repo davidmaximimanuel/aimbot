@@ -1,6 +1,7 @@
 """
-AIM Bot v9.1 — African Intelligence Model (Switchable AI + API Integration)
+AIM Bot v9.2 — African Intelligence Model (Switchable AI + API Integration)
 Supports both Gemini and DeepSeek - switch via USE_DEEPSEEK variable
+Sports search now uses GNews Sports category (legal & reliable)
 """
 
 import os
@@ -35,14 +36,14 @@ logger = logging.getLogger("aimbot")
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-USE_DEEPSEEK = os.environ.get("USE_DEEPSEEK", "false").lower() == "true"  # NEW: Switch
+USE_DEEPSEEK = os.environ.get("USE_DEEPSEEK", "false").lower() == "true"  # Switch
 
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "")
 WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")
 BRAVE_API_KEY   = os.environ.get("BRAVE_API_KEY", "")
 GNEWS_API_KEY   = os.environ.get("GNEWS_API_KEY", "")
-SPORTAPI_KEY    = os.environ.get("SPORTAPI_KEY", "")
+SPORTAPI_KEY    = os.environ.get("SPORTAPI_KEY", "")  # Kept for backward compatibility but no longer used
 
 TELEGRAM_MAX_CHARS = 4096
 
@@ -102,9 +103,7 @@ else:
     logger.warning("⚠️ GNEWS_API_KEY not set")
 
 if SPORTAPI_KEY:
-    logger.info("✅ SportAPI key found")
-else:
-    logger.warning("⚠️ SPORTAPI_KEY not set")
+    logger.info("ℹ️ SPORTAPI_KEY found (deprecated - sports now uses GNews)")
 
 # ─── SEMANTIC ROUTER ───
 logger.info("🧠 Loading semantic router model...")
@@ -200,7 +199,7 @@ def check_timers_background():
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
 
 # ═══════════════════════════════════════════════════════════
-# APIs (GNews + SportAPI)
+# APIs (GNews for News + Sports, Brave/DDG for general search)
 # ═══════════════════════════════════════════════════════════
 
 def get_latest_news(query: str, max_results: int = 5) -> str:
@@ -249,68 +248,83 @@ def get_latest_news(query: str, max_results: int = 5) -> str:
 
 
 def get_sports_data(query: str) -> str:
-    """Fetch sports data from SportAPI (RapidAPI)."""
-    if not SPORTAPI_KEY:
+    """Fetch sports data using GNews Sports Category (Legal & Reliable).
+    Replaces the broken SportAPI7 (baseball-only) with GNews sports coverage."""
+    if not GNEWS_API_KEY:
         return search_web(query, 5)
     
     try:
-        base_url = "https://sportapi7.p.rapidapi.com/api/v1"
-        headers = {
-            "X-RapidAPI-Key": SPORTAPI_KEY,
-            "X-RapidAPI-Host": "sportapi7.p.rapidapi.com"
+        # Use GNews dedicated sports category
+        url = "https://gnews.io/api/v4/top-headlines"
+        params = {
+            "category": "sports",
+            "apikey": GNEWS_API_KEY,
+            "lang": "en",
+            "country": "ng",  # Prioritize Nigerian sports news
+            "max": 5,
         }
         
-        if "live" in query.lower() or "now" in query.lower():
-            endpoint = f"{base_url}/event/live"
-        elif "football" in query.lower() or "soccer" in query.lower():
-            endpoint = f"{base_url}/event/scheduled/date"
+        # If the user asked about a specific team/league, add it to the search
+        query_lower = query.lower()
+        if "nigeria" in query_lower or "super eagles" in query_lower:
+            params["q"] = "Nigeria football"
+        elif "premier league" in query_lower or "epl" in query_lower:
+            params["q"] = "Premier League"
+        elif "champions league" in query_lower:
+            params["q"] = "Champions League"
+        elif "la liga" in query_lower:
+            params["q"] = "La Liga"
+        elif "serie a" in query_lower:
+            params["q"] = "Serie A"
+        elif "bundesliga" in query_lower:
+            params["q"] = "Bundesliga"
+        elif "afcon" in query_lower or "african cup" in query_lower:
+            params["q"] = "AFCON"
+        elif "world cup" in query_lower:
+            params["q"] = "World Cup"
+        elif "f1" in query_lower or "formula 1" in query_lower:
+            params["q"] = "Formula 1"
+        elif "nba" in query_lower or "basketball" in query_lower:
+            params["q"] = "NBA basketball"
+        elif "tennis" in query_lower:
+            params["q"] = "tennis"
+        elif "boxing" in query_lower or "ufc" in query_lower or "mma" in query_lower:
+            params["q"] = "boxing MMA UFC"
+        elif "cricket" in query_lower:
+            params["q"] = "cricket"
+        elif "rugby" in query_lower:
+            params["q"] = "rugby"
         else:
-            endpoint = f"{base_url}/event/scheduled/date"
-        
-        params = {"lang": "en"}
-        resp = requests.get(endpoint, headers=headers, params=params, timeout=10)
+            params["q"] = query
+
+        resp = requests.get(url, params=params, timeout=10)
         
         if resp.status_code != 200:
-            logger.warning("⚠️ SportAPI status %s for '%s'", resp.status_code, query)
+            logger.warning("⚠️ GNews Sports status %s for '%s'", resp.status_code, query)
             return search_web(query, 5)
         
         data = resp.json()
+        articles = data.get("articles", [])
         
-        if "live" in endpoint:
-            events = data.get("data", [])
-            if not events:
-                return "No live events at the moment."
+        if not articles:
+            logger.info("ℹ️ GNews Sports: 0 results for '%s'", query)
+            return search_web(query, 5)
+        
+        logger.info("✅ GNews Sports: %d results for '%s'", len(articles), query)
+        
+        lines = ["🏆 LATEST SPORTS UPDATES:\n"]
+        for i, article in enumerate(articles[:5], 1):
+            title = article.get("title", "")
+            desc = article.get("description", "")
+            source = article.get("source", {}).get("name", "")
+            published = article.get("publishedAt", "")[:16].replace("T", " ") if article.get("publishedAt") else ""
+            url = article.get("url", "")
             
-            lines = ["🔴 LIVE EVENTS:\n"]
-            for event in events[:5]:
-                home = event.get("home", {}).get("name", "")
-                away = event.get("away", {}).get("name", "")
-                score = event.get("score", {})
-                home_score = score.get("home", 0)
-                away_score = score.get("away", 0)
-                lines.append(f"⚽ {home} {home_score} - {away_score} {away}")
-            
-            return "\n".join(lines)
-        else:
-            events = data.get("data", [])
-            if not events:
-                return search_web(query, 5)
-            
-            lines = ["📅 UPCOMING EVENTS:\n"]
-            for event in events[:5]:
-                home = event.get("home", {}).get("name", "")
-                away = event.get("away", {}).get("name", "")
-                start_time = event.get("startTimestamp", 0)
-                if start_time:
-                    dt = datetime.fromtimestamp(start_time, tz=timezone.utc)
-                    time_str = dt.strftime("%b %d, %H:%M")
-                else:
-                    time_str = "TBD"
-                lines.append(f"⚽ {home} vs {away}\n   Time: {time_str}")
-            
-            return "\n".join(lines)
+            lines.append(f"{i}. {title}\n   Source: {source} | {published}\n   Summary: {desc}\n   Link: {url}")
+        
+        return "\n\n".join(lines)
     except Exception as e:
-        logger.error("SportAPI error: %s", e)
+        logger.error("GNews Sports error: %s", e)
         return search_web(query, 5)
 
 
@@ -449,7 +463,7 @@ def is_search_query(text: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
-# PROMPTING (v9.1 — Switchable AI)
+# PROMPTING (v9.2 — Switchable AI + Sports Fix)
 # ═══════════════════════════════════════════════════════════
 
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional, highly intelligent AI assistant built for Africans, by Africans.
@@ -476,8 +490,8 @@ CAPABILITIES:
 - Time Tools: Timers and stopwatches.
 - Time Awareness: You know the current time and when we last spoke.
 - Web Search: Real-time web results available.
-- Sports: You cover ALL sports (Football, F1, Basketball, Tennis, Boxing, UFC, Rugby, Cricket, etc.).
-- News: Real-time news from Nigeria and worldwide.
+- Sports: You cover ALL sports (Football, F1, Basketball, Tennis, Boxing, UFC, Rugby, Cricket, etc.) via GNews Sports.
+- News: Real-time news from Nigeria and worldwide via GNews.
 - Entertainment: Movies, TV shows, reality TV, music, celebrities.
 
 CONVERSATION CONTINUITY:
@@ -1038,7 +1052,7 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
         
         if "news" in query.lower() or "latest" in query.lower():
             results = get_latest_news(query)
-        elif any(sport in query.lower() for sport in ["football", "match", "score", "team", "player"]):
+        elif any(sport in query.lower() for sport in ["football", "match", "score", "team", "player", "f1", "nba", "tennis", "boxing"]):
             results = get_sports_data(query)
         else:
             results = search_web(query)
@@ -1151,7 +1165,7 @@ async def handle_inline_query_async(inline_query):
     if is_search_query(qtext) and not web_ctx:
         if "news" in qtext.lower() or "latest" in qtext.lower():
             sr = get_latest_news(qtext)
-        elif any(sport in qtext.lower() for sport in ["football", "match", "score", "team"]):
+        elif any(sport in qtext.lower() for sport in ["football", "match", "score", "team", "f1", "nba", "tennis", "boxing"]):
             sr = get_sports_data(qtext)
         else:
             sr = search_web(qtext)
@@ -1286,8 +1300,8 @@ async def handle_message_async(update: Update):
             if "news" in user_text.lower() or "latest" in user_text.lower() or "today" in user_text.lower():
                 logger.info("📰 Routing to GNews API")
                 sr = get_latest_news(user_text)
-            elif any(sport in user_text.lower() for sport in ["football", "match", "score", "team", "player", "league"]):
-                logger.info("⚽ Routing to SportAPI")
+            elif any(sport in user_text.lower() for sport in ["football", "match", "score", "team", "player", "league", "f1", "nba", "tennis", "boxing", "ufc", "cricket", "rugby"]):
+                logger.info("⚽ Routing to GNews Sports")
                 sr = get_sports_data(user_text)
             else:
                 logger.info("🔍 Routing to web search")
@@ -1323,7 +1337,7 @@ async def handle_message_async(update: Update):
                     logger.info("🔍 SEARCH_TRIGGER: '%s'", sq)
                     if "news" in sq.lower() or "latest" in sq.lower():
                         sr = get_latest_news(sq)
-                    elif any(sport in sq.lower() for sport in ["football", "match", "score", "team"]):
+                    elif any(sport in sq.lower() for sport in ["football", "match", "score", "team", "f1", "nba", "tennis", "boxing"]):
                         sr = get_sports_data(sq)
                     else:
                         sr = search_web(sq)
@@ -1409,15 +1423,15 @@ def health():
     ai_provider = "DeepSeek" if USE_DEEPSEEK else "Gemini"
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v9.1",
+        "version": "v9.2",
         "model": f"African Intelligence Model ({ai_provider})",
         "search_provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
         "apis": {
             "gnews": "✅" if GNEWS_API_KEY else "❌",
-            "sportapi": "✅" if SPORTAPI_KEY else "❌",
+            "brave": "✅" if BRAVE_API_KEY else "❌",
         },
-        "features": ["rolling_memory", "time_decay", "multi_language", "all_sports",
-                     "news_api", "sports_api", "smart_routing", "reliable_search",
+        "features": ["rolling_memory", "time_decay", "multi_language", "all_sports_gnews",
+                     "news_api", "smart_routing", "reliable_search",
                      "agentic_loop", "deep_research", "bot_commands", "inline_mode", "switchable_ai"],
     })
 
@@ -1478,7 +1492,7 @@ def debug_search():
     try:
         if "news" in q.lower():
             results = get_latest_news(q)
-        elif any(sport in q.lower() for sport in ["football", "match", "score"]):
+        elif any(sport in q.lower() for sport in ["football", "match", "score", "f1", "nba"]):
             results = get_sports_data(q)
         else:
             results = search_web(q)
