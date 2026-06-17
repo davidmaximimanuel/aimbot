@@ -329,12 +329,26 @@ def get_sports_data(query: str) -> str:
 
 
 def search_web(query: str, max_results: int = 5) -> str:
-    """Fallback web search using Brave or DuckDuckGo."""
-    results = _search_brave_api(query, max_results) if BRAVE_API_KEY else None
-    provider = "Brave API"
+    """
+    Search pipeline (v9.2.1):
+    1. Brave Scraping (PRIMARY - best quality, no API key needed)
+    2. Brave API (if key available)
+    3. DuckDuckGo Lite (ultimate fallback)
+    """
+    # 1. Try Brave Scraping FIRST (primary)
+    results = _search_brave_scrape(query, max_results)
+    provider = "Brave (Scraping)"
+    
+    # 2. Fallback to Brave API
+    if results is None:
+        results = _search_brave_api(query, max_results)
+        provider = "Brave (API)"
+    
+    # 3. Ultimate fallback to DuckDuckGo Lite
     if results is None:
         results = _search_duckduckgo_lite(query, max_results)
         provider = "DuckDuckGo Lite"
+    
     if not results:
         logger.warning("❌ All search providers failed for '%s'", query)
         return "No search results found."
@@ -344,28 +358,6 @@ def search_web(query: str, max_results: int = 5) -> str:
     for i, r in enumerate(results, 1):
         lines.append(f"{i}. {r['title']}\n   Summary: {r['description']}\n   Source: {r['url']}")
     return "\n\n".join(lines)
-
-
-def _search_brave_api(query: str, max_results: int = 5) -> Optional[list]:
-    if not BRAVE_API_KEY:
-        return None
-    try:
-        resp = requests.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"Accept": "application/json", "Accept-Encoding": "gzip", "X-Subscription-Token": BRAVE_API_KEY},
-            params={"q": query, "count": max_results},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return None
-        items = resp.json().get("web", {}).get("results", [])
-        if not items:
-            return None
-        return [{"title": i.get("title",""), "description": i.get("description",""), "url": i.get("url","")}
-                for i in items[:max_results]]
-    except Exception as e:
-        logger.error("Brave API error for '%s': %s", query, e)
-        return None
 
 
 def _search_duckduckgo_lite(query: str, max_results: int = 5) -> Optional[list]:
@@ -399,15 +391,151 @@ def _search_duckduckgo_lite(query: str, max_results: int = 5) -> Optional[list]:
         logger.error("DuckDuckGo Lite error for '%s': %s", query, e)
         return None
 
+def _search_brave_scrape(query: str, max_results: int = 5) -> Optional[list]:
+    """
+    Scrape Brave Search directly by constructing the URL.
+    URL format: https://search.brave.com/search?q=QUERY&source=web
+    This is the PRIMARY search method - no API key needed.
+    """
+    try:
+        from urllib.parse import quote, unquote
+        
+        # Construct Brave Search URL
+        search_url = f"https://search.brave.com/search?q={quote(query)}&source=web"
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
+        }
+        
+        logger.info("🔍 Brave scraping: %s", search_url)
+        resp = requests.get(search_url, headers=headers, timeout=15)
+        
+        if resp.status_code != 200:
+            logger.warning("⚠️ Brave scrape status %s", resp.status_code)
+            return None
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        results = []
+        
+        # Try multiple selectors to find results
+        snippets = soup.find_all('div', class_='snippet')
+        if not snippets:
+            snippets = soup.find_all('div', {'data-pos': True})
+        if not snippets:
+            snippets = soup.find_all('div', class_='result')
+        if not snippets:
+            results_div = soup.find('div', id='results') or soup.find('main')
+            if results_div:
+                snippets = results_div.find_all('div', recursive=False)
+        
+        for snippet in snippets[:max_results]:
+            title = ""
+            description = ""
+            url = ""
+            
+            # Extract title
+            title_elem = (
+                snippet.find('a', class_='result-title') or
+                snippet.find('a', class_='title') or
+                snippet.find('a', title=True) or
+                snippet.find('a', href=True)
+            )
+            if title_elem:
+                title = title_elem.get_text(strip=True)
+                url = title_elem.get('href', '')
+                if url and not url.startswith('http'):
+                    url = 'https://search.brave.com' + url
+            
+            # Extract description
+            desc_elem = (
+                snippet.find('p', class_='snippet-description') or
+                snippet.find('div', class_='snippet-description') or
+                snippet.find('p', class_='desc') or
+                snippet.find('div', class_='snippet-content') or
+                snippet.find('span', class_='snippet-description')
+            )
+            if desc_elem:
+                description = desc_elem.get_text(strip=True)
+            
+            # If no description found, try getting all text
+            if not description:
+                all_text = snippet.get_text(separator=' ', strip=True)
+                if title and title in all_text:
+                    description = all_text.replace(title, '', 1).strip()
+                else:
+                    description = all_text[:300]
+            
+            # Clean up URL - Brave sometimes wraps URLs
+            if url and 'search.brave.com' in url and 'url=' in url:
+                url_match = re.search(r'url=([^&]+)', url)
+                if url_match:
+                    url = unquote(url_match.group(1))
+            
+            if title and len(title) > 3:
+                results.append({
+                    "title": title,
+                    "description": description[:500] if description else "",
+                    "url": url
+                })
+        
+        # If structured parsing failed, try aggressive approach
+        if not results:
+            logger.info("ℹ️ Structured parsing failed, trying aggressive extraction")
+            all_links = soup.find_all('a', href=True)
+            for link in all_links:
+                href = link.get('href', '')
+                if any(skip in href for skip in ['search.brave.com/', 'javascript:', '#', '/settings', '/help']):
+                    continue
+                if not href.startswith('http'):
+                    continue
+                
+                title = link.get_text(strip=True)
+                if len(title) < 10:
+                    continue
+                
+                parent = link.find_parent(['div', 'article', 'li'])
+                description = ""
+                if parent:
+                    desc_p = parent.find('p') or parent.find('span', class_=re.compile(r'desc|snippet'))
+                    if desc_p:
+                        description = desc_p.get_text(strip=True)
+                
+                results.append({
+                    "title": title,
+                    "description": description[:500],
+                    "url": href
+                })
+                
+                if len(results) >= max_results:
+                    break
+        
+        if results:
+            logger.info("✅ Brave scrape: %d results for '%s'", len(results), query)
+            return results[:max_results]
+        
+        logger.warning("⚠️ Brave scrape: 0 results parsed for '%s'", query)
+        return None
+        
+    except Exception as e:
+        logger.error("Brave scrape error for '%s': %s", query, e)
+        return None
 
 def deep_research(query: str) -> str:
     angle_queries = [query, f"{query} latest news", f"{query} results details"]
     all_results = []
     seen_urls = set()
     for q in angle_queries:
-        results = _search_brave_api(q, 4) if BRAVE_API_KEY else None
-        if results is None:
-            results = _search_duckduckgo_lite(q, 4)
+        # Try Brave scraping first, then API, then DDG
+        results = _search_brave_scrape(q, 4) or _search_brave_api(q, 4) or _search_duckduckgo_lite(q, 4)
         if results:
             for r in results:
                 if r["url"] not in seen_urls:
