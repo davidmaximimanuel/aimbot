@@ -5,6 +5,7 @@ Sports search uses GNews Sports category (legal & reliable)
 """
 
 import os
+import tempfile
 import uuid
 import asyncio
 import logging
@@ -91,6 +92,33 @@ elif GEMINI_API_KEY:
     logger.info("✅ Using Gemini API")
 else:
     logger.warning("⚠️ No AI API configured!")
+
+# Groq Client for Voice Transcription (STT)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+groq_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1") if GROQ_API_KEY else None
+if GROQ_API_KEY: logger.info("✅ Groq API key found (Voice STT enabled)")
+
+async def transcribe_voice(file_id: str) -> Optional[str]:
+    """Transcribes a voice note using Groq Whisper."""
+    if not groq_client: return None
+    temp_path = f"voice_{file_id}.ogg"
+    try:
+        file = await bot.get_file(file_id)
+        await file.download_to_drive(custom_path=temp_path)
+        
+        with open(temp_path, "rb") as audio_file:
+            transcription = await groq_client.audio.transcriptions.create(
+                model="whisper-large-v3",
+                file=audio_file,
+                response_format="text"
+            )
+        return transcription.strip()
+    except Exception as e:
+        logger.error(f"Voice transcription error: {e}")
+        return None
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 if BRAVE_API_KEY:
     logger.info("✅ Brave Search API key found")
@@ -1303,6 +1331,17 @@ async def handle_message_async(update: Update):
     user_text = update.message.text or ""
     chat_type = chat.type if chat else "private"
     message_id = update.message.message_id
+
+    if update.message.voice or update.message.audio:
+        file_obj = update.message.voice or update.message.audio
+        await send_text_chunks(chat.id, "🎙️ Listening...", reply_to=message_id)
+        transcribed = await transcribe_voice(file_obj.file_id)
+        if transcribed:
+            user_text = transcribed
+            await send_text_chunks(chat.id, f"📝 You said: \"{user_text}\"", reply_to=message_id)
+        else:
+            await send_text_chunks(chat.id, "🎤 Sorry, I couldn't understand the voice note.", reply_to=message_id)
+            return
 
     if not user_text:
         await send_text_chunks(chat.id, "I can only read text messages for now.")
