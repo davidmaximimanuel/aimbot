@@ -1,7 +1,7 @@
 """
-AIM Bot v9.2 — African Intelligence Model (Switchable AI + API Integration)
-Supports both Gemini and DeepSeek - switch via USE_DEEPSEEK variable
-Sports search now uses GNews Sports category (legal & reliable)
+AIM Bot v9.3 — African Intelligence Model (DeepSeek V4 Pro + API Integration)
+Supports both Gemini and DeepSeek V4 Pro - switch via USE_DEEPSEEK variable
+Sports search uses GNews Sports category (legal & reliable)
 """
 
 import os
@@ -86,7 +86,7 @@ if USE_DEEPSEEK and DEEPSEEK_API_KEY:
         api_key=DEEPSEEK_API_KEY,
         base_url="https://api.deepseek.com"
     )
-    logger.info("✅ Using DeepSeek API")
+    logger.info("✅ Using DeepSeek V4 Pro API")
 elif GEMINI_API_KEY:
     logger.info("✅ Using Gemini API")
 else:
@@ -248,23 +248,20 @@ def get_latest_news(query: str, max_results: int = 5) -> str:
 
 
 def get_sports_data(query: str) -> str:
-    """Fetch sports data using GNews Sports Category (Legal & Reliable).
-    Replaces the broken SportAPI7 (baseball-only) with GNews sports coverage."""
+    """Fetch sports data using GNews Sports Category (Legal & Reliable)."""
     if not GNEWS_API_KEY:
         return search_web(query, 5)
     
     try:
-        # Use GNews dedicated sports category
         url = "https://gnews.io/api/v4/top-headlines"
         params = {
             "category": "sports",
             "apikey": GNEWS_API_KEY,
             "lang": "en",
-            "country": "ng",  # Prioritize Nigerian sports news
+            "country": "ng",
             "max": 5,
         }
         
-        # If the user asked about a specific team/league, add it to the search
         query_lower = query.lower()
         if "nigeria" in query_lower or "super eagles" in query_lower:
             params["q"] = "Nigeria football"
@@ -335,16 +332,13 @@ def search_web(query: str, max_results: int = 5) -> str:
     2. Brave API (if key available)
     3. DuckDuckGo Lite (ultimate fallback)
     """
-    # 1. Try Brave Scraping FIRST
     results = _search_brave_scrape(query, max_results)
     provider = "Brave (Scraping)"
     
-    # 2. Fallback to Brave API
     if results is None:
         results = _search_brave_api(query, max_results)
         provider = "Brave (API)"
     
-    # 3. Ultimate fallback to DuckDuckGo Lite
     if results is None:
         results = _search_duckduckgo_lite(query, max_results)
         provider = "DuckDuckGo Lite"
@@ -380,7 +374,6 @@ def _search_brave_scrape(query: str, max_results: int = 5) -> Optional[list]:
         soup = BeautifulSoup(resp.text, 'html.parser')
         results = []
         
-        # Try multiple selectors
         snippets = soup.find_all('div', class_='snippet') or soup.find_all('div', {'data-pos': True}) or soup.find_all('div', class_='result')
         
         for snippet in snippets[:max_results]:
@@ -527,7 +520,7 @@ def is_search_query(text: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
-# PROMPTING (v9.2 — Switchable AI + Sports Fix)
+# PROMPTING (v9.3 — DeepSeek V4 Pro)
 # ═══════════════════════════════════════════════════════════
 
 BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. You are a professional, highly intelligent AI assistant built for Africans, by Africans.
@@ -630,7 +623,6 @@ async def update_session_summary(user_id: str, recent_messages: list, current_su
     """Uses AI to create a rolling summary of the conversation."""
     if not supabase: return
     
-    # Use whichever AI is active
     try:
         msg_text = "\n".join([f"User: {m['message']}\nAIM: {m['response']}" for m in recent_messages])
         
@@ -642,7 +634,7 @@ Task: Create a concise, updated summary of the conversation. Include key facts a
 
         if USE_DEEPSEEK and deepseek_client:
             response = await deepseek_client.chat.completions.create(
-                model="deepseek-chat",
+                model="deepseek-v4-pro",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=200
@@ -792,7 +784,7 @@ async def get_ai_response(
     web_context: str = "",
     tool_status: str = "",
 ) -> Optional[str]:
-    """Calls either DeepSeek or Gemini based on USE_DEEPSEEK flag."""
+    """Calls either DeepSeek V4 Pro or Gemini based on USE_DEEPSEEK flag."""
     try:
         if profile is None:
             profile = await get_user_profile_data(user_id)
@@ -802,9 +794,9 @@ async def get_ai_response(
         )
         
         if USE_DEEPSEEK and deepseek_client:
-            logger.info("🤖 Using DeepSeek for response")
+            logger.info("🤖 Using DeepSeek V4 Pro for response")
             response = await deepseek_client.chat.completions.create(
-                model="deepseek-chat",
+                model="deepseek-v4-pro",
                 messages=[
                     {"role": "system", "content": BASE_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
@@ -855,7 +847,7 @@ Return ONLY the topic word, nothing else."""
     try:
         if USE_DEEPSEEK and deepseek_client:
             response = await deepseek_client.chat.completions.create(
-                model="deepseek-chat",
+                model="deepseek-v4-pro",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=20
@@ -1484,12 +1476,12 @@ async def handle_message_async(update: Update):
 # ─── ROUTES ───
 @app.route("/", methods=["GET"])
 def health():
-    ai_provider = "DeepSeek" if USE_DEEPSEEK else "Gemini"
+    ai_provider = "DeepSeek V4 Pro" if USE_DEEPSEEK else "Gemini"
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v9.2",
+        "version": "v9.3",
         "model": f"African Intelligence Model ({ai_provider})",
-        "search_provider": "Brave API" if BRAVE_API_KEY else "DuckDuckGo Lite",
+        "search_provider": "Brave Scraping → Brave API → DuckDuckGo Lite",
         "apis": {
             "gnews": "✅" if GNEWS_API_KEY else "❌",
             "brave": "✅" if BRAVE_API_KEY else "❌",
