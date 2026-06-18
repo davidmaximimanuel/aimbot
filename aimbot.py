@@ -1593,6 +1593,7 @@ async def handle_message_async(update: Update):
     chat_type = chat.type if chat else "private"
     message_id = update.message.message_id
 
+    # --- VOICE MESSAGE HANDLING (STT) ---
     if update.message.voice or update.message.audio:
         file_obj = update.message.voice or update.message.audio
         await send_text_chunks(chat.id, "🎙️ Listening...", reply_to=message_id)
@@ -1604,18 +1605,15 @@ async def handle_message_async(update: Update):
             await send_text_chunks(chat.id, "🎤 Sorry, I couldn't understand the voice note.", reply_to=message_id)
             return
 
-    if await handle_task_message(user_text, user_id, chat.id, message_id):
-        return
-
-
     if not user_text:
-        await send_text_chunks(chat.id, "I can only read text messages for now.")
+        await send_text_chunks(chat.id, "I can only read text and voice messages for now.")
         return
 
     user_id  = str(user.id)
     username = user.username or user.first_name or "User"
     logger.info("📩 [%s/%s] '%s'", user_id, chat_type, user_text[:80])
 
+    # --- COMMAND HANDLING ---
     if user_text.startswith("/"):
         if await handle_bot_command(user_id, chat.id, message_id, user_text):
             return
@@ -1645,6 +1643,15 @@ async def handle_message_async(update: Update):
         if not mentioned and not replied_to_bot:
             return
         user_text = re.sub(r'@askaimbot', '', user_text, flags=re.IGNORECASE).strip()
+
+    # --- TASK DETECTION (MOVED TO CORRECT PLACE) ---
+    # Only detect tasks if message contains specific task keywords
+    task_keywords_strict = ["remind me to", "remind me at", "set a reminder", "set an alarm", "create a task"]
+    if any(kw in user_text.lower() for kw in task_keywords_strict):
+        logger.info("📋 Task keyword detected in message")
+        if await handle_task_message(user_text, user_id, chat.id, message_id):
+            return
+    # -----------------------------------------------
 
     try:
         session_summary = await get_session_summary(user_id)
