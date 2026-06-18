@@ -9,3 +9,5 @@ beautifulsoup4
 requests
 sentence-transformers
 google-genai
+edge-tts
+reportlab
