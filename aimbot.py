@@ -1301,6 +1301,8 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
 
 <b>General:</b>
 /help — Show this message
+/tasks — View your tasks
+/tasks delete <id> — Delete a task
 
 <b>Web Search:</b>
 /search [query] — Quick web search
@@ -1310,10 +1312,15 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
 /timer [time] — Set a timer (e.g. /timer 5m, /timer 30s, /timer 1h)
 /stopwatch — Start or stop stopwatch
 
+<b>Quick Tasks:</b>
+/news daily 8am — Daily news at 8am
+/verse daily — Daily bible verse
+/word daily — Word of the day
+
 <b>Natural Language also works:</b>
-- "What's the score?"
-- "Set a 30 second timer"
-- "Search for who won AFCON"
+- "Remind me at 6pm to cook"
+- "Always remind me to pray"
+- "Every Monday send me news"
 """, reply_to=message_id)
         return True
 
@@ -1391,38 +1398,43 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
             await send_text_chunks(chat_id, "⏱️ Stopwatch started! Use /stopwatch again to stop.", reply_to=message_id)
         return True
 
-
-        elif tl.startswith("/tasks"):
-        # List all active tasks
+    # ─── TASKS COMMANDS (NEW) ───
+    elif tl == "/tasks":
         res = supabase.table("user_tasks").select("id, task_description, task_type, next_run, task_category").eq("user_id", str(user_id)).eq("is_active", True).order("next_run", desc=False).execute()
         if not res.data:
             await send_text_chunks(chat_id, "📋 You have no active tasks.", reply_to=message_id)
             return True
-        
         lines = ["📋 <b>Your Tasks:</b>\n"]
         for t in res.data:
             next_time = datetime.fromisoformat(t["next_run"].replace("Z", "+00:00")) if t["next_run"] else None
             time_str = next_time.strftime("%b %d, %I:%M %p") if next_time else "Soon"
-            type_icon = "🔁" if t["task_type"] == "recurring" else "1️"
+            type_icon = "🔁" if t["task_type"] == "recurring" else "1️⃣"
             lines.append(f"{type_icon} <code>{t['id'][:8]}</code> | {t['task_description']}\n   Next: {time_str}")
         lines.append("\n<i>Use /tasks delete &lt;id&gt; to remove a task</i>")
         await send_text_chunks(chat_id, "\n".join(lines), reply_to=message_id)
         return True
 
     elif tl.startswith("/tasks delete"):
-        task_id = user_text.split()[-1] if len(user_text.split()) > 2 else None
-        if not task_id or len(task_id) < 5:
-            await send_text_chunks(chat_id, "❌ Use: /tasks delete <task_id>", reply_to=message_id)
+        parts = tl.split()
+        if len(parts) < 3:
+            await send_text_chunks(chat_id, "❌ Use: /tasks delete <task_id>\n<i>Get the ID from /tasks</i>", reply_to=message_id)
             return True
-        res = supabase.table("user_tasks").delete().eq("id", task_id).eq("user_id", str(user_id)).execute()
-        if res.data or res.count == 0:
-            await send_text_chunks(chat_id, "✅ Task deleted!", reply_to=message_id)
-        else:
-            await send_text_chunks(chat_id, "❌ Task not found or already deleted.", reply_to=message_id)
+        task_id = parts[2]
+        # Get full ID from partial match
+        res = supabase.table("user_tasks").select("id").eq("user_id", str(user_id)).eq("is_active", True).execute()
+        full_id = None
+        for t in res.data:
+            if t["id"].startswith(task_id):
+                full_id = t["id"]
+                break
+        if not full_id:
+            await send_text_chunks(chat_id, "❌ Task not found. Check the ID from /tasks.", reply_to=message_id)
+            return True
+        supabase.table("user_tasks").update({"is_active": False}).eq("id", full_id).eq("user_id", str(user_id)).execute()
+        await send_text_chunks(chat_id, "✅ Task deleted!", reply_to=message_id)
         return True
 
     elif tl.startswith("/news "):
-        # /news daily 8am or /news weekly monday 9am
         parts = user_text.split()
         if len(parts) < 3:
             await send_text_chunks(chat_id, "❌ Use: /news daily 8am  or  /news weekly monday 9am", reply_to=message_id)
@@ -1431,7 +1443,7 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
         time_str = parts[2] if len(parts) > 2 else "08:00"
         days = parts[2:-1] if pattern == "weekly" else []
         task_data = {
-            "description": "Send me daily/weekly news",
+            "description": "Send me news",
             "type": "recurring",
             "recurrence_pattern": pattern,
             "recurrence_time": time_str if ":" in time_str else f"{time_str}:00",
@@ -1595,7 +1607,7 @@ async def handle_message_async(update: Update):
     if await handle_task_message(user_text, user_id, chat.id, message_id):
         return
 
-        
+
     if not user_text:
         await send_text_chunks(chat.id, "I can only read text messages for now.")
         return
