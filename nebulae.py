@@ -130,3 +130,49 @@ def is_audio_request(text: str) -> bool:
     t = text.lower()
     keywords = ["read this out loud", "say this", "convert to audio", "make an audio", "text to speech"]
     return any(kw in t for kw in keywords)
+
+# ═══════════════════════════════════════════════════════════
+# LOGO RECOGNITION
+# ═══════════════════════════════════════════════════════════
+
+AIM_LOGO_DESCRIPTION = """
+AIM's logo features:
+- A bright vertical beam of light/cyan/white energy going upward
+- Glowing at the top like a star or bright light source
+- Wavy, fluid tail at the bottom with organic flowing patterns
+- Set against a dark/black background with tiny stars
+- Represents intelligence, aspiration, and African innovation
+- Minimalist, cosmic, ethereal design
+"""
+
+async def is_aim_logo(image_bytes: bytes) -> bool:
+    """
+    Analyzes if the image is AIM's logo.
+    Returns True if confidence is high, False otherwise.
+    """
+    if not gemini_client:
+        return False
+    
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                types.Part.from_text(text=f"""
+Analyze this image carefully. Does it match this description?
+
+{AIM_LOGO_DESCRIPTION}
+
+Answer ONLY with "YES" if it matches the logo, or "NO" if it doesn't.
+Be strict - only say YES if it clearly matches the beam of light design.
+""")
+            ],
+            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=10)
+        )
+        
+        answer = response.text.strip().upper()
+        return "YES" in answer
+        
+    except Exception as e:
+        logger.error(f"Logo recognition error: {e}")
+        return False
