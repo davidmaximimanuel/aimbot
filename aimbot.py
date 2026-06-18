@@ -1,35 +1,16 @@
 """
-AIM Bot v9.4 — African Intelligence Model (DeepSeek V4 Pro + API Integration)
+AIM Bot v9.5 — African Intelligence Model (DeepSeek V4 + Nebulae Integration)
 
-CHANGES FROM v9.3:
-
-  FIX 1 — MISSING `import json`
-  The task parser used json.loads() but json was never imported.
-  Every task parse silently crashed with NameError.
-
-  FIX 2 — TASK DETECTION INDENTATION BUG
-  handle_task_message() was indented inside the group-chat block,
-  so it only ran for group messages. Private chat tasks were never handled.
-  Moved to the correct place — runs for ALL chat types.
-
-  FIX 3 — RECURRING TASK NEXT_RUN BUG
-  The weekly recurrence calculation used `days_ahead = [d for d in days_ahead if d > 0] or [7]`
-  which meant if today matched a target day, it would wait 7 days.
-  Fixed to check if next_run is in the past and add exactly 1 day,
-  then scan forward day-by-day to find the next matching weekday.
-
-  FIX 4 — MISSING SUPABASE COLUMNS HANDLED GRACEFULLY
-  `completed_at` and `last_run` are now only written if they exist;
-  added try/except fallbacks so missing columns don't crash the worker.
-  Added a /debug/tasks endpoint to help diagnose task issues.
-
-  FIX 5 — TIMER ≠ TASK (separation of concerns)
-  Timer keywords (set a timer, stopwatch) are now explicitly excluded from
-  task detection so "set a 5 minute timer" doesn't accidentally create a task.
-
-  IMPROVEMENT — TASK NOTIFICATION CONTENT
-  Recurring category tasks (news, verse, word) now fetch actual content
-  when they fire, not just a reminder string.
+FEATURES:
+- DeepSeek V4 Pro/Flash with Gemini fallback
+- Nebulae: Vision, Image Gen, Audio TTS, PDF Generation
+- Task System: One-time & recurring reminders
+- Voice STT via Groq Whisper
+- Rolling memory with session summaries
+- Web search: Brave Scrape → Brave API → DDG Lite
+- Sports & News via GNews API
+- Semantic routing for search triggers
+- Time-aware conversation continuity
 """
 
 import os
@@ -47,6 +28,8 @@ from typing import Optional, Tuple
 from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 from openai import AsyncOpenAI
+import nebulae
+from telegram import InputMediaPhoto, InputMediaAudio, InputMediaDocument
 
 from flask import Flask, request, jsonify
 from telegram import (
@@ -111,7 +94,7 @@ deepseek_client: Optional[AsyncOpenAI] = None
 
 if USE_DEEPSEEK and DEEPSEEK_API_KEY:
     deepseek_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-    logger.info("✅ Using DeepSeek V4 Pro API")
+    logger.info("✅ Using DeepSeek V4 API")
 elif GEMINI_API_KEY:
     logger.info("✅ Using Gemini API")
 else:
@@ -233,18 +216,14 @@ threading.Thread(target=check_timers_background, daemon=True, name="timer-worker
 
 
 def _calc_next_run(task: dict, from_time: datetime) -> datetime:
-    """
-    Calculate the next run time for a recurring task.
-    from_time should be WAT.
-    """
+    """Calculate the next run time for a recurring task."""
     pattern = task.get("recurrence_pattern", "daily")
-    rec_time = task.get("recurrence_time")        # "HH:MM"
-    days_list = task.get("recurrence_days") or [] # ["monday", "wednesday"]
+    rec_time = task.get("recurrence_time")
+    days_list = task.get("recurrence_days") or []
 
     DAY_MAP = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,
                "friday":4,"saturday":5,"sunday":6}
 
-    # Start from from_time, apply the recurrence time
     base = from_time
     if rec_time:
         try:
@@ -253,7 +232,6 @@ def _calc_next_run(task: dict, from_time: datetime) -> datetime:
         except Exception:
             pass
 
-    # If that slot is already in the past, push it forward 1 day to start searching
     if base <= from_time:
         base += timedelta(days=1)
         if rec_time:
@@ -265,31 +243,25 @@ def _calc_next_run(task: dict, from_time: datetime) -> datetime:
 
     if pattern == "daily":
         return base
-
     elif pattern == "weekly" and days_list:
         target_days = [DAY_MAP[d.lower()] for d in days_list if d.lower() in DAY_MAP]
         if not target_days:
             return base
-        # Scan forward up to 7 days to find the next matching weekday
         for i in range(8):
             candidate = base + timedelta(days=i)
             if candidate.weekday() in target_days:
                 return candidate
         return base + timedelta(days=7)
-
     elif pattern == "monthly":
-        # Same day of month, next month
         month = base.month + 1
         year  = base.year + (1 if month > 12 else 0)
         month = 1 if month > 12 else month
         try:
             return base.replace(year=year, month=month)
         except ValueError:
-            # e.g. Jan 31 → Feb 28
             import calendar
             last_day = calendar.monthrange(year, month)[1]
             return base.replace(year=year, month=month, day=last_day)
-
     return base
 
 
@@ -313,7 +285,6 @@ def check_tasks_background():
                 task_type   = task["task_type"]
                 category    = task.get("task_category", "reminder")
 
-                # ── Build notification message
                 if category == "news":
                     content = get_latest_news("Nigeria latest news today", 3)
                     msg = f"📰 <b>Your Daily News Update:</b>\n\n{content[:3000]}"
@@ -333,7 +304,6 @@ def check_tasks_background():
                     logger.error("Task send error for user %s: %s", user_id, send_err)
 
                 if task_type == "one_time":
-                    # Mark inactive — use update without completed_at in case column doesn't exist
                     try:
                         supabase.table("user_tasks").update({
                             "is_active": False,
@@ -366,7 +336,6 @@ threading.Thread(target=check_tasks_background, daemon=True, name="task-worker")
 # TASK SYSTEM
 # ═══════════════════════════════════════════════════════════
 
-# Keywords that indicate a TASK/REMINDER (not a timer)
 TASK_KEYWORDS = [
     "remind me", "set a reminder", "reminder", "remind", "notify me",
     "don't let me forget", "alert me", "schedule", "every day", "every week",
@@ -375,7 +344,6 @@ TASK_KEYWORDS = [
     "always remind",
 ]
 
-# Keywords that are TIMERS only — exclude from task detection
 TIMER_ONLY_KEYWORDS = [
     "set a timer", "start a timer", "set timer", "start timer",
     "set a stopwatch", "start stopwatch", "stopwatch",
@@ -431,7 +399,6 @@ Return ONLY the JSON object:"""
         else:
             return {"needs_clarification": True, "clarification_question": "Could you clarify when you want this reminder?"}
 
-        # Strip any accidental markdown fences
         raw = re.sub(r'^```json\s*', '', raw.strip())
         raw = re.sub(r'^```\s*', '', raw.strip())
         raw = re.sub(r'\s*```$', '', raw.strip())
@@ -460,11 +427,9 @@ async def create_task_in_db(user_id: str, task_data: dict) -> str:
         if task_data.get("type") == "one_time" and task_data.get("scheduled_time"):
             try:
                 st = task_data["scheduled_time"]
-                # Handle both naive and tz-aware ISO strings
                 if "+" in st or st.endswith("Z"):
                     next_run = datetime.fromisoformat(st.replace("Z", "+00:00"))
                 else:
-                    # Assume WAT
                     next_run = datetime.fromisoformat(st).replace(tzinfo=WAT)
                 if next_run < datetime.now(timezone.utc):
                     next_run += timedelta(days=1)
@@ -490,7 +455,6 @@ async def create_task_in_db(user_id: str, task_data: dict) -> str:
 
         supabase.table("user_tasks").insert(row).execute()
 
-        # Build user-facing confirmation
         desc     = task_data.get("description", "your reminder")
         t_type   = task_data.get("type", "one_time")
         if t_type == "recurring":
@@ -520,25 +484,17 @@ async def create_task_in_db(user_id: str, task_data: dict) -> str:
 
 
 async def handle_task_message(user_text: str, user_id: str, chat_id: int, message_id: int) -> bool:
-    """
-    Detect task/reminder intent and handle it.
-    Returns True if this message was handled as a task.
-
-    FIX: This is now called BEFORE the group check so it works in all chat types.
-    """
+    """Detect task/reminder intent and handle it."""
     text_lower = user_text.lower()
 
-    # Bail out early if this is clearly a timer/stopwatch request
     if any(kw in text_lower for kw in TIMER_ONLY_KEYWORDS):
         return False
 
-    # Check for task keywords
     if not any(kw in text_lower for kw in TASK_KEYWORDS):
         return False
 
     logger.info("📋 Task intent detected: '%s'", user_text[:60])
 
-    # Check if user is answering a clarification we asked earlier
     context_prefix = ""
     if supabase:
         try:
@@ -547,7 +503,6 @@ async def handle_task_message(user_text: str, user_id: str, chat_id: int, messag
                       .order("created_at", desc=True).limit(1).execute())
             if recent.data:
                 last_response = recent.data[0].get("response", "")
-                # If our last reply was a clarification question, include context
                 if "clarify" in last_response.lower() or "when" in last_response.lower():
                     original_msg = recent.data[0].get("message", "")
                     context_prefix = f"Original request: {original_msg}\nUser's answer: "
@@ -804,6 +759,7 @@ CAPABILITIES:
 - Web Search: Real-time results.
 - Sports: All sports via GNews (Football, F1, NBA, Tennis, Boxing, UFC, Cricket, Rugby).
 - News: Real-time news from Nigeria and worldwide.
+- Nebulae (Your Sibling): Vision, Image Generation, Audio, PDFs.
 
 CONVERSATION CONTINUITY:
 - Read SESSION SUMMARY and RECENT HISTORY before responding.
@@ -828,6 +784,13 @@ SPECIAL INSTRUCTIONS:
 
 4. GENERAL KNOWLEDGE:
    Answer directly if confident. No SEARCH_TRIGGER needed.
+
+5. NEBULAE (THE MIRACLE WORKER - YOUR SIBLING):
+   If the user asks for an image, picture, or drawing, output EXACTLY: [NEBULAE_IMAGE: <detailed visual prompt>]
+   If the user asks you to read text out loud or make audio, output EXACTLY: [NEBULAE_AUDIO: <text to speak>]
+   If the user asks to create a PDF or document, output EXACTLY: [NEBULAE_PDF:Document Title|The content to put inside the PDF]
+   Do not output these tags unless explicitly asked for images, audio, or PDFs.
+   Treat Nebulae as your sibling — your younger but important sibling.
 ─────────────────────────────────────────
 """
 
@@ -915,7 +878,6 @@ async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, 
             gap_seconds = (datetime.now(timezone.utc) - last_ts).total_seconds()
         except Exception: pass
 
-        # Recent: last 5 in chronological order with WAT timestamps
         recent_rows = list(reversed(rows.data[:5]))
         recent_lines = []
         for row in recent_rows:
@@ -927,7 +889,6 @@ async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, 
             recent_lines += [f"  [{tstr}]", f"  User : {row['message']}", f"  AIM  : {row['response']}", ""]
         recent_history = "\n".join(recent_lines).strip()
 
-        # Older: relevance-scored
         older_rows = rows.data[5:]
         if not older_rows: return recent_history, "", gap_seconds
 
@@ -983,7 +944,6 @@ def build_enhanced_prompt(
     pref_lines.append("--- END PREFERENCES ---\n")
     parts.append("\n".join(pref_lines))
 
-    # TIME & CONTEXT BLOCK
     parts.append(
         "\n┌──────────────────────────────────────────┐\n"
         "│  TIME & CONTEXT                          │\n"
@@ -1225,6 +1185,9 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
 - "Remind me at 6pm to cook dinner"
 - "Remind me every Monday at 9am"
 - "Set a 5 minute timer"
+- "Generate an image of..."
+- "Read this out loud: ..."
+- "Create a PDF of..."
 """, reply_to=message_id)
         return True
 
@@ -1329,7 +1292,6 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
             return True
         pattern   = parts[1].lower()
         time_part = parts[2].lower().replace("am","").replace("pm","")
-        # Parse hour
         try:
             hour = int(time_part)
             if "pm" in parts[2].lower() and hour != 12: hour += 12
@@ -1466,8 +1428,30 @@ async def handle_message_async(update: Update):
             await send_text_chunks(chat.id, "🎤 Sorry, couldn't understand the voice note.", reply_to=message_id)
             return
 
+    # ── VISION HANDLING (NEBULAE) ──
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        await send_text_chunks(chat.id, "👁️ Nebulae is looking...", reply_to=message_id)
+        temp_path = f"photo_{photo.file_id}.jpg"
+        try:
+            file = await bot.get_file(photo.file_id)
+            await file.download_to_drive(custom_path=temp_path)
+            with open(temp_path, "rb") as img_file:
+                img_bytes = img_file.read()
+            
+            description = await nebulae.analyze_image(img_bytes, "Describe this image in detail. What is happening?")
+            
+            user_text = f"[User sent a photo. Nebulae sees: {description}]"
+            await send_text_chunks(chat.id, f"📝 Nebulae sees: {description[:200]}...", reply_to=message_id)
+        except Exception as e:
+            logger.error(f"Vision error: {e}")
+            await send_text_chunks(chat.id, "👁️ Couldn't process the photo.", reply_to=message_id)
+            return
+        finally:
+            if os.path.exists(temp_path): os.remove(temp_path)
+
     if not user_text:
-        await send_text_chunks(chat.id, "I can only read text and voice messages for now.")
+        await send_text_chunks(chat.id, "I can only read text, voice, and photo messages for now.")
         return
 
     user_id  = str(user.id)
@@ -1494,16 +1478,12 @@ async def handle_message_async(update: Update):
         await send_text_chunks(chat.id, result, reply_to=message_id)
         return
 
-    # ── TASK DETECTION — runs for ALL chat types (FIX: was inside group block before)
-        # ── TASK DETECTION — runs for ALL chat types
+    # ── TASK DETECTION — runs for ALL chat types
     if await handle_task_message(user_text, user_id, chat.id, message_id):
-        # FIX: Save task interaction to memory so AIM knows what happened
+        # Save task interaction to memory so AIM knows what happened
         try:
-            # Get AIM's last response (the task confirmation)
             last_response = supabase.table("chat_memory").select("response").eq("user_id", str(user_id)).order("created_at", desc=True).limit(1).execute()
             ai_response = last_response.data[0]["response"] if last_response.data else "Task created"
-            
-            # Save to memory
             await save_chat_memory(user_id, username, user_text, ai_response, chat_type, "reminder")
             await update_user_profile(user_id, username, "reminder")
         except Exception as e:
@@ -1612,6 +1592,71 @@ async def handle_message_async(update: Update):
                         answer = re.sub(r'\[STOPWATCH:STOP\]','',answer,flags=re.IGNORECASE).strip()
                         answer += f"\n\n_⏱️ Stopped! Time: {ts}_"
 
+            # ── NEBULAE MAGIC TRIGGERS ──
+            # Image Generation
+            img_match = re.search(r'\[NEBULAE_IMAGE:\s*(.+?)\]', answer, re.IGNORECASE)
+            if img_match:
+                img_prompt = img_match.group(1).strip()
+                logger.info("🎨 Nebulae generating image: %s", img_prompt[:50])
+                await send_text_chunks(chat.id, "🎨 Nebulae is painting your image...", reply_to=message_id)
+                
+                img_bytes = await nebulae.generate_image(img_prompt)
+                if img_bytes:
+                    try:
+                        await bot.send_photo(chat_id=chat.id, photo=img_bytes, caption=f"✨ Generated by Nebulae", reply_to_message_id=message_id)
+                        answer = "✅ Here is your image!"
+                    except Exception as e:
+                        logger.error(f"Send photo error: {e}")
+                        answer = "❌ Image generated but failed to send."
+                else:
+                    answer = "❌ Nebulae couldn't generate the image right now."
+                answer = re.sub(r'\[NEBULAE_IMAGE:.*?\]', '', answer, flags=re.IGNORECASE).strip()
+
+            # Audio Generation
+            audio_match = re.search(r'\[NEBULAE_AUDIO:\s*(.+?)\]', answer, re.IGNORECASE)
+            if audio_match:
+                audio_text = audio_match.group(1).strip()
+                logger.info("🔊 Nebulae generating audio: %s", audio_text[:50])
+                await send_text_chunks(chat.id, "🔊 Nebulae is speaking...", reply_to=message_id)
+                
+                audio_bytes = await nebulae.generate_audio(audio_text)
+                if audio_bytes:
+                    try:
+                        await bot.send_audio(chat_id=chat.id, audio=audio_bytes, caption="🔊 Audio by Nebulae", reply_to_message_id=message_id)
+                        answer = "✅ Here is your audio!"
+                    except Exception as e:
+                        logger.error(f"Send audio error: {e}")
+                        answer = "❌ Audio generated but failed to send."
+                else:
+                    answer = "❌ Nebulae couldn't generate the audio."
+                answer = re.sub(r'\[NEBULAE_AUDIO:.*?\]', '', answer, flags=re.IGNORECASE).strip()
+
+            # PDF Generation
+            pdf_match = re.search(r'\[NEBULAE_PDF:\s*([^\|]+)\|(.*?)\]', answer, re.IGNORECASE | re.DOTALL)
+            if pdf_match:
+                pdf_title = pdf_match.group(1).strip()
+                pdf_content = pdf_match.group(2).strip()
+                logger.info("📄 Nebulae generating PDF: %s", pdf_title)
+                await send_text_chunks(chat.id, "📄 Nebulae is generating your document...", reply_to=message_id)
+                
+                pdf_bytes = nebulae.generate_pdf(pdf_title, pdf_content)
+                if pdf_bytes:
+                    try:
+                        await bot.send_document(
+                            chat_id=chat.id,
+                            document=pdf_bytes,
+                            filename=f"{pdf_title.replace(' ', '_')}.pdf",
+                            caption=f"📄 {pdf_title}",
+                            reply_to_message_id=message_id
+                        )
+                        answer = "✅ Here is your PDF document!"
+                    except Exception as e:
+                        logger.error(f"Send PDF error: {e}")
+                        answer = "❌ PDF generated but failed to send."
+                else:
+                    answer = "❌ Nebulae couldn't generate the PDF."
+                answer = re.sub(r'\[NEBULAE_PDF:.*?\]', '', answer, flags=re.IGNORECASE | re.DOTALL).strip()
+
             final_answer = answer
             break
 
@@ -1645,11 +1690,12 @@ async def handle_message_async(update: Update):
 def health():
     return jsonify({
         "status": "AIM Bot is live!",
-        "version": "v9.4",
-        "ai": "DeepSeek V4 Pro" if USE_DEEPSEEK else "Gemini",
+        "version": "v9.5",
+        "ai": "DeepSeek V4" if USE_DEEPSEEK else "Gemini",
         "search": "Brave Scrape → Brave API → DDG Lite",
         "apis": {"gnews": "✅" if GNEWS_API_KEY else "❌", "brave": "✅" if BRAVE_API_KEY else "❌"},
-        "features": ["task_reminders_fixed","rolling_memory","time_gap_awareness","voice_stt",
+        "features": ["nebulae_integration","task_reminders","rolling_memory","time_gap_awareness",
+                     "voice_stt","vision","image_gen","audio_tts","pdf_gen",
                      "multi_language","all_sports","news_api","agentic_loop","deep_research",
                      "bot_commands","inline_mode","switchable_ai"],
     })
@@ -1710,7 +1756,6 @@ def debug_search():
 
 @app.route("/debug/tasks/<user_id>", methods=["GET"])
 def debug_tasks(user_id: str):
-    """NEW: Inspect all tasks for a user — helpful for diagnosing task issues."""
     if not supabase: return jsonify({"error": "Supabase not connected"}), 500
     try:
         tasks = supabase.table("user_tasks").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(20).execute()
