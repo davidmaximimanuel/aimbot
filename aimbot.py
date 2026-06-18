@@ -1495,7 +1495,19 @@ async def handle_message_async(update: Update):
         return
 
     # ── TASK DETECTION — runs for ALL chat types (FIX: was inside group block before)
+        # ── TASK DETECTION — runs for ALL chat types
     if await handle_task_message(user_text, user_id, chat.id, message_id):
+        # FIX: Save task interaction to memory so AIM knows what happened
+        try:
+            # Get AIM's last response (the task confirmation)
+            last_response = supabase.table("chat_memory").select("response").eq("user_id", str(user_id)).order("created_at", desc=True).limit(1).execute()
+            ai_response = last_response.data[0]["response"] if last_response.data else "Task created"
+            
+            # Save to memory
+            await save_chat_memory(user_id, username, user_text, ai_response, chat_type, "reminder")
+            await update_user_profile(user_id, username, "reminder")
+        except Exception as e:
+            logger.error("Failed to save task interaction to memory: %s", e)
         return
 
     # Group mention filter (AFTER task detection)
