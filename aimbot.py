@@ -1644,13 +1644,14 @@ async def handle_message_async(update: Update):
             return
         user_text = re.sub(r'@askaimbot', '', user_text, flags=re.IGNORECASE).strip()
 
-    # --- TASK DETECTION (MOVED TO CORRECT PLACE) ---
-    # Only detect tasks if message contains specific task keywords
-    task_keywords_strict = ["remind me to", "remind me at", "set a reminder", "set an alarm", "create a task"]
-    if any(kw in user_text.lower() for kw in task_keywords_strict):
+       # --- TASK DETECTION (MOVED TO CORRECT PLACE) ---
+    # Detect tasks if message contains task keywords
+    task_keywords = ["remind me", "reminder", "set a reminder", "set an alarm", "create a task", "don't let me forget"]
+    if any(kw in user_text.lower() for kw in task_keywords):
         logger.info("📋 Task keyword detected in message")
         if await handle_task_message(user_text, user_id, chat.id, message_id):
             return
+    # -----------------------------------------------
     # -----------------------------------------------
 
     try:
