@@ -120,6 +120,123 @@ async def transcribe_voice(file_id: str) -> Optional[str]:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
+# ═══════════════════════════════════════════════════════════
+# TASKS SYSTEM (Natural Language + Recurring + One-Time)
+# ═══════════════════════════════════════════════════════════
+
+TASK_KEYWORDS = ["remind me", "set a reminder", "remind", "task", "todo", "set an alarm", "notify me"]
+
+async def parse_task_with_ai(user_text: str, user_id: str) -> dict:
+    """Uses DeepSeek to parse natural language into structured task data."""
+    now_wat = datetime.now(timezone(timedelta(hours=1)))
+    current_time_str = now_wat.strftime("%A, %B %d, %Y at %I:%M %p WAT")
+    
+    prompt = f"""Parse this user message into a task. Return ONLY valid JSON. No markdown, no extra text.
+Fields:
+- description (string): clear task description
+- type ("one_time"|"recurring")
+- scheduled_time (ISO 8601 string or null): for one_time only
+- recurrence_pattern ("daily"|"weekly"|"monthly"|null)
+- recurrence_time ("HH:MM" string or null)
+- recurrence_days (array of lowercase day names ["monday","wednesday"] or null)
+- category ("reminder"|"news"|"verse"|"word"|"custom")
+- needs_clarification (boolean)
+- clarification_question (string, empty if not needed)
+
+Rules:
+- "remind me at 6pm to cook" -> one_time, scheduled_time=today 18:00 WAT
+- "always remind me at 6pm to cook" -> recurring, pattern=daily, time=18:00
+- "every monday at 9am send me news" -> recurring, pattern=weekly, days=["monday"], time=09:00, category=news
+- "remind me in 2 hours" -> one_time, scheduled_time=now+2h
+- If unclear, set needs_clarification=true and ask a short question
+Current time: {current_time_str}
+User message: "{user_text}"
+"""
+    
+    try:
+        if USE_DEEPSEEK and deepseek_client:
+            r = await deepseek_client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1, max_tokens=300
+            )
+            raw = r.choices[0].message.content.strip()
+            # Clean markdown if DeepSeek wraps it
+            if raw.startswith("```json"):
+                raw = raw.replace("```json", "").replace("```", "").strip()
+            elif raw.startswith("```"):
+                raw = raw.replace("```", "").strip()
+            return json.loads(raw)
+    except Exception as e:
+        logger.error(f"Task parsing error: {e}")
+    return {"needs_clarification": True, "clarification_question": "Could you clarify when and how often you want this reminder?"}
+
+
+async def create_task_in_db(user_id: str, task_data: dict) -> str:
+    """Saves parsed task to Supabase and returns success/failure message."""
+    try:
+        now_wat = datetime.now(timezone(timedelta(hours=1)))
+        
+        # Calculate next_run based on type
+        next_run = None
+        if task_data["type"] == "one_time" and task_data.get("scheduled_time"):
+            next_run = datetime.fromisoformat(task_data["scheduled_time"].replace("Z", "+00:00"))
+            # If scheduled time is in past, assume tomorrow
+            if next_run < now_wat:
+                next_run += timedelta(days=1)
+        elif task_data["type"] == "recurring":
+            # Calculate first occurrence
+            base_time = now_wat
+            if task_data.get("recurrence_time"):
+                h, m = map(int, task_data["recurrence_time"].split(":"))
+                base_time = base_time.replace(hour=h, minute=m, second=0, microsecond=0)
+                if base_time < now_wat:
+                    base_time += timedelta(days=1)
+            next_run = base_time
+
+        # Insert into Supabase
+        supabase.table("user_tasks").insert({
+            "user_id": str(user_id),
+            "task_description": task_data["description"],
+            "task_type": task_data["type"],
+            "scheduled_time": task_data.get("scheduled_time"),
+            "recurrence_pattern": task_data.get("recurrence_pattern"),
+            "recurrence_time": task_data.get("recurrence_time"),
+            "recurrence_days": task_data.get("recurrence_days", []),
+            "task_category": task_data.get("category", "reminder"),
+            "is_active": True,
+            "next_run": next_run.isoformat() if next_run else None
+        }).execute()
+        
+        type_text = "daily" if task_data["type"] == "recurring" else "once"
+        return f"✅ Task saved! I'll remind you {type_text}: \"{task_data['description']}\""
+    except Exception as e:
+        logger.error(f"Task creation error: {e}")
+        return "❌ Couldn't save the task. Please try again."
+
+
+async def handle_task_message(user_text: str, user_id: str, chat_id: int, message_id: int) -> bool:
+    """Detects task-like messages and handles them. Returns True if handled."""
+    if not any(kw in user_text.lower() for kw in TASK_KEYWORDS):
+        return False
+    
+    # Check if user is responding to a clarification
+    recent = supabase.table("chat_memory").select("message, response").eq("user_id", str(user_id)).order("created_at", desc=True).limit(1).execute()
+    if recent.data and "clarification_question" in recent.data[0].get("response", ""):
+        # User is answering clarification, re-parse with context
+        combined = f"Original: {recent.data[0]['message']}\nClarification: {user_text}"
+        task_data = await parse_task_with_ai(combined, user_id)
+    else:
+        task_data = await parse_task_with_ai(user_text, user_id)
+    
+    if task_data.get("needs_clarification"):
+        await send_text_chunks(chat_id, f"🤔 {task_data['clarification_question']}", reply_to=message_id)
+        return True
+    
+    result = await create_task_in_db(user_id, task_data)
+    await send_text_chunks(chat_id, result, reply_to=message_id)
+    return True
+
 if BRAVE_API_KEY:
     logger.info("✅ Brave Search API key found")
 else:
@@ -223,6 +340,77 @@ def check_timers_background():
                     logger.info("⏰ Timer fired for user %s", user_id)
         except Exception as e:
             logger.error("Timer background check error: %s", e)
+
+# ─── BACKGROUND TASK WORKER ───
+def check_tasks_background():
+    logger.info(" Task background worker started.")
+    while True:
+        time.sleep(30)  # Check every 30 seconds
+        if not supabase or not bot:
+            continue
+        try:
+            now_utc = datetime.now(timezone.utc).isoformat()
+            # Get all active tasks that are due
+            res = (supabase.table("user_tasks")
+                   .select("*")
+                   .eq("is_active", True)
+                   .lte("next_run", now_utc)
+                   .order("next_run", desc=False)
+                   .execute())
+            
+            if not res.data:
+                continue
+                
+            for task in res.data:
+                user_id = task["user_id"]
+                task_id = task["id"]
+                description = task["task_description"]
+                task_type = task["task_type"]
+                
+                # Send notification
+                msg = f"⏰ Task Reminder:\n\n{description}"
+                run_async(bot.send_message(chat_id=int(user_id), text=msg))
+                logger.info(f"📋 Task fired for user {user_id}: {description}")
+                
+                if task_type == "one_time":
+                    # Mark as completed/inactive
+                    supabase.table("user_tasks").update({"is_active": False, "completed_at": datetime.now(timezone.utc).isoformat()}).eq("id", task_id).execute()
+                elif task_type == "recurring":
+                    # Calculate next occurrence
+                    now_wat = datetime.now(timezone(timedelta(hours=1)))
+                    pattern = task.get("recurrence_pattern")
+                    days = task.get("recurrence_days", [])
+                    rec_time = task.get("recurrence_time")
+                    
+                    next_run = now_wat
+                    if rec_time:
+                        h, m = map(int, rec_time.split(":"))
+                        next_run = next_run.replace(hour=h, minute=m, second=0, microsecond=0)
+                        if next_run <= now_wat:
+                            next_run += timedelta(days=1)
+                    
+                    if pattern == "weekly" and days:
+                        # Find next matching day
+                        day_map = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
+                        current_day = next_run.weekday()
+                        target_days = [day_map.get(d.lower(), 0) for d in days]
+                        days_ahead = [(d - current_day) % 7 for d in target_days]
+                        days_ahead = [d for d in days_ahead if d > 0] or [7]
+                        next_run += timedelta(days=min(days_ahead))
+                    elif pattern == "monthly":
+                        next_run = (next_run.replace(day=1) + timedelta(days=32)).replace(day=1)
+                    else:  # daily
+                        next_run += timedelta(days=1)
+                    
+                    supabase.table("user_tasks").update({
+                        "last_run": datetime.now(timezone.utc).isoformat(),
+                        "next_run": next_run.isoformat()
+                    }).eq("id", task_id).execute()
+                    
+        except Exception as e:
+            logger.error("Task background check error: %s", e)
+
+threading.Thread(target=check_tasks_background, daemon=True, name="task-worker").start()
 
 threading.Thread(target=check_timers_background, daemon=True, name="timer-worker").start()
 
@@ -1203,6 +1391,67 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
             await send_text_chunks(chat_id, "⏱️ Stopwatch started! Use /stopwatch again to stop.", reply_to=message_id)
         return True
 
+
+        elif tl.startswith("/tasks"):
+        # List all active tasks
+        res = supabase.table("user_tasks").select("id, task_description, task_type, next_run, task_category").eq("user_id", str(user_id)).eq("is_active", True).order("next_run", desc=False).execute()
+        if not res.data:
+            await send_text_chunks(chat_id, "📋 You have no active tasks.", reply_to=message_id)
+            return True
+        
+        lines = ["📋 <b>Your Tasks:</b>\n"]
+        for t in res.data:
+            next_time = datetime.fromisoformat(t["next_run"].replace("Z", "+00:00")) if t["next_run"] else None
+            time_str = next_time.strftime("%b %d, %I:%M %p") if next_time else "Soon"
+            type_icon = "🔁" if t["task_type"] == "recurring" else "1️"
+            lines.append(f"{type_icon} <code>{t['id'][:8]}</code> | {t['task_description']}\n   Next: {time_str}")
+        lines.append("\n<i>Use /tasks delete &lt;id&gt; to remove a task</i>")
+        await send_text_chunks(chat_id, "\n".join(lines), reply_to=message_id)
+        return True
+
+    elif tl.startswith("/tasks delete"):
+        task_id = user_text.split()[-1] if len(user_text.split()) > 2 else None
+        if not task_id or len(task_id) < 5:
+            await send_text_chunks(chat_id, "❌ Use: /tasks delete <task_id>", reply_to=message_id)
+            return True
+        res = supabase.table("user_tasks").delete().eq("id", task_id).eq("user_id", str(user_id)).execute()
+        if res.data or res.count == 0:
+            await send_text_chunks(chat_id, "✅ Task deleted!", reply_to=message_id)
+        else:
+            await send_text_chunks(chat_id, "❌ Task not found or already deleted.", reply_to=message_id)
+        return True
+
+    elif tl.startswith("/news "):
+        # /news daily 8am or /news weekly monday 9am
+        parts = user_text.split()
+        if len(parts) < 3:
+            await send_text_chunks(chat_id, "❌ Use: /news daily 8am  or  /news weekly monday 9am", reply_to=message_id)
+            return True
+        pattern = parts[1].lower()
+        time_str = parts[2] if len(parts) > 2 else "08:00"
+        days = parts[2:-1] if pattern == "weekly" else []
+        task_data = {
+            "description": "Send me daily/weekly news",
+            "type": "recurring",
+            "recurrence_pattern": pattern,
+            "recurrence_time": time_str if ":" in time_str else f"{time_str}:00",
+            "recurrence_days": [d.lower() for d in days],
+            "category": "news",
+            "needs_clarification": False
+        }
+        await send_text_chunks(chat_id, await create_task_in_db(user_id, task_data), reply_to=message_id)
+        return True
+
+    elif tl == "/verse daily":
+        task_data = {"description": "Send me a daily bible verse", "type": "recurring", "recurrence_pattern": "daily", "recurrence_time": "08:00", "category": "verse", "needs_clarification": False}
+        await send_text_chunks(chat_id, await create_task_in_db(user_id, task_data), reply_to=message_id)
+        return True
+
+    elif tl == "/word daily":
+        task_data = {"description": "Send me word of the day", "type": "recurring", "recurrence_pattern": "daily", "recurrence_time": "09:00", "category": "word", "needs_clarification": False}
+        await send_text_chunks(chat_id, await create_task_in_db(user_id, task_data), reply_to=message_id)
+        return True
+
     return False
 
 
@@ -1343,6 +1592,10 @@ async def handle_message_async(update: Update):
             await send_text_chunks(chat.id, "🎤 Sorry, I couldn't understand the voice note.", reply_to=message_id)
             return
 
+    if await handle_task_message(user_text, user_id, chat.id, message_id):
+        return
+
+        
     if not user_text:
         await send_text_chunks(chat.id, "I can only read text messages for now.")
         return
