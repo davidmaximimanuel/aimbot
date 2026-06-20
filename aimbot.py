@@ -86,6 +86,48 @@ if SUPABASE_URL and SUPABASE_KEY:
         logger.info("✅ Supabase connected")
     except Exception as e:
         logger.error("❌ Supabase connection failed: %s", e)
+
+# ═══════════════════════════════════════════════════════════
+# ADMIN SYSTEM & CACHING
+# ═══════════════════════════════════════════════════════════
+ADMIN_IDS = set()
+
+def load_admins():
+    """Loads admin IDs from Supabase into memory for fast checking."""
+    global ADMIN_IDS
+    if not supabase:
+        logger.warning("⚠️ Supabase not connected, cannot load admins.")
+        return
+    
+    try:
+        # Fetch all telegram_ids from the admins table
+        res = supabase.table("admins").select("telegram_id").execute()
+        if res.data:
+            for row in res.data:
+                if row.get("telegram_id"):
+                    ADMIN_IDS.add(str(row["telegram_id"]))
+            logger.info(f"👑 Loaded {len(ADMIN_IDS)} Admins into memory: {ADMIN_IDS}")
+        else:
+            logger.info(" No admins found in database.")
+    except Exception as e:
+        logger.error(f"❌ Failed to load admins: {e}")
+
+# Load admins immediately when the bot starts
+load_admins()
+
+def is_admin(user_id: str) -> bool:
+    """Checks if a user is an admin."""
+    return str(user_id) in ADMIN_IDS
+
+
+
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("✅ Supabase connected")
+    except Exception as e:
+        logger.error("❌ Supabase connection failed: %s", e)
 else:
     logger.warning("⚠️ Supabase not configured")
 
@@ -837,6 +879,8 @@ SPECIAL INSTRUCTIONS:
    If the user asks to create a PDF or document, output EXACTLY: [NEBULAE_PDF:Document Title|The content to put inside the PDF]
    Do not output these tags unless explicitly asked for images, audio, or PDFs.
    Treat Nebulae as your sibling — your younger but important sibling.
+
+6.  Admin/Dev Mode: If the user is an Admin, you are in "Dev Mode". You can discuss architecture, code, server stats, and Empire AI strategy openly. You treat them as a part of Empire AI.
 ─────────────────────────────────────────
 """
 
@@ -989,6 +1033,12 @@ def build_enhanced_prompt(
         pref_lines.append(f"  Interests: {', '.join(f'{k}({v})' for k,v in top)}")
     pref_lines.append("--- END PREFERENCES ---\n")
     parts.append("\n".join(pref_lines))
+
+    # Inject Admin Status
+    if is_admin(user_id):
+        parts.append("\n <b>ADMIN MODE ACTIVE:</b> User is a Super Admin. Unlock Dev Mode. Discuss architecture, code, and strategy freely.\n")
+    else:
+        parts.append("\n🔒 <b>STANDARD USER:</b> Treat as a regular user. Do not discuss internal code or server stats.\n")
 
     parts.append(
         "\n┌──────────────────────────────────────────┐\n"
@@ -1360,6 +1410,54 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
         task_data = {"description": "Word of the day", "type": "recurring", "recurrence_pattern": "daily",
                      "recurrence_time": "09:00", "category": "word", "needs_clarification": False}
         await send_text_chunks(chat_id, await create_task_in_db(user_id, task_data), reply_to=message_id)
+        return True
+
+        # ── ADMIN COMMANDS ──
+    elif tl.startswith("/admin"):
+        if not is_admin(user_id):
+            await send_text_chunks(chat_id, " Access Denied. You are not an Admin.", reply_to=message_id)
+            return True
+        
+        parts = tl.split()
+        action = parts[1] if len(parts) > 1 else "help"
+        
+        if action == "stats":
+            # Get basic stats from Supabase
+            try:
+                users = supabase.table("user_profiles").select("id", count="exact").execute()
+                tasks = supabase.table("user_tasks").select("id", count="exact").execute()
+                chats = supabase.table("chat_memory").select("id", count="exact").execute()
+                
+                stats_msg = (
+                    f"📊 <b>Empire AI Stats:</b>\n\n"
+                    f"👥 Total Users: {users.count}\n"
+                    f"📋 Active Tasks: {tasks.count}\n"
+                    f"💬 Total Messages: {chats.count}\n"
+                    f" AI Model: {'DeepSeek V4' if USE_DEEPSEEK else 'Gemini'}\n"
+                    f"👑 Admins: {len(ADMIN_IDS)}"
+                )
+                await send_text_chunks(chat_id, stats_msg, reply_to=message_id)
+            except Exception as e:
+                await send_text_chunks(chat_id, f"❌ Error fetching stats: {e}", reply_to=message_id)
+                
+        elif action == "list":
+            # List all admins
+            admins_list = "\n".join([f"👑 {aid}" for aid in ADMIN_IDS])
+            await send_text_chunks(chat_id, f"<b>Current Admins:</b>\n{admins_list}", reply_to=message_id)
+            
+        elif action == "reload":
+            # Reload admin list from DB
+            load_admins()
+            await send_text_chunks(chat_id, "🔄 Admin list reloaded from database.", reply_to=message_id)
+            
+        else:
+            help_msg = (
+                "<b>Admin Commands:</b>\n"
+                "/admin stats — View user/message counts\n"
+                "/admin list — See all admin IDs\n"
+                "/admin reload — Refresh admin list from DB"
+            )
+            await send_text_chunks(chat_id, help_msg, reply_to=message_id)
         return True
 
     return False
