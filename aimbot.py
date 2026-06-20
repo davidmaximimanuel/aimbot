@@ -120,16 +120,51 @@ def is_admin(user_id: str) -> bool:
     return str(user_id) in ADMIN_IDS
 
 
+# ═══════════════════════════════════════════════════════════
+# ADMIN TOOLS: FILE READING & SERVER METRICS
+# ═══════════════════════════════════════════════════════════
+START_TIME = time.time()
 
-supabase: Optional[Client] = None
-if SUPABASE_URL and SUPABASE_KEY:
+def read_file_safely(filepath: str) -> str:
+    """Safely reads a file from the current directory. Prevents hacking."""
+    base_dir = os.path.abspath(os.path.dirname(__file__))
+    requested_path = os.path.abspath(os.path.join(base_dir, filepath))
+    
+    if not requested_path.startswith(base_dir):
+        return "❌ Access Denied: Path traversal detected."
+    if not os.path.exists(requested_path):
+        return f"❌ File not found: {filepath}"
+        
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("✅ Supabase connected")
+        with open(requested_path, 'r', encoding='utf-8') as f:
+            return f.read()
     except Exception as e:
-        logger.error("❌ Supabase connection failed: %s", e)
-else:
-    logger.warning("⚠️ Supabase not configured")
+        return f"❌ Error reading file: {e}"
+
+def get_server_metrics() -> str:
+    """Gets basic server health metrics."""
+    import resource
+    
+    uptime_seconds = time.time() - START_TIME
+    hours, remainder = divmod(int(uptime_seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    memory_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    memory_mb = memory_kb / 1024  
+    
+    try:
+        load_1, load_5, load_15 = os.getloadavg()
+    except Exception:
+        load_1, load_5, load_15 = "N/A", "N/A", "N/A"
+
+    return (
+        f"📊 <b>Server Health Report:</b>\n\n"
+        f"⏱️ <b>Uptime:</b> {hours}h {minutes}m {seconds}s\n"
+        f"💾 <b>Memory Usage:</b> {memory_mb:.2f} MB\n"
+        f"🧠 <b>CPU Load:</b> 1m: {load_1} | 5m: {load_5} | 15m: {load_15}\n"
+        f"🐍 <b>Python:</b> {os.sys.version.split()[0]}\n"
+        f"📂 <b>Directory:</b> {os.getcwd()}"
+    )
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 deepseek_client: Optional[AsyncOpenAI] = None
@@ -1445,17 +1480,53 @@ async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_t
             admins_list = "\n".join([f"👑 {aid}" for aid in ADMIN_IDS])
             await send_text_chunks(chat_id, f"<b>Current Admins:</b>\n{admins_list}", reply_to=message_id)
             
-        elif action == "reload":
-            # Reload admin list from DB
+                elif action == "reload":
             load_admins()
             await send_text_chunks(chat_id, "🔄 Admin list reloaded from database.", reply_to=message_id)
+
+        elif action == "server":
+            metrics = get_server_metrics()
+            await send_text_chunks(chat_id, metrics, reply_to=message_id)
+
+        elif action.startswith("read "):
+            filename = user_text.split(" ", 2)[2] if len(user_text.split(" ", 2)) > 2 else "aimbot.py"
+            code_content = read_file_safely(filename)
+            formatted_code = f"📄 <b>File: {filename}</b>\n\n```python\n{code_content[:3000]}\n```"
+            await send_text_chunks(chat_id, formatted_code, reply_to=message_id)
+
+        elif action.startswith("analyze "):
+            filename = user_text.split(" ", 2)[2] if len(user_text.split(" ", 2)) > 2 else "aimbot.py"
+            code_content = read_file_safely(filename)
             
+            if code_content.startswith("❌"):
+                await send_text_chunks(chat_id, code_content, reply_to=message_id)
+                return True
+
+            await send_text_chunks(chat_id, f"🔍 Analyzing <b>{filename}</b>... This may take a moment.", reply_to=message_id)
+            
+            analysis_prompt = f"""You are in Dev Mode. Analyze this Python code for our AIM bot. 
+1. Identify bugs or security risks.
+2. Suggest 3 improvements.
+3. Explain how it fits into Empire AI.
+
+CODE:
+{code_content[:12000]}"""
+            
+            analysis = await get_ai_response(analysis_prompt, user_id, "private")
+            if analysis:
+                await send_text_chunks(chat_id, f"📊 <b>Analysis of {filename}:</b>\n\n{analysis}", reply_to=message_id)
+            else:
+                await send_text_chunks(chat_id, "❌ Analysis failed.", reply_to=message_id)
+
         else:
             help_msg = (
-                "<b>Admin Commands:</b>\n"
+                "<b>👑 Admin Commands:</b>\n\n"
                 "/admin stats — View user/message counts\n"
+                "/admin server — Real-time server health\n"
                 "/admin list — See all admin IDs\n"
-                "/admin reload — Refresh admin list from DB"
+                "/admin reload — Refresh admin list from DB\n"
+                "/admin read [file] — View raw code\n"
+                "/admin analyze [file] — AI code review"
             )
             await send_text_chunks(chat_id, help_msg, reply_to=message_id)
         return True
