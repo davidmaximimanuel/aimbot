@@ -31,17 +31,17 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("aimbot")
 
-# ─── CONFIG ───
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
+# ─── CONFIG ──
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-USE_DEEPSEEK     = os.environ.get("USE_DEEPSEEK", "false").lower() == "true"
-SUPABASE_URL     = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY     = os.environ.get("SUPABASE_KEY", "")
-WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "")
-BRAVE_API_KEY    = os.environ.get("BRAVE_API_KEY", "")
-GNEWS_API_KEY    = os.environ.get("GNEWS_API_KEY", "")
-GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
+USE_DEEPSEEK = os.environ.get("USE_DEEPSEEK", "false").lower() == "true"
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
+GNEWS_API_KEY = os.environ.get("GNEWS_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 TELEGRAM_MAX_CHARS = 4096
 WAT = timezone(timedelta(hours=1))
@@ -241,7 +241,7 @@ def check_timers_background():
                    .eq("tool_type", "timer").eq("is_active", True)
                    .lte("target_time", now_utc).execute())
             for row in res.data or []:
-                user_id  = row["user_id"]
+                user_id = row["user_id"]
                 duration = row.get("duration_seconds", 0)
                 supabase.table("user_tools").update({"is_active": False}).eq("id", row["id"]).execute()
                 mins, secs = divmod(duration, 60)
@@ -284,7 +284,7 @@ def _calc_next_run(task: dict, from_time: datetime) -> datetime:
         return base + timedelta(days=7)
     elif pattern == "monthly":
         month = base.month + 1
-        year  = base.year + (1 if month > 12 else 0)
+        year = base.year + (1 if month > 12 else 0)
         month = 1 if month > 12 else month
         try: return base.replace(year=year, month=month)
         except ValueError:
@@ -1316,89 +1316,19 @@ def webhook():
         logger.error("Webhook error: %s", e)
         return "Error", 500
 
-
-# ═══════════════════════════════════════════════════════════
-# ADD THIS ROUTE to your aimbot.py, anywhere among your other
-# @app.route(...) definitions (e.g. right after /debug/supabase
-# if you have one, or anywhere before `if __name__ == "__main__":`)
-# ═══════════════════════════════════════════════════════════
-
 @app.route("/debug/tasks/<user_id>", methods=["GET"])
 def debug_tasks(user_id: str):
-    """
-    Shows EXACTLY what's stored for a user's tasks, plus whether each one
-    SHOULD have fired by now, comparing against live server time.
-    Visit: https://your-app-url/debug/tasks/<your_telegram_user_id>
-    """
-    if not supabase:
-        return jsonify({"error": "Supabase not connected"}), 500
+    if not supabase: return jsonify({"error": "Supabase not connected"}), 500
     try:
-        now_utc = datetime.now(timezone.utc)
-        tasks = (supabase.table("user_tasks")
-                 .select("*")
-                 .eq("user_id", user_id)
-                 .order("created_at", desc=True)
-                 .limit(20)
-                 .execute())
-
-        enriched = []
-        for t in tasks.data:
-            next_run_raw = t.get("next_run")
-            should_have_fired = None
-            seconds_until_fire = None
-
-            if next_run_raw:
-                try:
-                    next_run_dt = datetime.fromisoformat(next_run_raw.replace("Z", "+00:00"))
-                    should_have_fired = next_run_dt <= now_utc
-                    seconds_until_fire = (next_run_dt - now_utc).total_seconds()
-                except Exception as parse_err:
-                    should_have_fired = f"PARSE_ERROR: {parse_err}"
-
-            enriched.append({
-                "id": t.get("id"),
-                "description": t.get("task_description"),
-                "type": t.get("task_type"),
-                "category": t.get("task_category"),
-                "is_active": t.get("is_active"),
-                "next_run_stored": next_run_raw,
-                "recurrence_pattern": t.get("recurrence_pattern"),
-                "recurrence_time": t.get("recurrence_time"),
-                "recurrence_days": t.get("recurrence_days"),
-                "last_run": t.get("last_run"),
-                "should_have_fired_by_now": should_have_fired,
-                "seconds_until_next_fire": seconds_until_fire,
-            })
-
+        tasks = supabase.table("user_tasks").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(20).execute()
+        now_utc = datetime.now(timezone.utc).isoformat()
         return jsonify({
             "user_id": user_id,
-            "server_time_utc": now_utc.isoformat(),
-            "server_time_wat": now_utc.astimezone(WAT).isoformat(),
-            "total_tasks_for_user": len(enriched),
-            "active_tasks": [t for t in enriched if t["is_active"]],
-            "inactive_tasks": [t for t in enriched if not t["is_active"]],
-            "all_tasks": enriched,
+            "server_time_utc": now_utc,
+            "task_count": len(tasks.data),
+            "tasks": tasks.data,
         })
-    except Exception as e:
-        logger.error("debug_tasks error: %s", e)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/debug/worker-status", methods=["GET"])
-def debug_worker_status():
-    """
-    Confirms the background threads are actually alive right now.
-    Visit: https://your-app-url/debug/worker-status
-    """
-    alive_threads = [t.name for t in threading.enumerate()]
-    return jsonify({
-        "all_threads": alive_threads,
-        "timer_worker_alive": "timer-worker" in alive_threads,
-        "task_worker_alive": "task-worker" in alive_threads,
-        "async_loop_alive": "async-loop" in alive_threads,
-        "server_time_utc": datetime.now(timezone.utc).isoformat(),
-    })
-
+    except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.route("/set-webhook", methods=["GET"])
 def set_webhook():
