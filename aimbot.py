@@ -1,5 +1,5 @@
 """
-AIM Bot v9.6 — African Intelligence Model (DeepSeek V4 + Nebulae + Admin System)
+AIM Bot v9.6 — African Intelligence Model (DeepSeek V4 + Nebulae + Admin System + Empire ID)
 """
 import os
 import json
@@ -11,6 +11,8 @@ import re
 import time
 import requests
 import numpy as np
+import random
+import string
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from bs4 import BeautifulSoup
@@ -119,6 +121,14 @@ load_admins()
 
 def is_admin(user_id: str) -> bool:
     return str(user_id) in ADMIN_IDS
+
+# ═══════════════════════════════════════════════════════════
+# EMPIRE ID SYSTEM
+# ═══════════════════════════════════════════════════════════
+def generate_empire_id() -> str:
+    """Generates a unique Empire ID (e.g., EMP-A1B2C3D4)."""
+    random_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    return f"EMP-{random_str}"
 
 def read_file_safely(filepath: str) -> str:
     base_dir = os.path.abspath(os.path.dirname(__file__))
@@ -895,6 +905,7 @@ I'm your personal AI assistant built for Africans, by Africans. Here's what I ca
 /tasks — View your reminders
 /search [query] — Quick search
 /deep [query] — Deep research
+/claim — Get your Empire ID
 
 Just talk to me naturally — I'll understand! 🇳🇬✨"""
         await send_text_chunks(chat_id, welcome_msg, reply_to=message_id)
@@ -1000,7 +1011,35 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
         task_data = {"description": "Word of the day", "type": "recurring", "recurrence_pattern": "daily", "recurrence_time": "09:00", "category": "word", "needs_clarification": False}
         await send_text_chunks(chat_id, await create_task_in_db(user_id, task_data), reply_to=message_id)
         return True
-        
+    elif tl == "/claim":
+        # 1. Check if they already have an Empire ID
+        profile = await get_user_profile_data(user_id)
+        existing_id = profile.get("empire_id")
+
+        if existing_id:
+            await send_text_chunks(
+                chat_id, 
+                f"👑 You already have an Empire ID: <b>{existing_id}</b>\n\nKeep this safe! You will use it to log into the Web App when it launches.", 
+                reply_to=message_id
+            )
+        else:
+            # 2. Generate a unique Empire ID
+            new_id = generate_empire_id()
+
+            # 3. Save it to Supabase
+            try:
+                supabase.table("user_profiles").update({"empire_id": new_id}).eq("user_id", str(user_id)).execute()
+                
+                await send_text_chunks(
+                    chat_id, 
+                    f"🎉 <b>Congratulations!</b>\n\nYour Empire ID has been created: <b>{new_id}</b>\n\n⚠️ <b>SAVE THIS ID.</b> When the Empire AI Web App launches, you will use this ID to log in and sync all your memories, tasks, and preferences from Telegram.", 
+                    reply_to=message_id
+                )
+            except Exception as e:
+                logger.error(f"Failed to save Empire ID: {e}")
+                await send_text_chunks(chat_id, "❌ Failed to generate Empire ID. Please try again.", reply_to=message_id)
+        return True
+    
     # ── ADMIN COMMANDS ──
     elif tl.startswith("/admin"):
         if not is_admin(user_id):
