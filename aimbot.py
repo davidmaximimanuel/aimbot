@@ -31,7 +31,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("aimbot")
 
-# ─── CONFIG ──
+# ─── CONFIG ───
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -865,8 +865,39 @@ async def search_memory(user_id: str) -> str:
 # ═══════════════════════════════════════════════════════════
 async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_text: str) -> bool:
     tl = user_text.lower().strip()
-    if tl.startswith("/help"):
-        await send_text_chunks(chat_id, """🤖 <b>AIM Bot Commands</b>\n\n<b>General:</b>\n/help — Show this message\n\n<b>Web Search:</b>\n/search [query]\n/deep [query]\n\n<b>Time Tools:</b>\n/timer [time]\n/stopwatch\n\n<b>Tasks:</b>\n/tasks\n/tasks delete [id]\n/news daily 8am\n/verse daily\n/word daily\n\n<b>Admin:</b>\n/admin stats\n/admin server\n/admin read [file]\n/admin analyze [file]""", reply_to=message_id)
+    if tl.startswith("/start") or tl.startswith("/help"):
+        welcome_msg = """🌟 <b>Welcome to AIM — African Intelligence Model!</b>
+
+I'm your personal AI assistant built for Africans, by Africans. Here's what I can do:
+
+<b>🧠 Smart Conversations</b>
+• Chat in English, Pidgin, Yoruba, Hausa, Igbo & more
+• I remember our conversations and learn your preferences
+
+<b>🔍 Real-Time Search</b>
+• Web search, news, sports updates
+• Deep research on any topic
+
+<b>⏰ Tasks & Reminders</b>
+• "Remind me at 6pm to cook"
+• "Every Monday send me news at 8am"
+• "Daily bible verse" or "Word of the day"
+
+<b>🎨 Creative Tools</b>
+• Generate images, audio, PDFs
+• Analyze photos and documents
+
+<b>🎙️ Voice Support</b>
+• Send voice notes — I'll transcribe and respond
+
+<b>Quick Commands:</b>
+/help — See all commands
+/tasks — View your reminders
+/search [query] — Quick search
+/deep [query] — Deep research
+
+Just talk to me naturally — I'll understand! 🇳🇬✨"""
+        await send_text_chunks(chat_id, welcome_msg, reply_to=message_id)
         return True
     elif tl.startswith("/search "):
         query = user_text[8:].strip()
