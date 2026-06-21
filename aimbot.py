@@ -1,5 +1,6 @@
 """
-AIM Bot v9.6 — African Intelligence Model (DeepSeek V4 + Nebulae + Admin System + Empire ID)
+AIM Bot v9.7 — African Intelligence Model
+Added: /link command → Logto OAuth → Empire ID ↔ Telegram ID binding
 """
 import os
 import json
@@ -13,6 +14,9 @@ import requests
 import numpy as np
 import random
 import string
+import hashlib
+import base64
+import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from bs4 import BeautifulSoup
@@ -20,7 +24,7 @@ from sentence_transformers import SentenceTransformer
 from openai import AsyncOpenAI
 import nebulae
 from telegram import InputMediaPhoto, InputMediaAudio, InputMediaDocument
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from telegram import (
     Update, Bot, InlineQueryResultArticle, InputTextMessageContent
 )
@@ -34,16 +38,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("aimbot")
 
 # ─── CONFIG ───
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-USE_DEEPSEEK = os.environ.get("USE_DEEPSEEK", "false").lower() == "true"
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
-GNEWS_API_KEY = os.environ.get("GNEWS_API_KEY", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
+GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
+DEEPSEEK_API_KEY    = os.environ.get("DEEPSEEK_API_KEY", "")
+USE_DEEPSEEK        = os.environ.get("USE_DEEPSEEK", "false").lower() == "true"
+SUPABASE_URL        = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY        = os.environ.get("SUPABASE_KEY", "")
+WEBHOOK_URL         = os.environ.get("WEBHOOK_URL", "")          # e.g. https://aimbot.up.railway.app
+BRAVE_API_KEY       = os.environ.get("BRAVE_API_KEY", "")
+GNEWS_API_KEY       = os.environ.get("GNEWS_API_KEY", "")
+GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
+
+# ─── LOGTO CONFIG ───
+LOGTO_ENDPOINT      = os.environ.get("LOGTO_ENDPOINT", "")       # e.g. https://your-tenant.logto.app
+LOGTO_CLIENT_ID     = os.environ.get("LOGTO_CLIENT_ID", "")
+LOGTO_CLIENT_SECRET = os.environ.get("LOGTO_CLIENT_SECRET", "")
+# The URL Logto will redirect to after login — must be registered in your Logto app's redirect URIs
+LOGTO_REDIRECT_URI  = f"{WEBHOOK_URL}/auth/callback" if WEBHOOK_URL else ""
 
 TELEGRAM_MAX_CHARS = 4096
 WAT = timezone(timedelta(hours=1))
@@ -64,6 +75,90 @@ def is_duplicate_update(update_id: int) -> bool:
             for old_id in ids_to_remove:
                 _processed_update_ids.discard(old_id)
         return False
+
+# ─── IN-MEMORY OAUTH STATE STORE ───
+# Maps state_token → {"telegram_user_id": str, "chat_id": int, "created_at": float}
+# States expire after 10 minutes.
+_oauth_states: dict[str, dict] = {}
+_oauth_states_lock = threading.Lock()
+
+def _create_oauth_state(telegram_user_id: str, chat_id: int) -> str:
+    """Generate a cryptographically random state token and store context."""
+    state = secrets.token_urlsafe(32)
+    with _oauth_states_lock:
+        # Purge stale states (older than 10 min) to avoid memory growth
+        now = time.time()
+        stale = [k for k, v in _oauth_states.items() if now - v["created_at"] > 600]
+        for k in stale:
+            del _oauth_states[k]
+        _oauth_states[state] = {
+            "telegram_user_id": telegram_user_id,
+            "chat_id": chat_id,
+            "created_at": now,
+        }
+    return state
+
+def _consume_oauth_state(state: str) -> Optional[dict]:
+    """Retrieve and delete a state token. Returns None if missing or expired."""
+    with _oauth_states_lock:
+        ctx = _oauth_states.pop(state, None)
+    if ctx is None:
+        return None
+    if time.time() - ctx["created_at"] > 600:
+        return None
+    return ctx
+
+def build_logto_auth_url(state: str) -> str:
+    """Build the Logto OIDC authorization URL."""
+    from urllib.parse import urlencode
+    params = {
+        "client_id":     LOGTO_CLIENT_ID,
+        "redirect_uri":  LOGTO_REDIRECT_URI,
+        "response_type": "code",
+        "scope":         "openid profile email",
+        "state":         state,
+        # 'prompt': 'login'  # uncomment to force re-login every time
+    }
+    return f"{LOGTO_ENDPOINT.rstrip('/')}/oidc/auth?{urlencode(params)}"
+
+def exchange_logto_code(code: str) -> Optional[dict]:
+    """
+    Exchange an authorization code for tokens.
+    Returns the ID token claims dict, or None on failure.
+    """
+    try:
+        token_url = f"{LOGTO_ENDPOINT.rstrip('/')}/oidc/token"
+        resp = requests.post(
+            token_url,
+            data={
+                "grant_type":    "authorization_code",
+                "code":          code,
+                "redirect_uri":  LOGTO_REDIRECT_URI,
+                "client_id":     LOGTO_CLIENT_ID,
+                "client_secret": LOGTO_CLIENT_SECRET,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        tokens = resp.json()
+
+        # Decode the ID token payload (we trust Logto — skip full sig verification for now)
+        id_token = tokens.get("id_token", "")
+        if not id_token:
+            logger.error("Logto token exchange: no id_token in response")
+            return None
+
+        # JWT payload is the middle segment
+        payload_b64 = id_token.split(".")[1]
+        # Fix base64 padding
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return claims
+
+    except Exception as e:
+        logger.error("Logto token exchange error: %s", e)
+        return None
 
 # ─── INIT CLIENTS ───
 app = Flask(__name__)
@@ -94,6 +189,8 @@ groq_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/o
 if GROQ_API_KEY: logger.info("✅ Groq API (Voice STT enabled)")
 if BRAVE_API_KEY: logger.info("✅ Brave Search API")
 if GNEWS_API_KEY: logger.info("✅ GNews API")
+if LOGTO_ENDPOINT and LOGTO_CLIENT_ID: logger.info("✅ Logto OAuth configured → %s", LOGTO_REDIRECT_URI)
+else: logger.warning("⚠️ Logto not configured — /link will not work")
 
 # ═══════════════════════════════════════════════════════════
 # ADMIN SYSTEM & CACHING
@@ -906,10 +1003,56 @@ I'm your personal AI assistant built for Africans, by Africans. Here's what I ca
 /search [query] — Quick search
 /deep [query] — Deep research
 /claim — Get your Empire ID
+/link — Connect to Empire AI Web App
 
 Just talk to me naturally — I'll understand! 🇳🇬✨"""
         await send_text_chunks(chat_id, welcome_msg, reply_to=message_id)
         return True
+
+    # ── /link — Connect Telegram account to Empire AI web via Logto ──
+    elif tl.startswith("/link"):
+        if not LOGTO_ENDPOINT or not LOGTO_CLIENT_ID:
+            await send_text_chunks(
+                chat_id,
+                "⚠️ Web login is not configured yet. Check back soon!",
+                reply_to=message_id,
+            )
+            return True
+
+        # Check if already linked
+        profile = await get_user_profile_data(user_id)
+        existing_logto_id = profile.get("logto_id")
+        if existing_logto_id:
+            empire_id = profile.get("empire_id", "N/A")
+            await send_text_chunks(
+                chat_id,
+                (
+                    f"✅ <b>Your account is already linked!</b>\n\n"
+                    f"🆔 Empire ID: <b>{empire_id}</b>\n"
+                    f"🔗 Logto ID: <code>{existing_logto_id}</code>\n\n"
+                    f"When the web app launches, sign in with your Empire ID and all your memories will be there. 🌍"
+                ),
+                reply_to=message_id,
+            )
+            return True
+
+        # Build the Logto auth URL with a secure state token
+        state = _create_oauth_state(user_id, chat_id)
+        auth_url = build_logto_auth_url(state)
+
+        await send_text_chunks(
+            chat_id,
+            (
+                "🔗 <b>Link your Telegram to Empire AI Web</b>\n\n"
+                "Tap the button below to sign in or create your Empire AI account. "
+                "Once done, your Telegram memory will be available on the web app when it launches.\n\n"
+                f'<a href="{auth_url}">👉 Sign in / Create Account</a>\n\n'
+                "⏳ This link expires in <b>10 minutes</b>."
+            ),
+            reply_to=message_id,
+        )
+        return True
+
     elif tl.startswith("/search "):
         query = user_text[8:].strip()
         if not query: return True
@@ -1012,34 +1155,34 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
         await send_text_chunks(chat_id, await create_task_in_db(user_id, task_data), reply_to=message_id)
         return True
     elif tl == "/claim":
-        # 1. Check if they already have an Empire ID
         profile = await get_user_profile_data(user_id)
         existing_id = profile.get("empire_id")
-
         if existing_id:
             await send_text_chunks(
-                chat_id, 
-                f"👑 You already have an Empire ID: <b>{existing_id}</b>\n\nKeep this safe! You will use it to log into the Web App when it launches.", 
-                reply_to=message_id
+                chat_id,
+                f"👑 You already have an Empire ID: <b>{existing_id}</b>\n\nKeep this safe! You will use it to log into the Web App when it launches.",
+                reply_to=message_id,
             )
         else:
-            # 2. Generate a unique Empire ID
             new_id = generate_empire_id()
-
-            # 3. Save it to Supabase
             try:
                 supabase.table("user_profiles").update({"empire_id": new_id}).eq("user_id", str(user_id)).execute()
-                
                 await send_text_chunks(
-                    chat_id, 
-                    f"🎉 <b>Congratulations!</b>\n\nYour Empire ID has been created: <b>{new_id}</b>\n\n⚠️ <b>SAVE THIS ID.</b> When the Empire AI Web App launches, you will use this ID to log in and sync all your memories, tasks, and preferences from Telegram.", 
-                    reply_to=message_id
+                    chat_id,
+                    (
+                        f"🎉 <b>Congratulations!</b>\n\n"
+                        f"Your Empire ID has been created: <b>{new_id}</b>\n\n"
+                        f"⚠️ <b>SAVE THIS ID.</b> When the Empire AI Web App launches, you will use this ID "
+                        f"to log in and sync all your memories, tasks, and preferences from Telegram.\n\n"
+                        f"💡 Tip: Type /link to connect your account to the web app now!"
+                    ),
+                    reply_to=message_id,
                 )
             except Exception as e:
                 logger.error(f"Failed to save Empire ID: {e}")
                 await send_text_chunks(chat_id, "❌ Failed to generate Empire ID. Please try again.", reply_to=message_id)
         return True
-    
+
     # ── ADMIN COMMANDS ──
     elif tl.startswith("/admin"):
         if not is_admin(user_id):
@@ -1052,7 +1195,17 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
                 users = supabase.table("user_profiles").select("id", count="exact").execute()
                 tasks = supabase.table("user_tasks").select("id", count="exact").execute()
                 chats = supabase.table("chat_memory").select("id", count="exact").execute()
-                stats_msg = f"📊 <b>Empire AI Stats:</b>\n\n👥 Total Users: {users.count}\n📋 Active Tasks: {tasks.count}\n💬 Total Messages: {chats.count}\n🤖 AI Model: {'DeepSeek V4' if USE_DEEPSEEK else 'Gemini'}\n👑 Admins: {len(ADMIN_IDS)}"
+                # Count linked accounts (those with a logto_id)
+                linked = supabase.table("user_profiles").select("id", count="exact").not_.is_("logto_id", "null").execute()
+                stats_msg = (
+                    f"📊 <b>Empire AI Stats:</b>\n\n"
+                    f"👥 Total Users: {users.count}\n"
+                    f"🔗 Linked (web): {linked.count}\n"
+                    f"📋 Active Tasks: {tasks.count}\n"
+                    f"💬 Total Messages: {chats.count}\n"
+                    f"🤖 AI Model: {'DeepSeek V4' if USE_DEEPSEEK else 'Gemini'}\n"
+                    f"👑 Admins: {len(ADMIN_IDS)}"
+                )
                 await send_text_chunks(chat_id, stats_msg, reply_to=message_id)
             except Exception as e:
                 await send_text_chunks(chat_id, f"❌ Error: {e}", reply_to=message_id)
@@ -1370,7 +1523,7 @@ async def handle_message_async(update: Update):
 # ═══════════════════════════════════════════════════════════
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "AIM Bot is live!", "version": "v9.6", "ai": "DeepSeek V4" if USE_DEEPSEEK else "Gemini"})
+    return jsonify({"status": "AIM Bot is live!", "version": "v9.7", "ai": "DeepSeek V4" if USE_DEEPSEEK else "Gemini"})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -1385,6 +1538,166 @@ def webhook():
     except Exception as e:
         logger.error("Webhook error: %s", e)
         return "Error", 500
+
+# ─────────────────────────────────────────────────────────
+# /auth/callback  — Logto redirects here after login
+# Flow:
+#   1. Validate state token (prevents CSRF)
+#   2. Exchange authorization code for tokens
+#   3. Extract user's Logto sub (unique user ID)
+#   4. Upsert user_profiles: set logto_id = logto_sub
+#   5. If no empire_id yet, auto-generate one
+#   6. Send a Telegram message to the user confirming success
+#   7. Show a simple HTML success/error page
+# ─────────────────────────────────────────────────────────
+@app.route("/auth/callback", methods=["GET"])
+def auth_callback():
+    code  = request.args.get("code")
+    state = request.args.get("state")
+    error = request.args.get("error")
+
+    # ── OAuth error from Logto ──
+    if error:
+        logger.warning("Logto OAuth error: %s — %s", error, request.args.get("error_description"))
+        return _html_page(
+            "❌ Login Failed",
+            f"<p>Logto returned an error: <b>{error}</b></p>"
+            "<p>Please go back to Telegram and try <b>/link</b> again.</p>",
+            success=False,
+        ), 400
+
+    # ── Validate state ──
+    if not state or not code:
+        return _html_page("❌ Bad Request", "<p>Missing state or code.</p>", success=False), 400
+
+    ctx = _consume_oauth_state(state)
+    if ctx is None:
+        return _html_page(
+            "⏰ Link Expired",
+            "<p>This login link has expired or already been used.</p>"
+            "<p>Go back to Telegram and type <b>/link</b> to get a fresh one.</p>",
+            success=False,
+        ), 400
+
+    telegram_user_id = ctx["telegram_user_id"]
+    chat_id          = ctx["chat_id"]
+
+    # ── Exchange code for tokens ──
+    claims = exchange_logto_code(code)
+    if not claims:
+        run_async(bot.send_message(
+            chat_id=chat_id,
+            text="❌ Something went wrong during login. Please try /link again.",
+        ))
+        return _html_page("❌ Token Error", "<p>Could not verify your login. Please try again.</p>", success=False), 500
+
+    logto_sub   = claims.get("sub", "")          # Logto's unique user ID
+    logto_email = claims.get("email", "")
+    logto_name  = claims.get("name", "") or claims.get("username", "")
+
+    if not logto_sub:
+        return _html_page("❌ No User ID", "<p>Logto did not return a user ID.</p>", success=False), 500
+
+    # ── Upsert Supabase profile ──
+    try:
+        existing = supabase.table("user_profiles").select("*").eq("user_id", telegram_user_id).execute()
+
+        if existing.data:
+            profile = existing.data[0]
+            empire_id = profile.get("empire_id") or generate_empire_id()
+            supabase.table("user_profiles").update({
+                "logto_id":    logto_sub,
+                "logto_email": logto_email,
+                "logto_name":  logto_name,
+                "empire_id":   empire_id,
+                "last_active": datetime.now(timezone.utc).isoformat(),
+            }).eq("user_id", telegram_user_id).execute()
+        else:
+            # First-time user — create full profile
+            empire_id = generate_empire_id()
+            supabase.table("user_profiles").insert({
+                "user_id":     telegram_user_id,
+                "username":    logto_name or "",
+                "logto_id":    logto_sub,
+                "logto_email": logto_email,
+                "logto_name":  logto_name,
+                "empire_id":   empire_id,
+                "topic_counts": {},
+                "total_chats": 0,
+                "last_active": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+
+        logger.info("✅ Linked Telegram %s → Logto %s (Empire ID: %s)", telegram_user_id, logto_sub, empire_id)
+
+    except Exception as e:
+        logger.error("Supabase link error: %s", e)
+        run_async(bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ Login verified but we couldn't save your link. Please try /link again.",
+        ))
+        return _html_page("❌ Database Error", "<p>We couldn't save your account link. Please try again.</p>", success=False), 500
+
+    # ── Notify user in Telegram ──
+    display = logto_name or logto_email or "there"
+    run_async(bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🎉 <b>Account linked successfully, {display}!</b>\n\n"
+            f"🆔 Empire ID: <b>{empire_id}</b>\n"
+            f"📧 Email: {logto_email or 'N/A'}\n\n"
+            f"✅ Your Telegram memory is now connected to the Empire AI web app.\n"
+            f"When the web app launches, sign in with your Empire ID and AIM will remember everything. 🌍🇳🇬"
+        ),
+        parse_mode=ParseMode.HTML,
+    ))
+
+    return _html_page(
+        "✅ Account Linked!",
+        f"<p>Welcome, <b>{display}</b>! 🎉</p>"
+        f"<p>Your Empire ID is: <b>{empire_id}</b></p>"
+        f"<p>You can close this tab and return to Telegram.</p>",
+        success=True,
+    ), 200
+
+
+def _html_page(title: str, body: str, success: bool = True) -> str:
+    """Return a minimal branded HTML page for the OAuth callback result."""
+    color = "#22c55e" if success else "#ef4444"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Empire AI — {title}</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f0f0f; color: #f0f0f0;
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+    }}
+    .card {{
+      background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 16px;
+      padding: 40px 32px; max-width: 420px; width: 100%; text-align: center;
+    }}
+    .icon {{ font-size: 48px; margin-bottom: 16px; }}
+    h1 {{ font-size: 22px; font-weight: 700; color: {color}; margin-bottom: 16px; }}
+    p {{ font-size: 15px; color: #aaa; line-height: 1.6; margin-bottom: 10px; }}
+    b {{ color: #f0f0f0; }}
+    .brand {{ margin-top: 32px; font-size: 13px; color: #555; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">{'🌍' if success else '⚠️'}</div>
+    <h1>{title}</h1>
+    {body}
+    <div class="brand">Empire AI · African Intelligence Model</div>
+  </div>
+</body>
+</html>"""
+
 
 @app.route("/debug/tasks/<user_id>", methods=["GET"])
 def debug_tasks(user_id: str):
