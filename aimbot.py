@@ -32,7 +32,11 @@ from telegram.constants import ParseMode
 from supabase import create_client, Client
 from google import genai
 from google.genai import types
-
+from core import BASE_SYSTEM_PROMPT, build_enhanced_prompt
+from capabilities import is_search_query, SEARCH_TRIGGER_PHRASES, trigger_embeddings, semantic_model
+from admin import load_admins, is_admin, handle_admin_command, ADMIN_IDS
+from core import BASE_SYSTEM_PROMPT, build_enhanced_prompt, WAT
+from capabilities import is_search_query, SEARCH_TRIGGER_PHRASES, trigger_embeddings, semantic_model
 # ─── LOGGING ───
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("aimbot")
@@ -195,29 +199,8 @@ else: logger.warning("⚠️ Logto not configured — /link will not work")
 # ═══════════════════════════════════════════════════════════
 # ADMIN SYSTEM & CACHING
 # ═══════════════════════════════════════════════════════════
-ADMIN_IDS = set()
-
-def load_admins():
-    global ADMIN_IDS
-    if not supabase:
-        logger.warning("⚠️ Supabase not connected, cannot load admins.")
-        return
-    try:
-        res = supabase.table("admins").select("telegram_id").execute()
-        if res.data:
-            for row in res.data:
-                if row.get("telegram_id"):
-                    ADMIN_IDS.add(str(row["telegram_id"]))
-            logger.info(f"👑 Loaded {len(ADMIN_IDS)} Admins into memory: {ADMIN_IDS}")
-        else:
-            logger.info("ℹ️ No admins found in database.")
-    except Exception as e:
-        logger.error(f"❌ Failed to load admins: {e}")
-
-load_admins()
-
-def is_admin(user_id: str) -> bool:
-    return str(user_id) in ADMIN_IDS
+elif tl.startswith("/admin"):
+    return await handle_admin_command(user_id, chat.id, message_id, user_text, supabase, get_ai_response, send_text_chunks, USE_DEEPSEEK, ADMIN_IDS, load_admins)
 
 # ═══════════════════════════════════════════════════════════
 # EMPIRE ID SYSTEM
@@ -282,43 +265,6 @@ async def transcribe_voice(file_id: str) -> Optional[str]:
             os.remove(temp_path)
 
 # ═══════════════════════════════════════════════════════════
-# SEMANTIC ROUTER
-# ═══════════════════════════════════════════════════════════
-logger.info("🧠 Loading semantic router model...")
-semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-
-SEARCH_TRIGGER_PHRASES = [
-    "who won the match", "what is the score", "latest news about", "current events",
-    "what happened today", "search for information", "look up", "find out about",
-    "who knocked out", "eliminated from", "when did they win", "what is the price",
-    "exchange rate", "weather forecast", "stock price", "bitcoin price",
-    "currency conversion", "flight status", "traffic update", "road conditions",
-    "event schedule", "concert tickets", "movie release date", "album release",
-    "who is the president", "who is the governor", "latest update on",
-    "recent developments", "breaking news", "current situation", "what is happening now",
-    "live update", "real-time information", "who won the election", "match result",
-    "game outcome", "tournament winner", "championship result", "final score",
-    "standings table", "league table", "fixture list", "upcoming matches",
-    "next game", "who is playing", "schedule for", "when is the match",
-    "kickoff time", "venue information", "ticket prices", "how to watch",
-    "broadcast information", "streaming options", "what did this celebrity do",
-    "Politics", "Sports", "Entertainment",
-    "formula 1 result", "f1 race winner", "grand prix results",
-    "nba score", "basketball result", "tennis result", "wimbledon winner",
-    "boxing match result", "ufc fight night", "mma result",
-    "rugby result", "cricket score", "ipl result", "who won the super bowl",
-    "who stopped them from qualifying", "who stopped nigeria", "who knocked nigeria out",
-    "why did nigeria not qualify", "who beat nigeria", "did nigeria qualify",
-    "nigeria world cup", "super eagles result", "super eagles match", "afcon result",
-    "african cup of nations", "world cup qualification africa",
-    "who invented", "what caused", "why did", "how did", "when did", "what year did",
-    "tell me about", "give me information on", "what do you know about",
-    "news about", "update on", "facts about", "history of", "background on",
-    "what is going on with", "recent news", "what happened with", "explain what happened",
-    "naira exchange rate", "dollar to naira", "fuel price nigeria",
-    "nigerian government", "nigerian politics", "tinubu", "lagos news", "abuja news",
-    "nigeria economy", "nigeria inflation", "nigeria election", "nigeria insecurity",
-]
 
 logger.info("🔢 Computing trigger embeddings...")
 trigger_embeddings = semantic_model.encode(SEARCH_TRIGGER_PHRASES)
@@ -671,65 +617,6 @@ def fetch_url_content(url: str) -> str:
 def detect_urls(text: str) -> list:
     return re.findall(r'https?://\S+', text)
 
-def is_search_query_semantic(text: str, threshold: float = 0.45) -> bool:
-    try:
-        sims = np.dot(trigger_embeddings, semantic_model.encode([text]).T).flatten()
-        max_sim = float(np.max(sims))
-        best = SEARCH_TRIGGER_PHRASES[int(np.argmax(sims))]
-        result = max_sim >= threshold
-        logger.info("🔍 Semantic: '%.60s' → %.3f (best: '%s') → %s", text, max_sim, best, "SEARCH" if result else "skip")
-        return result
-    except Exception as e:
-        logger.error("Semantic routing error: %s", e)
-        return False
-
-def is_search_query(text: str) -> bool:
-    tl = text.lower().strip()
-    if any(t in tl for t in ["search for","google","look up","find out","search the web","browse","search"]): return True
-    return is_search_query_semantic(text)
-
-# ═══════════════════════════════════════════════════════════
-# PROMPTING
-# ═══════════════════════════════════════════════════════════
-BASE_SYSTEM_PROMPT = """You are AIM — African Intelligence Model. A professional, highly intelligent AI assistant built for Africans, by Africans.
-You are Built by Empire AI, a start up Nigerian company whose plan is to create an independent artificial intelligence for Africa while maintaining the best of standards.
-David Emmanuel is the CEO and founder of Empire AI.
-
-PERSONALITY & TONE:
-- Warm, respectful, and culturally aware.
-- Adapt to the user's vibe. Formal ↔ Casual. Match their energy.
-- Be helpful, patient, and empowering.
-
-LANGUAGE RULE (CRITICAL):
-- Respond in the EXACT language or dialect the user is using (Pidgin, Yoruba, Hausa, Igbo, English, etc.).
-- If the user mixes languages, you can mix too.
-- EXCEPTION: Never use rude or hateful language.
-
-RULES:
-- Keep responses concise but informative.
-- If you don't know something, use the SEARCH TRIGGER.
-- Never make up facts.
-- Use emojis naturally but not excessively.
-
-SELF-AWARENESS & IDENTITY:
-NAME MEANING: AIM = African Intelligence Model. Built for Africans, by Africans.
-YOUR CAPABILITIES: Conversational AI, Memory, Tasks & Reminders, Web Search, Sports, News, Voice STT, Vision (Nebulae), Image Gen (Nebulae), Audio Gen (Nebulae), PDF Gen (Nebulae), Time Tools, Deep Research, Inline Mode, Multi-language.
-YOUR SIBLING - NEBULAE: Nebulae is your younger sibling — the "Miracle Worker". Handles Vision, Image Gen, Audio, PDFs.
-FUTURE PLANS: Web App, Mobile App, Mini Apps, More Integrations.
-
-CONVERSATION CONTINUITY:
-- Read SESSION SUMMARY and RECENT HISTORY before responding.
-- Short follow-ups → continue previous topic. Pronouns → resolve from previous message.
-- DO NOT start every message with "Hello there! It's [date/time]".
-
-SPECIAL INSTRUCTIONS:
-1. TIMERS/STOPWATCHES: Append machine code at END: [TIMER:Xs] [TIMER:Xm] [TIMER:Xh] [STOPWATCH:START] [STOPWATCH:STOP]
-2. SEARCH TRIGGER: SEARCH_TRIGGER: <your search query>
-3. WEB CONTEXT PROVIDED: Synthesize results. Do NOT output SEARCH_TRIGGER again.
-4. GENERAL KNOWLEDGE: Answer directly if confident.
-5. NEBULAE: If asked for image: [NEBULAE_IMAGE: <prompt>]. If asked for audio: [NEBULAE_AUDIO: <text>]. If asked for PDF: [NEBULAE_PDF:Title|Content].
-6. Admin/Dev Mode: If the user is an Admin, you are in "Dev Mode". Discuss architecture, code, server stats openly. Treat them as part of Empire AI.
-"""
 
 async def get_user_profile_data(user_id: str) -> dict:
     if not supabase: return {}
@@ -778,11 +665,7 @@ async def update_session_summary(user_id: str, recent_messages: list, current_su
 def _fmt_wat(dt: datetime) -> str:
     return dt.astimezone(WAT).strftime("%a %b %d, %Y · %I:%M %p WAT")
 
-def _gap_instruction(seconds: float) -> str:
-    if seconds < 1800: return "NO_GAP_ACK"
-    elif seconds < 10800: return "LIGHT_ACK"
-    elif seconds < 86400: return "GAP_ACK"
-    else: return "LONG_GAP_ACK"
+
 
 async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, str, float]:
     if not supabase: return "", "", 0.0
@@ -827,37 +710,7 @@ async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, 
         logger.error("Context retrieval error: %s", e)
         return "", "", 0.0
 
-def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, session_summary: str = "", recent_history: str = "", older_context: str = "", web_context: str = "", tool_status: str = "", gap_seconds: float = 0.0) -> str:
-    now_wat = datetime.now(WAT)
-    parts = [BASE_SYSTEM_PROMPT]
-    pref_language = profile.get("preferred_language", "english")
-    topic_counts = profile.get("topic_counts", {})
-    total_chats = profile.get("total_chats", 0)
-    pref_lines = ["\n--- USER PREFERENCES ---", f"  User ID: {user_id}  |  Language: {pref_language}  |  Total chats: {total_chats}"]
-    if topic_counts:
-        top = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        pref_lines.append(f"  Interests: {', '.join(f'{k}({v})' for k,v in top)}")
-    pref_lines.append("--- END PREFERENCES ---\n")
-    parts.append("\n".join(pref_lines))
-    if is_admin(user_id):
-        parts.append("\n👑 <b>ADMIN MODE ACTIVE:</b> User is a Super Admin. Unlock Dev Mode.\n")
-    else:
-        parts.append("\n🔒 <b>STANDARD USER:</b> Treat as a regular user.\n")
-    parts.append(f"\n┌──────────────────────────────────────────┐\n│  TIME & CONTEXT                          │\n└──────────────────────────────────────────┘\n  Current time (WAT)  : {now_wat.strftime('%A, %B %d, %Y · %I:%M %p')}\n  User's last message : {_gap_label(gap_seconds)}\n  Greeting guidance   : {_gap_instruction(gap_seconds)}\n─────────────────────────────────────────────\n")
-    if session_summary: parts.append(f"\n╔══════════════════════════════════════╗\n║       SESSION SUMMARY                ║\n╚══════════════════════════════════════╝\n{session_summary}\n════════════════════════════════════════\n")
-    if recent_history: parts.append(f"\n╔══════════════════════════════════════════════╗\n║  CONVERSATION HISTORY — LAST 5 MESSAGES    ║\n╚══════════════════════════════════════════════╝\n\n{recent_history}\n\n══════════════════════════════════════════════\n")
-    if web_context: parts.append(f"\n--- WEB SEARCH RESULTS ---\n{web_context}\n--- END WEB RESULTS ---\n")
-    if older_context: parts.append(f"\n--- OLDER MEMORY (background) ---\n{older_context}\n--- END OLDER MEMORY ---\n")
-    if tool_status: parts.append(f"\n--- TOOL STATUS ---\n{tool_status}\n---\n")
-    parts.append(f"\nUSER MESSAGE: {user_text}")
-    return "\n".join(parts)
 
-def _gap_label(seconds: float) -> str:
-    if seconds < 60: return "just now"
-    elif seconds < 3600: return f"{int(seconds/60)} min ago"
-    elif seconds < 86400: return f"{int(seconds/3600)} hr ago"
-    elif seconds < 604800: return f"{int(seconds/86400)} day(s) ago"
-    else: return f"{int(seconds/604800)} week(s) ago"
 
 async def get_ai_response(user_text: str, user_id: str, chat_type: str, profile: dict = None, session_summary: str = "", recent_history: str = "", older_context: str = "", web_context: str = "", tool_status: str = "", gap_seconds: float = 0.0) -> Optional[str]:
     try:
