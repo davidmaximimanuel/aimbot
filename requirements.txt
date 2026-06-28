@@ -12,3 +12,9 @@ google-genai
 edge-tts
 reportlab
 authlib
+PyPDF2>=3.0.0
+python-docx>=0.8.11
+openpyxl>=3.1.0
+python-pptx>=0.6.21
+opencv-python>=4.8.0
+moviepy>=1.0.3
