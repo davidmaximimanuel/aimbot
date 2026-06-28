@@ -200,8 +200,72 @@ else: logger.warning("⚠️ Logto not configured — /link will not work")
 # ADMIN SYSTEM & CACHING
 # ═══════════════════════════════════════════════════════════
 elif tl.startswith("/admin"):
-    return await handle_admin_command(user_id, chat.id, message_id, user_text, supabase, get_ai_response, send_text_chunks, USE_DEEPSEEK, ADMIN_IDS, load_admins)
-
+    if not is_admin(user_id):
+        await send_text_chunks(chat_id, "❌ Access Denied.", reply_to=message_id)
+        return True
+    
+    parts = tl.split()
+    action = parts[1] if len(parts) > 1 else "help"
+    
+    if action == "stats":
+        try:
+            users = supabase.table("user_profiles").select("id", count="exact").execute()
+            tasks = supabase.table("user_tasks").select("id", count="exact").execute()
+            chats = supabase.table("chat_memory").select("id", count="exact").execute()
+            linked = supabase.table("user_profiles").select("id", count="exact").not_.is_("logto_id", "null").execute()
+            stats_msg = (
+                f"📊 <b>Empire AI Stats:</b>\n\n"
+                f"👥 Total Users: {users.count}\n"
+                f"🔗 Linked (web): {linked.count}\n"
+                f"📋 Active Tasks: {tasks.count}\n"
+                f"💬 Total Messages: {chats.count}\n"
+                f"🤖 AI Model: {'DeepSeek V4' if USE_DEEPSEEK else 'Gemini'}\n"
+                f"👑 Admins: {len(ADMIN_IDS)}"
+            )
+            await send_text_chunks(chat_id, stats_msg, reply_to=message_id)
+        except Exception as e:
+            await send_text_chunks(chat_id, f"❌ Error: {e}", reply_to=message_id)
+    
+    elif action == "list":
+        admins_list = "\n".join([f"👑 {aid}" for aid in ADMIN_IDS])
+        await send_text_chunks(chat_id, f"<b>Current Admins:</b>\n{admins_list}", reply_to=message_id)
+    
+    elif action == "reload":
+        load_admins()
+        await send_text_chunks(chat_id, "🔄 Admin list reloaded.", reply_to=message_id)
+    
+    elif action == "server":
+        metrics = get_server_metrics()
+        await send_text_chunks(chat_id, metrics, reply_to=message_id)
+    
+    elif action.startswith("read "):  # ← FIXED: ONE SPACE
+        filename = user_text.split(" ", 2)[2] if len(user_text.split(" ", 2)) > 2 else "aimbot.py"  # ← FIXED: ONE SPACE
+        code_content = read_file_safely(filename)
+        formatted_code = f"📄 <b>File: {filename}</b>\n\n```python\n{code_content[:3000]}\n```"
+        await send_text_chunks(chat_id, formatted_code, reply_to=message_id)
+    
+    elif action.startswith("analyze "):  # ← FIXED: ONE SPACE
+        filename = user_text.split(" ", 2)[2] if len(user_text.split(" ", 2)) > 2 else "aimbot.py"  # ← FIXED: ONE SPACE
+        code_content = read_file_safely(filename)
+        
+        if code_content.startswith("❌"):
+            await send_text_chunks(chat_id, code_content, reply_to=message_id)
+            return True
+        
+        await send_text_chunks(chat_id, f"🔍 Analyzing <b>{filename}</b>...", reply_to=message_id)
+        analysis_prompt = f"You are in Dev Mode. Analyze this Python code for our AIM bot. Identify bugs, suggest 3 improvements, and explain how it fits into Empire AI.\n\nCODE:\n{code_content[:12000]}"
+        analysis = await get_ai_response(analysis_prompt, user_id, "private")
+        
+        if analysis:
+            await send_text_chunks(chat_id, f"📊 <b>Analysis of {filename}:</b>\n\n{analysis}", reply_to=message_id)
+        else:
+            await send_text_chunks(chat_id, "❌ Analysis failed.", reply_to=message_id)
+    
+    else:
+        help_msg = "<b>👑 Admin Commands:</b>\n\n/admin stats\n/admin server\n/admin list\n/admin reload\n/admin read [file]\n/admin analyze [file]"
+        await send_text_chunks(chat_id, help_msg, reply_to=message_id)
+    
+    return True
 # ═══════════════════════════════════════════════════════════
 # EMPIRE ID SYSTEM
 # ═══════════════════════════════════════════════════════════
