@@ -61,6 +61,10 @@ LOGTO_CLIENT_ID     = os.environ.get("LOGTO_CLIENT_ID", "")
 LOGTO_CLIENT_SECRET = os.environ.get("LOGTO_CLIENT_SECRET", "")
 LOGTO_REDIRECT_URI  = f"{WEBHOOK_URL}/auth/callback" if WEBHOOK_URL else ""
 
+# ─── EMPIRE SUPABASE (separate identity project) ───
+EMPIRE_SUPABASE_URL = os.environ.get("EMPIRE_SUPABASE_URL", "")
+EMPIRE_SUPABASE_KEY = os.environ.get("EMPIRE_SUPABASE_KEY", "")
+
 TELEGRAM_MAX_CHARS = 4096
 
 # ─── DUPLICATE PREVENTION ───
@@ -186,6 +190,17 @@ if LOGTO_ENDPOINT and LOGTO_CLIENT_ID:
     logger.info("✅ Logto OAuth configured → %s", LOGTO_REDIRECT_URI)
 else:
     logger.warning("⚠️ Logto not configured — /link will not work")
+
+# ─── EMPIRE SUPABASE CLIENT ───
+empire_supabase: Optional[Client] = None
+if EMPIRE_SUPABASE_URL and EMPIRE_SUPABASE_KEY:
+    try:
+        empire_supabase = create_client(EMPIRE_SUPABASE_URL, EMPIRE_SUPABASE_KEY)
+        logger.info("✅ Empire Supabase connected")
+    except Exception as e:
+        logger.error("❌ Empire Supabase connection failed: %s", e)
+else:
+    logger.warning("⚠️ Empire Supabase not configured — dual-write will be skipped")
 
 # Load admins at startup
 load_admins(supabase)
@@ -800,6 +815,66 @@ async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = No
         except Exception as e2: logger.error("Fallback send failed: %s", e2)
 
 # ═══════════════════════════════════════════════════════════
+# EMPIRE ID / LINK HELPERS
+# ═══════════════════════════════════════════════════════════
+
+# Casual phrases that signal the user wants to create/link an Empire ID
+_EMPIRE_INTENT_PHRASES = [
+    "empire id", "create my id", "get my id", "empire account",
+    "link my account", "link telegram", "connect my account",
+    "create account", "sign up", "make an account", "web app account",
+    "link to web", "connect to web", "i want an account", "how do i sign up",
+    "register", "web version", "use on web", "access on web",
+]
+
+def _is_empire_intent(text: str) -> bool:
+    tl = text.lower()
+    return any(phrase in tl for phrase in _EMPIRE_INTENT_PHRASES)
+
+async def _handle_link_command(user_id: str, chat_id: int, message_id: int):
+    """Core logic for /link and /account — also called from casual intent detection."""
+    if not LOGTO_ENDPOINT or not LOGTO_CLIENT_ID:
+        await send_text_chunks(
+            chat_id,
+            "⚠️ Web login isn't set up yet — check back soon!",
+            reply_to=message_id,
+        )
+        return
+
+    profile = await get_user_profile_data(user_id)
+    existing_logto_id = profile.get("logto_id")
+
+    if existing_logto_id:
+        empire_id = profile.get("empire_id", "N/A")
+        await send_text_chunks(
+            chat_id,
+            (
+                f"✅ <b>Your account is already linked!</b>\n\n"
+                f"🆔 Empire ID: <b>{empire_id}</b>\n"
+                f"📧 Email: {profile.get('logto_email') or 'N/A'}\n\n"
+                f"When the web app launches, sign in with your Empire ID and AIM will remember everything. 🌍🇳🇬"
+            ),
+            reply_to=message_id,
+        )
+        return
+
+    state    = _create_oauth_state(user_id, chat_id)
+    auth_url = build_logto_auth_url(state)
+
+    await send_text_chunks(
+        chat_id,
+        (
+            "🔗 <b>Link your Telegram to Empire AI</b>\n\n"
+            "Tap below to sign up or log in. Once done, your Telegram memory "
+            "will be available on the Empire AI web app when it launches.\n\n"
+            f'👉 <a href="{auth_url}">Create / Sign into your Empire Account</a>\n\n'
+            "⏳ Link expires in <b>10 minutes</b>."
+        ),
+        reply_to=message_id,
+    )
+
+
+# ═══════════════════════════════════════════════════════════
 # BOT COMMANDS
 # ═══════════════════════════════════════════════════════════
 async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_text: str) -> bool:
@@ -981,6 +1056,10 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
                 await send_text_chunks(chat_id, "❌ Failed to generate Empire ID. Please try again.", reply_to=message_id)
         return True
 
+    elif tl in ("/link", "/account"):
+        await _handle_link_command(user_id, chat_id, message_id)
+        return True
+
     # ── ADMIN COMMANDS — delegated entirely to admin.py ──────
     elif tl.startswith("/admin"):
         return await handle_admin_command(
@@ -1134,6 +1213,25 @@ async def handle_message_async(update: Update):
             await update_user_profile(user_id, username, "reminder")
         except Exception as e:
             logger.error("Failed to save task interaction: %s", e)
+        return
+
+    # ── Casual Empire ID / link intent ──────────────────────
+    if _is_empire_intent(user_text):
+        profile_check = await get_user_profile_data(user_id)
+        if not profile_check.get("logto_id"):
+            await send_text_chunks(
+                chat.id,
+                (
+                    "🌍 Sounds like you want to set up your <b>Empire AI account</b>!\n\n"
+                    "This links your Telegram to the Empire AI web app — so when it launches, "
+                    "AIM will remember everything you've told me here.\n\n"
+                    "Want me to send you the link to get started? Just say <b>yes</b> or tap /link anytime. 🇳🇬"
+                ),
+                reply_to=message_id,
+            )
+            return
+        # Already linked — show their info
+        await _handle_link_command(user_id, chat.id, message_id)
         return
 
     if chat_type in ("group", "supergroup"):
@@ -1331,6 +1429,21 @@ def auth_callback():
         logger.error("Supabase link error: %s", e)
         run_async(bot.send_message(chat_id=chat_id, text="⚠️ Login verified but we couldn't save your link. Please try /link again."))
         return _html_page("❌ Database Error", "<p>We couldn't save your account link. Please try again.</p>", success=False), 500
+
+    # ── Dual-write to Empire Supabase (identity store) ──────
+    if empire_supabase:
+        try:
+            empire_supabase.table("empire_users").upsert({
+                "logto_id":      logto_sub,
+                "telegram_id":   telegram_user_id,
+                "email":         logto_email,
+                "name":          logto_name,
+                "signup_method": "telegram_link",
+            }, on_conflict="logto_id").execute()
+            logger.info("✅ Empire Supabase updated for logto_id=%s", logto_sub)
+        except Exception as e:
+            # Non-fatal — AIM Supabase already has the link
+            logger.error("⚠️ Empire Supabase write failed (non-fatal): %s", e)
 
     display = logto_name or logto_email or "there"
     run_async(bot.send_message(
