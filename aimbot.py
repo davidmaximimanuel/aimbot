@@ -210,6 +210,20 @@ threading.Thread(target=_run_loop, daemon=True, name="async-loop").start()
 def run_async(coro):
     return asyncio.run_coroutine_threadsafe(coro, _loop)
 
+async def dynamic_status_updater(bot_instance, chat_id, message_id, phrases, stop_event):
+    """Edits a message with rotating phrases to show dynamic progress."""
+    idx = 0
+    try:
+        while not stop_event.is_set():
+            text = phrases[idx % len(phrases)]
+            try:
+                await bot_instance.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+            except Exception:
+                pass  # Ignore "message is not modified" errors
+            idx += 1
+            await asyncio.sleep(1.5)  # Change phrase every 1.5 seconds
+    except asyncio.CancelledError:
+        pass
 # ═══════════════════════════════════════════════════════════
 # VOICE TRANSCRIPTION
 # ═══════════════════════════════════════════════════════════
@@ -1101,6 +1115,98 @@ async def handle_message_async(update: Update):
         finally:
             if os.path.exists(temp_path): os.remove(temp_path)
 
+
+        # ── DOCUMENT HANDLER ──
+if update.message.document:
+    doc = update.message.document
+    doc_name = doc.file_name or "unknown_document"
+    doc_mime = doc.mime_type or "application/octet-stream"
+    temp_path = f"doc_{doc.file_id}_{doc_name}"
+    
+    # Send initial message and get its ID so we can edit it dynamically
+    msg = await bot.send_message(chat.id, "📄 Nebulae is opening the document...", reply_to_message_id=message_id)
+    status_msg_id = msg.message_id
+    
+    stop_event = asyncio.Event()
+    doc_phrases = [
+        "📄 Nebulae is opening the document...",
+        "📄 Nebulae is reading the pages...",
+        "📄 Nebulae is analyzing the text...",
+        "📄 Nebulae is almost done reading..."
+    ]
+    updater_task = asyncio.create_task(dynamic_status_updater(bot, chat.id, status_msg_id, doc_phrases, stop_event))
+    
+    try:
+        file = await bot.get_file(doc.file_id)
+        await file.download_to_drive(custom_path=temp_path)
+        with open(temp_path, "rb") as f:
+            doc_bytes = f.read()
+        
+        # Stop the dynamic updater before processing the actual result
+        stop_event.set()
+        await updater_task
+        
+        description = await nebulae.analyze_document(doc_bytes, doc_mime, doc_name, "Summarize and explain this document in detail.")
+        final_text = f"📝 <b>Document Analysis:</b>\n{description[:3000]}"
+        
+        # Edit the status message into the final result
+        try:
+            await bot.edit_message_text(chat_id=chat.id, message_id=status_msg_id, text=final_text, parse_mode=ParseMode.HTML)
+        except Exception:
+            await send_text_chunks(chat.id, final_text, reply_to=message_id)
+            
+        user_text = f"[User sent a document named {doc_name}. Nebulae's analysis: {description}]"
+    except Exception as e:
+        logger.error(f"Document error: {e}")
+        stop_event.set()
+        await send_text_chunks(chat.id, "📄 Couldn't process the document.", reply_to=status_msg_id)
+        return
+    finally:
+        if os.path.exists(temp_path): os.remove(temp_path)
+
+# ── VIDEO HANDLER ──
+if update.message.video or update.message.animation:
+    video_obj = update.message.video or update.message.animation
+    temp_path = f"video_{video_obj.file_id}.mp4"
+    
+    msg = await bot.send_message(chat.id, "🎬 Nebulae is loading the video...", reply_to_message_id=message_id)
+    status_msg_id = msg.message_id
+    
+    stop_event = asyncio.Event()
+    vid_phrases = [
+        "🎬 Nebulae is loading the video...",
+        "🎬 Nebulae is breaking it into frames...",
+        "🎬 Nebulae is watching frame 1...",
+        "🎬 Nebulae is analyzing the motion..."
+    ]
+    updater_task = asyncio.create_task(dynamic_status_updater(bot, chat.id, status_msg_id, vid_phrases, stop_event))
+    
+    try:
+        file = await bot.get_file(video_obj.file_id)
+        await file.download_to_drive(custom_path=temp_path)
+        with open(temp_path, "rb") as vid_file:
+            vid_bytes = vid_file.read()
+            
+        stop_event.set()
+        await updater_task
+        
+        description = await nebulae.analyze_video(vid_bytes, "Describe what is happening in this video in detail.")
+        final_text = f"🎥 <b>Video Analysis:</b>\n{description[:3000]}"
+        
+        try:
+            await bot.edit_message_text(chat_id=chat.id, message_id=status_msg_id, text=final_text, parse_mode=ParseMode.HTML)
+        except Exception:
+            await send_text_chunks(chat.id, final_text, reply_to=message_id)
+            
+        user_text = f"[User sent a video. Nebulae's analysis: {description}]"
+    except Exception as e:
+        logger.error(f"Video error: {e}")
+        stop_event.set()
+        await send_text_chunks(chat.id, "🎬 Couldn't process the video.", reply_to=status_msg_id)
+        return
+    finally:
+        if os.path.exists(temp_path): os.remove(temp_path)
+        
     if not user_text:
         await send_text_chunks(chat.id, "I can only read text, voice, and photo messages.")
         return

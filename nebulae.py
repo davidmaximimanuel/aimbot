@@ -117,6 +117,100 @@ def generate_pdf(title: str, content: str) -> bytes:
     c.save()
     return buffer.getvalue()
 
+import cv2
+import numpy as np
+
+════════════════════════════════════
+5. DOCUMENT READING (Native Gemini PDF + Text Fallback)
+════════════════════════════════════
+async def analyze_document(file_bytes: bytes, mime_type: str, filename: str, prompt: str = "Analyze this document and provide a detailed summary.") -> str:
+    """Analyzes a document (PDF, TXT, etc.) using Gemini."""
+    if not gemini_client:
+        return "❌ Nebulae's document reader is offline."
+    try:
+        # Gemini natively supports PDFs! We pass the raw bytes.
+        if mime_type == "application/pdf":
+            parts = [
+                types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"),
+                types.Part.from_text(text=prompt)
+            ]
+        else:
+            # For other files (like .txt, .csv), try to decode as text
+            try:
+                text_content = file_bytes.decode('utf-8')
+                text_content = text_content[:15000] # Truncate to avoid token limits
+                parts = [
+                    types.Part.from_text(text=f"Document content ({filename}):\n{text_content}\n\n{prompt}")
+                ]
+            except UnicodeDecodeError:
+                return "❌ I can currently read PDFs and text-based files (TXT, CSV). Please send a PDF or text file."
+
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash", 
+            contents=parts,
+            config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=2048)
+        )
+        return response.text
+    except Exception as e:
+        logger.error(f"Nebulae Document Error: {e}")
+        return "I couldn't read this document properly."
+
+════════════════════════════════════
+6. VIDEO ANALYSIS (Frame Extraction)
+════════════════════════════════════
+async def analyze_video(video_bytes: bytes, prompt: str = "Describe what is happening in this video in detail.") -> str:
+    """Analyzes a video by extracting keyframes and sending them to Gemini Vision."""
+    if not gemini_client:
+        return "❌ Nebulae's video analyzer is offline."
+    
+    temp_video_path = f"temp_video_{os.urandom(4).hex()}.mp4"
+    try:
+        # Save video bytes to a temp file so OpenCV can read it
+        with open(temp_video_path, "wb") as f:
+            f.write(video_bytes)
+            
+        cap = cv2.VideoCapture(temp_video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        if total_frames == 0:
+            cap.release()
+            return "❌ Could not read video frames."
+            
+        # Extract up to 6 evenly spaced frames to keep token usage low but accurate
+        num_frames = min(6, total_frames)
+        frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+        
+        image_parts = []
+        for i in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ret, frame = cap.read()
+            if ret:
+                # Convert BGR to RGB and compress to JPEG
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                _, buffer = cv2.imencode('.jpg', frame_rgb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                image_parts.append(types.Part.from_bytes(data=buffer.tobytes(), mime_type="image/jpeg"))
+        
+        cap.release()
+        
+        if not image_parts:
+            return "❌ No frames could be extracted from the video."
+            
+        # Add the text prompt at the end
+        image_parts.append(types.Part.from_text(text=prompt))
+        
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=image_parts,
+            config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=1024)
+        )
+        return response.text
+        
+    except Exception as e:
+        logger.error(f"Nebulae Video Error: {e}")
+        return "I couldn't analyze this video properly."
+    finally:
+        if os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
 
 # ════════════════════════════════════════
 # INTENT DETECTORS (For AIM to use)
