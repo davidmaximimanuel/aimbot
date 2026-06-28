@@ -2,6 +2,7 @@
 admin.py — Admin System & Controls
 """
 import os
+import re
 import time
 import logging
 from datetime import datetime, timezone
@@ -108,13 +109,18 @@ async def handle_admin_command(
         await send_text_chunks(chat_id, "❌ Access Denied.", reply_to=message_id)
         return True
 
-    # Parse: "/admin read aimbot.py" -> parts = ["/admin", "read", "aimbot.py"]
-    # We work on the ORIGINAL user_text (not lowercased) so filenames stay correct.
-    raw_parts  = user_text.strip().split(None, 2)   # max 3 pieces
-    tl_parts   = user_text.lower().strip().split(None, 2)
-    action     = tl_parts[1] if len(tl_parts) > 1 else "help"
-    # filename is the third word if present (preserves original casing)
+    # ── Parse the command ──────────────────────────────────
+    # Telegram sometimes sends "/admin@BotUsername read file.py"
+    # Strip the @BotUsername from the first word first.
+    clean_text = re.sub(r'^(/\w+)@\w+', r'\1', user_text.strip())
+
+    raw_parts  = clean_text.split(None, 2)   # max 3 pieces: ["/admin", "read", "file.py"]
+    tl_parts   = clean_text.lower().split(None, 2)
+    action     = tl_parts[1].strip() if len(tl_parts) > 1 else "help"
     filename   = raw_parts[2].strip() if len(raw_parts) > 2 else None
+
+    # ✅ Debug log — check your server logs if something still doesn't work
+    logger.info("🛠️ Admin cmd → clean=%r | action=%r | filename=%r", clean_text[:80], action, filename)
 
     # ── stats ──────────────────────────────────────────────
     if action == "stats":
