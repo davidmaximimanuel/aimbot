@@ -43,10 +43,13 @@ def read_file_safely(filepath: str) -> str:
     """
     base_dir = os.path.abspath(os.path.dirname(__file__))
     requested_path = os.path.abspath(os.path.join(base_dir, filepath))
+    # ✅ Bug 1 fix: log the resolved paths so you can debug hosting-platform
+    # issues where __file__ resolves to an unexpected directory.
+    logger.info("📂 read_file_safely → base=%s | target=%s", base_dir, requested_path)
     if not requested_path.startswith(base_dir):
         return "❌ Access Denied: Path traversal detected."
     if not os.path.exists(requested_path):
-        return f"❌ File not found: {filepath}"
+        return f"❌ File not found: {filepath}\n(looked in: {base_dir})"
     try:
         with open(requested_path, "r", encoding="utf-8") as f:
             return f.read()
@@ -88,7 +91,7 @@ async def handle_admin_command(
     message_id: int,
     user_text: str,
     supabase,
-    get_ai_response,
+    get_ai_response,   # kept for backward compat — no longer used internally
     send_text_chunks,
     USE_DEEPSEEK: bool,
 ) -> bool:
@@ -96,6 +99,10 @@ async def handle_admin_command(
     Handles all /admin subcommands.
     Called from handle_bot_command in aimbot.py after the /admin check.
     Returns True so handle_bot_command knows the message was handled.
+
+    NOTE: get_ai_response is intentionally no longer called here.
+    The analyze command now calls the AI client directly so it gets a clean
+    response without the user-chat prompt overhead (history, profile, etc.).
     """
     if not is_admin(user_id):
         await send_text_chunks(chat_id, "❌ Access Denied.", reply_to=message_id)
@@ -164,14 +171,17 @@ async def handle_admin_command(
         await send_text_chunks(chat_id, f"{header}\n\n<pre>{display}</pre>", reply_to=message_id)
 
     # ── analyze [file] ─────────────────────────────────────
-    # Same fix as read: action == "analyze", not action.startswith("analyze ")
     elif action == "analyze":
         target = filename or "aimbot.py"
+
+        # ── Step 1: read the file ──────────────────────────
         content = read_file_safely(target)
         if content.startswith("❌"):
             await send_text_chunks(chat_id, content, reply_to=message_id)
             return True
+
         await send_text_chunks(chat_id, f"🔍 Analyzing <b>{target}</b>...", reply_to=message_id)
+
         analysis_prompt = (
             f"You are AIM in Dev Mode. Analyze this Python code for the Empire AI bot.\n"
             f"1. Identify any bugs or problems.\n"
@@ -179,11 +189,48 @@ async def handle_admin_command(
             f"3. Briefly explain what this file does in the Empire AI architecture.\n\n"
             f"FILE: {target}\n\nCODE:\n{content[:12000]}"
         )
-        analysis = await get_ai_response(analysis_prompt, user_id, "private")
+
+        # ── Step 2: call AI directly (NOT via get_ai_response) ──
+        # get_ai_response is built for user chat — it loads conversation
+        # history, profiles, builds a heavy prompt, etc. For admin code
+        # analysis we just need a clean, direct API call.
+        analysis = None
+        try:
+            if USE_DEEPSEEK:
+                import os as _os
+                from openai import AsyncOpenAI as _AsyncOpenAI
+                _ds = _AsyncOpenAI(
+                    api_key=_os.environ.get("DEEPSEEK_API_KEY", ""),
+                    base_url="https://api.deepseek.com",
+                )
+                _r = await _ds.chat.completions.create(
+                    model="deepseek-v4-flash",
+                    messages=[{"role": "user", "content": analysis_prompt}],
+                    temperature=0.4,
+                    max_tokens=1500,
+                )
+                analysis = _r.choices[0].message.content if _r.choices else None
+            else:
+                import os as _os
+                from google import genai as _genai
+                from google.genai import types as _types
+                _gc = _genai.Client(api_key=_os.environ.get("GEMINI_API_KEY", ""))
+                _r  = _gc.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=[_types.Content(role="user", parts=[_types.Part(text=analysis_prompt)])],
+                    config=_types.GenerateContentConfig(temperature=0.4, max_output_tokens=1500),
+                )
+                analysis = _r.text if _r and _r.text else None
+        except Exception as _e:
+            # ✅ Bug 3 fix: show the REAL error instead of a generic message
+            logger.error("❌ Admin analyze error: %s", _e)
+            await send_text_chunks(chat_id, f"❌ AI call failed: <code>{_e}</code>", reply_to=message_id)
+            return True
+
         if analysis:
             await send_text_chunks(chat_id, f"📊 <b>Analysis: {target}</b>\n\n{analysis}", reply_to=message_id)
         else:
-            await send_text_chunks(chat_id, "❌ Analysis failed. Try again.", reply_to=message_id)
+            await send_text_chunks(chat_id, "❌ AI returned an empty response. Check your API key env vars.", reply_to=message_id)
 
     # ── help / unknown ─────────────────────────────────────
     else:
