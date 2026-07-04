@@ -844,40 +844,27 @@ async def _handle_link_command(user_id: str, chat_id: int, message_id: int):
     ep  = os.environ.get("LOGTO_ENDPOINT", "").rstrip("/")
     cid = os.environ.get("LOGTO_CLIENT_ID", "")
     if not ep or not cid:
-        await send_text_chunks(
-            chat_id,
-            "\u26a0\ufe0f Web login isn't set up yet \u2014 check back soon!",
-            reply_to=message_id,
-        )
+        await send_text_chunks(chat_id, "⚠️ Web login isn't set up yet — check back soon!", reply_to=message_id)
         return
     profile = await get_user_profile_data(user_id)
-    existing_logto_id = profile.get("logto_id")
-    if existing_logto_id:
+    if profile.get("logto_id"):
         empire_id = profile.get("empire_id", "N/A")
-        await send_text_chunks(
-            chat_id,
-            (
-                f"\u2705 <b>Your account is already linked!</b>\n\n"
-                f"\U0001f194 Empire ID: <b>{empire_id}</b>\n"
-                f"\U0001f4e7 Email: {profile.get('logto_email') or 'N/A'}\n\n"
-                f"When the web app launches, sign in with your Empire ID and AIM will remember everything. \U0001f30d\U0001f1f3\U0001f1ec"
-            ),
-            reply_to=message_id,
-        )
+        await send_text_chunks(chat_id, (
+            f"✅ <b>Your account is already linked!</b>\n\n"
+            f"🆔 Empire ID: <b>{empire_id}</b>\n"
+            f"📧 Email: {profile.get('logto_email') or 'N/A'}\n\n"
+            f"When the web app launches, sign in with your Empire ID and AIM will remember everything. 🌍🇳🇬"
+        ), reply_to=message_id)
         return
     state    = _create_oauth_state(user_id, chat_id)
     auth_url = build_logto_auth_url(state)
-    await send_text_chunks(
-        chat_id,
-        (
-            "\U0001f517 <b>Link your Telegram to Empire AI</b>\n\n"
-            "Tap below to sign up or log in. Once done, your Telegram memory "
-            "will be available on the Empire AI web app when it launches.\n\n"
-            f'\U0001f449 <a href="{auth_url}">Create / Sign into your Empire Account</a>\n\n'
-            "\u23f3 Link expires in <b>10 minutes</b>."
-        ),
-        reply_to=message_id,
-    )
+    await send_text_chunks(chat_id, (
+        "🔗 <b>Link your Telegram to Empire AI</b>\n\n"
+        "Tap below to sign up or log in. Once done, your Telegram memory "
+        "will be available on the Empire AI web app when it launches.\n\n"
+        f'👉 <a href="{auth_url}">Create / Sign into your Empire Account</a>\n\n'
+        "⏳ Link expires in <b>10 minutes</b>."
+    ), reply_to=message_id)
 
 # ═══════════════════════════════════════════════════════════
 # BOT COMMANDS
@@ -1172,83 +1159,83 @@ async def handle_message_async(update: Update):
             if os.path.exists(temp_path): os.remove(temp_path)
 
 
-    # ── DOCUMENT HANDLER ──
-    if update.message.document:
-        doc = update.message.document
-        doc_name = doc.file_name or "unknown_document"
-        doc_mime = doc.mime_type or "application/octet-stream"
-        temp_path = f"doc_{doc.file_id}_{doc_name}"
-        msg = await bot.send_message(chat.id, "📄 Nebulae is opening the document...", reply_to_message_id=message_id)
-        status_msg_id = msg.message_id
-        stop_event = asyncio.Event()
-        doc_phrases = [
-            "📄 Nebulae is opening the document...",
-            "📄 Nebulae is reading the pages...",
-            "📄 Nebulae is analyzing the text...",
-            "📄 Nebulae is almost done reading..."
-        ]
-        updater_task = asyncio.create_task(dynamic_status_updater(bot, chat.id, status_msg_id, doc_phrases, stop_event))
-        try:
-            file = await bot.get_file(doc.file_id)
-            await file.download_to_drive(custom_path=temp_path)
-            with open(temp_path, "rb") as f:
-                doc_bytes = f.read()
-            stop_event.set()
-            await updater_task
-            description = await nebulae.analyze_document(doc_bytes, doc_mime, doc_name, "Summarize and explain this document in detail.")
-            final_text = f"📝 <b>Document Analysis:</b>\n{description[:3000]}"
+        # ── DOCUMENT HANDLER ──
+        if update.message.document:
+            doc      = update.message.document
+            doc_name = doc.file_name or "unknown_document"
+            doc_mime = doc.mime_type or "application/octet-stream"
+            temp_path = f"doc_{doc.file_id}_{doc_name}"
+            msg = await bot.send_message(chat.id, "📄 Nebulae is opening the document...", reply_to_message_id=message_id)
+            status_msg_id = msg.message_id
+            stop_event   = asyncio.Event()
+            doc_phrases  = [
+                "📄 Nebulae is opening the document...",
+                "📄 Nebulae is reading the pages...",
+                "📄 Nebulae is analyzing the text...",
+                "📄 Nebulae is almost done reading..."
+            ]
+            updater_task = asyncio.create_task(dynamic_status_updater(bot, chat.id, status_msg_id, doc_phrases, stop_event))
             try:
-                await bot.edit_message_text(chat_id=chat.id, message_id=status_msg_id, text=final_text, parse_mode=ParseMode.HTML)
-            except Exception:
-                await send_text_chunks(chat.id, final_text, reply_to=message_id)
-            user_text = f"[User sent a document named {doc_name}. Nebulae's analysis: {description}]"
-        except Exception as e:
-            logger.error(f"Document error: {e}")
-            stop_event.set()
-            await send_text_chunks(chat.id, "📄 Couldn't process the document.", reply_to=status_msg_id)
-            return
-        finally:
-            if os.path.exists(temp_path): os.remove(temp_path)
+                file = await bot.get_file(doc.file_id)
+                await file.download_to_drive(custom_path=temp_path)
+                with open(temp_path, "rb") as f:
+                    doc_bytes = f.read()
+                stop_event.set()
+                await updater_task
+                description = await nebulae.analyze_document(doc_bytes, doc_mime, doc_name, "Summarize and explain this document in detail.")
+                final_text  = f"📝 <b>Document Analysis:</b>\n{description[:3000]}"
+                try:
+                    await bot.edit_message_text(chat_id=chat.id, message_id=status_msg_id, text=final_text, parse_mode=ParseMode.HTML)
+                except Exception:
+                    await send_text_chunks(chat.id, final_text, reply_to=message_id)
+                user_text = f"[User sent a document named {doc_name}. Nebulae\'s analysis: {description}]"
+            except Exception as e:
+                logger.error("Document error: %s", e)
+                stop_event.set()
+                await send_text_chunks(chat.id, "📄 Couldn\'t process the document.", reply_to=status_msg_id)
+                return
+            finally:
+                if os.path.exists(temp_path): os.remove(temp_path)
 
-    # ── VIDEO HANDLER ──
-    if update.message.video or update.message.animation:
-        video_obj = update.message.video or update.message.animation
-        temp_path = f"video_{video_obj.file_id}.mp4"
-        msg = await bot.send_message(chat.id, "🎬 Nebulae is loading the video...", reply_to_message_id=message_id)
-        status_msg_id = msg.message_id
-        stop_event = asyncio.Event()
-        vid_phrases = [
-            "🎬 Nebulae is loading the video...",
-            "🎬 Nebulae is breaking it into frames...",
-            "🎬 Nebulae is watching frame 1...",
-            "🎬 Nebulae is analyzing the motion..."
-        ]
-        updater_task = asyncio.create_task(dynamic_status_updater(bot, chat.id, status_msg_id, vid_phrases, stop_event))
-        try:
-            file = await bot.get_file(video_obj.file_id)
-            await file.download_to_drive(custom_path=temp_path)
-            with open(temp_path, "rb") as vid_file:
-                vid_bytes = vid_file.read()
-            stop_event.set()
-            await updater_task
-            description = await nebulae.analyze_video(vid_bytes, "Describe what is happening in this video in detail.")
-            final_text = f"🎥 <b>Video Analysis:</b>\n{description[:3000]}"
+        # ── VIDEO HANDLER ──
+        if update.message.video or update.message.animation:
+            video_obj = update.message.video or update.message.animation
+            temp_path = f"video_{video_obj.file_id}.mp4"
+            msg = await bot.send_message(chat.id, "🎬 Nebulae is loading the video...", reply_to_message_id=message_id)
+            status_msg_id = msg.message_id
+            stop_event    = asyncio.Event()
+            vid_phrases   = [
+                "🎬 Nebulae is loading the video...",
+                "🎬 Nebulae is breaking it into frames...",
+                "🎬 Nebulae is watching frame 1...",
+                "🎬 Nebulae is analyzing the motion..."
+            ]
+            updater_task = asyncio.create_task(dynamic_status_updater(bot, chat.id, status_msg_id, vid_phrases, stop_event))
             try:
-                await bot.edit_message_text(chat_id=chat.id, message_id=status_msg_id, text=final_text, parse_mode=ParseMode.HTML)
-            except Exception:
-                await send_text_chunks(chat.id, final_text, reply_to=message_id)
-            user_text = f"[User sent a video. Nebulae's analysis: {description}]"
-        except Exception as e:
-            logger.error(f"Video error: {e}")
-            stop_event.set()
-            await send_text_chunks(chat.id, "🎬 Couldn't process the video.", reply_to=status_msg_id)
-            return
-        finally:
-            if os.path.exists(temp_path): os.remove(temp_path)
+                file = await bot.get_file(video_obj.file_id)
+                await file.download_to_drive(custom_path=temp_path)
+                with open(temp_path, "rb") as vid_file:
+                    vid_bytes = vid_file.read()
+                stop_event.set()
+                await updater_task
+                description = await nebulae.analyze_video(vid_bytes, "Describe what is happening in this video in detail.")
+                final_text  = f"🎥 <b>Video Analysis:</b>\n{description[:3000]}"
+                try:
+                    await bot.edit_message_text(chat_id=chat.id, message_id=status_msg_id, text=final_text, parse_mode=ParseMode.HTML)
+                except Exception:
+                    await send_text_chunks(chat.id, final_text, reply_to=message_id)
+                user_text = f"[User sent a video. Nebulae\'s analysis: {description}]"
+            except Exception as e:
+                logger.error("Video error: %s", e)
+                stop_event.set()
+                await send_text_chunks(chat.id, "🎬 Couldn\'t process the video.", reply_to=status_msg_id)
+                return
+            finally:
+                if os.path.exists(temp_path): os.remove(temp_path)
 
-    if not user_text:
-        await send_text_chunks(chat.id, "I can only read text, voice, and photo messages.")
-        return
+        if not user_text:
+            await send_text_chunks(chat.id, "I can only read text, voice, and photo messages.")
+            return
 
     user_id  = str(user.id)
     username = user.username or user.first_name or "User"
@@ -1284,16 +1271,12 @@ async def handle_message_async(update: Update):
     if _is_empire_intent(user_text):
         profile_check = await get_user_profile_data(user_id)
         if not profile_check.get("logto_id"):
-            await send_text_chunks(
-                chat.id,
-                (
-                    "\U0001f30d Sounds like you want to set up your <b>Empire AI account</b>!\n\n"
-                    "This links your Telegram to the Empire AI web app \u2014 so when it launches, "
-                    "AIM will remember everything you've told me here.\n\n"
-                    "Want me to send you the link? Just say <b>yes</b> or tap /link anytime. \U0001f1f3\U0001f1ec"
-                ),
-                reply_to=message_id,
-            )
+            await send_text_chunks(chat.id, (
+                "🌍 Sounds like you want to set up your <b>Empire AI account</b>!\n\n"
+                "This links your Telegram to the Empire AI web app — so when it launches, "
+                "AIM will remember everything you\'ve told me here.\n\n"
+                "Want me to send you the link? Just say <b>yes</b> or tap /link anytime. 🇳🇬"
+            ), reply_to=message_id)
             return
         await _handle_link_command(user_id, chat.id, message_id)
         return

@@ -37,25 +37,59 @@ def is_admin(user_id: str) -> bool:
     return str(user_id) in ADMIN_IDS
 
 
-def read_file_safely(filepath: str) -> str:
+def read_file_safely(filepath: str, supabase=None) -> str:
     """
-    Read a file relative to admin.py's directory.
-    Rejects path traversal attempts.
+    Read a project file. Tries Supabase project_files table first
+    (populated by sync_files_to_supabase.py on every deploy),
+    then falls back to the local filesystem.
     """
+    # ── 1. Try Supabase ──────────────────────────────────────
+    if supabase:
+        try:
+            res = supabase.table("project_files").select("content").eq("filename", filepath).execute()
+            if res.data:
+                logger.info("📂 read_file_safely → served from Supabase: %s", filepath)
+                return res.data[0]["content"]
+        except Exception as e:
+            logger.warning("⚠️ Supabase file read failed for %s: %s", filepath, e)
+
+    # ── 2. Fallback: local filesystem ────────────────────────
     base_dir = os.path.abspath(os.path.dirname(__file__))
     requested_path = os.path.abspath(os.path.join(base_dir, filepath))
-    # ✅ Bug 1 fix: log the resolved paths so you can debug hosting-platform
-    # issues where __file__ resolves to an unexpected directory.
-    logger.info("📂 read_file_safely → base=%s | target=%s", base_dir, requested_path)
+    logger.info("📂 read_file_safely → local fallback: %s", requested_path)
     if not requested_path.startswith(base_dir):
         return "❌ Access Denied: Path traversal detected."
     if not os.path.exists(requested_path):
-        return f"❌ File not found: {filepath}\n(looked in: {base_dir})"
+        return (
+            f"❌ File not found: {filepath}\n"
+            f"(checked Supabase project_files + local dir: {base_dir})\n"
+            f"Tip: make sure sync_files_to_supabase.py ran on the last deploy."
+        )
     try:
         with open(requested_path, "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:
         return f"❌ Error reading file: {e}"
+
+
+def list_project_files(supabase=None) -> str:
+    """List all files synced to Supabase, or local .py files as fallback."""
+    if supabase:
+        try:
+            res = supabase.table("project_files").select("filename,file_size,updated_at").order("filename").execute()
+            if res.data:
+                lines = ["📁 <b>Project Files (from Supabase):</b>\n"]
+                for r in res.data:
+                    size = r.get("file_size", 0)
+                    updated = r.get("updated_at", "")[:16].replace("T", " ")
+                    lines.append(f"• <code>{r['filename']}</code> — {size:,} bytes | {updated}")
+                return "\n".join(lines)
+        except Exception as e:
+            logger.warning("⚠️ Could not list files from Supabase: %s", e)
+    # Local fallback
+    base_dir = os.path.abspath(os.path.dirname(__file__))
+    py_files = [f for f in os.listdir(base_dir) if f.endswith(".py")]
+    return "📁 Local .py files:\n" + "\n".join(f"• {f}" for f in sorted(py_files))
 
 
 def get_server_metrics() -> str:
@@ -164,11 +198,13 @@ async def handle_admin_command(
     # ── read [file] ────────────────────────────────────────
     # FIX: was `action.startswith("read ")` which is always False because
     # action is just the single word "read" (split into parts[1]).
+    elif action == "files":
+        files_list = list_project_files(supabase)
+        await send_text_chunks(chat_id, files_list, reply_to=message_id)
+
     elif action == "read":
-        target = filename or "aimbot.py"
-        content = read_file_safely(target)
-        # Telegram HTML parse mode doesn't support <pre><code> well beyond 4096 chars,
-        # so we send plain and truncate with a note if needed.
+        target    = filename or "aimbot.py"
+        content   = read_file_safely(target, supabase)
         truncated = len(content) > 3800
         display   = content[:3800]
         header    = f"📄 <b>File: {target}</b>"
@@ -181,7 +217,7 @@ async def handle_admin_command(
         target = filename or "aimbot.py"
 
         # ── Step 1: read the file ──────────────────────────
-        content = read_file_safely(target)
+        content = read_file_safely(target, supabase)
         if content.startswith("❌"):
             await send_text_chunks(chat_id, content, reply_to=message_id)
             return True
@@ -246,6 +282,7 @@ async def handle_admin_command(
             "/admin server — Server health & uptime\n"
             "/admin list — List all admin IDs\n"
             "/admin reload — Reload admins from DB\n"
+            "/admin files — List all synced project files\n"
             "/admin read [file] — Read a project file\n"
             "/admin analyze [file] — AI analysis of a file\n\n"
             "<i>Default file for read/analyze: aimbot.py</i>"
