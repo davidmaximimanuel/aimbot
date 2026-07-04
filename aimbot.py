@@ -1121,7 +1121,12 @@ async def handle_message_async(update: Update):
     chat_type  = chat.type if chat else "private"
     message_id = update.message.message_id
 
-    # Voice
+    logger.info(f"DEBUG MEDIA → photo={bool(update.message.photo)}, doc={bool(update.message.document)}, video={bool(update.message.video)}, animation={bool(update.message.animation)}")
+
+    # === MEDIA HANDLING ===
+    media_processed = False
+
+    # Voice / Audio
     if update.message.voice or update.message.audio:
         file_obj = update.message.voice or update.message.audio
         await send_text_chunks(chat.id, "🎙️ Listening...", reply_to=message_id)
@@ -1132,6 +1137,7 @@ async def handle_message_async(update: Update):
         else:
             await send_text_chunks(chat.id, "🎤 Sorry, couldn't understand.", reply_to=message_id)
             return
+        media_processed = True
 
     # Photo
     if update.message.photo:
@@ -1157,22 +1163,19 @@ async def handle_message_async(update: Update):
             return
         finally:
             if os.path.exists(temp_path): os.remove(temp_path)
+        media_processed = True
 
-    # ── DOCUMENT HANDLER ──
+    # Document
     if update.message.document:
+        media_processed = True
         doc      = update.message.document
         doc_name = doc.file_name or "unknown_document"
         doc_mime = doc.mime_type or "application/octet-stream"
         temp_path = f"doc_{doc.file_id}_{doc_name}"
         msg = await bot.send_message(chat.id, "📄 Nebulae is opening the document...", reply_to_message_id=message_id)
         status_msg_id = msg.message_id
-        stop_event   = asyncio.Event()
-        doc_phrases  = [
-            "📄 Nebulae is opening the document...",
-            "📄 Nebulae is reading the pages...",
-            "📄 Nebulae is analyzing the text...",
-            "📄 Nebulae is almost done reading..."
-        ]
+        stop_event = asyncio.Event()
+        doc_phrases = ["📄 Opening document...", "📄 Reading pages...", "📄 Analyzing content..."]
         updater_task = asyncio.create_task(dynamic_status_updater(bot, chat.id, status_msg_id, doc_phrases, stop_event))
         try:
             file = await bot.get_file(doc.file_id)
@@ -1182,33 +1185,29 @@ async def handle_message_async(update: Update):
             stop_event.set()
             await updater_task
             description = await nebulae.analyze_document(doc_bytes, doc_mime, doc_name, "Summarize and explain this document in detail.")
-            final_text  = f"📝 <b>Document Analysis:</b>\n{description[:3000]}"
+            final_text  = f"📝 <b>Document Analysis: {doc_name}</b>\n\n{description[:2800]}"
             try:
                 await bot.edit_message_text(chat_id=chat.id, message_id=status_msg_id, text=final_text, parse_mode=ParseMode.HTML)
             except Exception:
                 await send_text_chunks(chat.id, final_text, reply_to=message_id)
-            user_text = f"[User sent a document named {doc_name}. Nebulae\'s analysis: {description}]"
+            user_text = f"[User sent document {doc_name}. Analysis: {description[:500]}]"
         except Exception as e:
             logger.error("Document error: %s", e)
             stop_event.set()
-            await send_text_chunks(chat.id, "📄 Couldn\'t process the document.", reply_to=status_msg_id)
+            await send_text_chunks(chat.id, "❌ Could not process this document.", reply_to=status_msg_id)
             return
         finally:
             if os.path.exists(temp_path): os.remove(temp_path)
 
-    # ── VIDEO HANDLER ──
+    # Video / Animation
     if update.message.video or update.message.animation:
+        media_processed = True
         video_obj = update.message.video or update.message.animation
         temp_path = f"video_{video_obj.file_id}.mp4"
         msg = await bot.send_message(chat.id, "🎬 Nebulae is loading the video...", reply_to_message_id=message_id)
         status_msg_id = msg.message_id
-        stop_event    = asyncio.Event()
-        vid_phrases   = [
-            "🎬 Nebulae is loading the video...",
-            "🎬 Nebulae is breaking it into frames...",
-            "🎬 Nebulae is watching frame 1...",
-            "🎬 Nebulae is analyzing the motion..."
-        ]
+        stop_event = asyncio.Event()
+        vid_phrases = ["🎬 Loading video...", "🎬 Extracting frames...", "🎬 Analyzing..."]
         updater_task = asyncio.create_task(dynamic_status_updater(bot, chat.id, status_msg_id, vid_phrases, stop_event))
         try:
             file = await bot.get_file(video_obj.file_id)
@@ -1218,35 +1217,32 @@ async def handle_message_async(update: Update):
             stop_event.set()
             await updater_task
             description = await nebulae.analyze_video(vid_bytes, "Describe what is happening in this video in detail.")
-            final_text  = f"🎥 <b>Video Analysis:</b>\n{description[:3000]}"
+            final_text  = f"🎥 <b>Video Analysis:</b>\n{description[:2800]}"
             try:
                 await bot.edit_message_text(chat_id=chat.id, message_id=status_msg_id, text=final_text, parse_mode=ParseMode.HTML)
             except Exception:
                 await send_text_chunks(chat.id, final_text, reply_to=message_id)
-            user_text = f"[User sent a video. Nebulae\'s analysis: {description}]"
+            user_text = f"[User sent a video. Nebulae analysis: {description}]"
         except Exception as e:
             logger.error("Video error: %s", e)
             stop_event.set()
-            await send_text_chunks(chat.id, "🎬 Couldn\'t process the video.", reply_to=status_msg_id)
+            await send_text_chunks(chat.id, "❌ Could not process this video.", reply_to=status_msg_id)
             return
         finally:
             if os.path.exists(temp_path): os.remove(temp_path)
 
-        # Final check — only show this if NO media was processed
-    if not user_text and not any([
-        update.message.photo, 
-        update.message.document, 
-        update.message.video, 
-        update.message.animation, 
-        update.message.voice, 
-        update.message.audio
-    ]):
-        await send_text_chunks(chat.id, "I can only read text, voice, photo, document, and video messages.")
+    # Fallback if nothing was processed
+    if not media_processed and not user_text:
+        await send_text_chunks(chat.id, "I can only read text, voice, photos, documents, and videos.")
         return
 
+    # === NORMAL FLOW (Commands, AI Response, etc.) ===
     user_id  = str(user.id)
     username = user.username or user.first_name or "User"
     logger.info("📩 [%s/%s] '%s'", user_id, chat_type, user_text[:80])
+
+    if user_text.startswith("/"):
+        if await handle_bot_command(user_id, chat.id, message_id, user_text): return
 
     # ... (the rest of the function stays the same - from "if user_text.startswith("/"): " onwards)
 
