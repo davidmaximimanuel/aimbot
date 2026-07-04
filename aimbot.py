@@ -1115,26 +1115,26 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
 # ═══════════════════════════════════════════════════════════
 async def handle_message_async(update: Update):
     if not update.message: return
-    user       = update.message.from_user
-    chat       = update.message.chat
-    user_text  = update.message.text or ""
-    chat_type  = chat.type if chat else "private"
-    message_id = update.message.message_id
 
-    logger.info(f"DEBUG MEDIA → photo={bool(update.message.photo)}, doc={bool(update.message.document)}, video={bool(update.message.video)}, animation={bool(update.message.animation)}")
-
-        logger.info("=== NEW MESSAGE RECEIVED ===")
+    # Debug logging
+    logger.info("=== NEW MESSAGE RECEIVED ===")
     logger.info(f"Has text: {bool(update.message.text)}")
     logger.info(f"Has photo: {bool(update.message.photo)}")
     logger.info(f"Has document: {bool(update.message.document)}")
     logger.info(f"Has video: {bool(update.message.video)}")
     logger.info(f"Has animation: {bool(update.message.animation)}")
     logger.info(f"Has voice: {bool(update.message.voice)}")
+
     if update.message.document:
         logger.info(f"Document name: {update.message.document.file_name}, mime: {update.message.document.mime_type}")
-    # === MEDIA HANDLING ===
-    media_processed = False
 
+    user       = update.message.from_user
+    chat       = update.message.chat
+    user_text  = update.message.text or ""
+    chat_type  = chat.type if chat else "private"
+    message_id = update.message.message_id
+
+    # ... rest of your code
     # Voice / Audio
     if update.message.voice or update.message.audio:
         file_obj = update.message.voice or update.message.audio
