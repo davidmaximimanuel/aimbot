@@ -1158,9 +1158,8 @@ async def handle_message_async(update: Update):
         finally:
             if os.path.exists(temp_path): os.remove(temp_path)
 
-
-        # ── DOCUMENT HANDLER ──
-        if update.message.document:
+    # ── DOCUMENT HANDLER ──
+    if update.message.document:
             doc      = update.message.document
             doc_name = doc.file_name or "unknown_document"
             doc_mime = doc.mime_type or "application/octet-stream"
@@ -1197,8 +1196,8 @@ async def handle_message_async(update: Update):
             finally:
                 if os.path.exists(temp_path): os.remove(temp_path)
 
-        # ── VIDEO HANDLER ──
-        if update.message.video or update.message.animation:
+    # ── VIDEO HANDLER ──
+    if update.message.video or update.message.animation:
             video_obj = update.message.video or update.message.animation
             temp_path = f"video_{video_obj.file_id}.mp4"
             msg = await bot.send_message(chat.id, "🎬 Nebulae is loading the video...", reply_to_message_id=message_id)
@@ -1233,8 +1232,8 @@ async def handle_message_async(update: Update):
             finally:
                 if os.path.exists(temp_path): os.remove(temp_path)
 
-        if not user_text:
-            await send_text_chunks(chat.id, "I can only read text, voice, and photo messages.")
+    if not user_text:
+            await send_text_chunks(chat.id, "I can only read text, voice, photo, document, and video messages.")
             return
 
     user_id  = str(user.id)
