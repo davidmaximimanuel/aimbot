@@ -1375,21 +1375,28 @@ def debug_worker_status():
 
 @app.route("/set-webhook", methods=["GET"])
 def set_webhook():
-    if not bot or not WEBHOOK_URL: return jsonify({"error":"Not configured"}), 500
+    if not bot or not WEBHOOK_URL:
+        return jsonify({"error": "Bot or WEBHOOK_URL not configured"}), 500
     try:
-        run_async(bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"))
-        return jsonify({"status":"Webhook set successfully!"})
-    except Exception as e: 
-        return jsonify({"error":str(e)}), 500
+        future = run_async(bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"))
+        future.result(timeout=10)  # Wait for it to complete
+        return jsonify({"status": "Webhook set successfully!"})
+    except Exception as e:
+        logger.error("Set webhook error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/delete-webhook", methods=["GET"])
 def delete_webhook():
-    if not bot: return jsonify({"error":"Bot not configured"}), 500
+    if not bot:
+        return jsonify({"error": "Bot not configured"}), 500
     try:
-        run_async(bot.delete_webhook())
-        return jsonify({"status":"Webhook deleted!"})
-    except Exception as e: 
-        return jsonify({"error":str(e)}), 500
+        future = run_async(bot.delete_webhook())
+        future.result(timeout=10)
+        return jsonify({"status": "Webhook deleted!"})
+    except Exception as e:
+        logger.error("Delete webhook error: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/debug/logto", methods=["GET"])
 def debug_logto():
