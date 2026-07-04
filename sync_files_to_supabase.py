@@ -35,7 +35,7 @@ SKIP_DIRS       = {"__pycache__", ".git", "node_modules", ".venv", "venv", "env"
 SKIP_FILES      = {"sync_files_to_supabase.py"}  # don't need to sync the sync script itself
 
 # Max file size to store (50KB — keeps Supabase row sizes sane)
-MAX_FILE_SIZE = 50_000
+MAX_FILE_SIZE = 200_000
 
 def get_project_files(base_dir: str) -> list[dict]:
     """Walk the project dir and collect all readable .py files."""
