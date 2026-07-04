@@ -1269,7 +1269,12 @@ def health():
 def webhook():
     try:
         data = request.get_json(force=True)
-        uid  = data.get("update_id")
+        logger.info(f"RAW WEBHOOK RECEIVED - keys: {list(data.keys())}")
+        if "message" in data:
+            msg = data["message"]
+            logger.info(f"Message types - text:{'text' in msg}, photo:{'photo' in msg}, document:{'document' in msg}, video:{'video' in msg}")
+        
+        uid = data.get("update_id")
         if uid and is_duplicate_update(uid): return "OK", 200
         upd = Update.de_json(data, bot)
         if upd.inline_query: run_async(handle_inline_query_async(upd.inline_query))
