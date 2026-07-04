@@ -1232,7 +1232,15 @@ async def handle_message_async(update: Update):
         finally:
             if os.path.exists(temp_path): os.remove(temp_path)
 
-    if not user_text:
+        # Final check — only show this if NO media was processed
+    if not user_text and not any([
+        update.message.photo, 
+        update.message.document, 
+        update.message.video, 
+        update.message.animation, 
+        update.message.voice, 
+        update.message.audio
+    ]):
         await send_text_chunks(chat.id, "I can only read text, voice, photo, document, and video messages.")
         return
 
