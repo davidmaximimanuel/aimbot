@@ -1123,6 +1123,15 @@ async def handle_message_async(update: Update):
 
     logger.info(f"DEBUG MEDIA → photo={bool(update.message.photo)}, doc={bool(update.message.document)}, video={bool(update.message.video)}, animation={bool(update.message.animation)}")
 
+        logger.info("=== NEW MESSAGE RECEIVED ===")
+    logger.info(f"Has text: {bool(update.message.text)}")
+    logger.info(f"Has photo: {bool(update.message.photo)}")
+    logger.info(f"Has document: {bool(update.message.document)}")
+    logger.info(f"Has video: {bool(update.message.video)}")
+    logger.info(f"Has animation: {bool(update.message.animation)}")
+    logger.info(f"Has voice: {bool(update.message.voice)}")
+    if update.message.document:
+        logger.info(f"Document name: {update.message.document.file_name}, mime: {update.message.document.mime_type}")
     # === MEDIA HANDLING ===
     media_processed = False
 
