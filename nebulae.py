@@ -120,9 +120,9 @@ def generate_pdf(title: str, content: str) -> bytes:
 import cv2
 import numpy as np
 
-════════════════════════════════════
-5. DOCUMENT READING (Native Gemini PDF + Text Fallback)
-════════════════════════════════════
+# ════════════════════════════════════
+# 5. DOCUMENT READING (Native Gemini PDF + Text Fallback)
+# ════════════════════════════════════
 async def analyze_document(file_bytes: bytes, mime_type: str, filename: str, prompt: str = "Analyze this document and provide a detailed summary.") -> str:
     """Analyzes a document (PDF, TXT, etc.) using Gemini."""
     if not gemini_client:
@@ -155,9 +155,9 @@ async def analyze_document(file_bytes: bytes, mime_type: str, filename: str, pro
         logger.error(f"Nebulae Document Error: {e}")
         return "I couldn't read this document properly."
 
-════════════════════════════════════
-6. VIDEO ANALYSIS (Frame Extraction)
-════════════════════════════════════
+# ════════════════════════════════════
+# 6. VIDEO ANALYSIS (Frame Extraction)
+# ════════════════════════════════════
 async def analyze_video(video_bytes: bytes, prompt: str = "Describe what is happening in this video in detail.") -> str:
     """Analyzes a video by extracting keyframes and sending them to Gemini Vision."""
     if not gemini_client:
