@@ -1114,19 +1114,22 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
 # MAIN MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════
 async def handle_message_async(update: Update):
-    if not update.message: return
+    if not update.message: 
+        logger.info("No message in update")
+        return
 
-    # Debug logging
-    logger.info("=== NEW MESSAGE RECEIVED ===")
+    logger.info("=== MESSAGE RECEIVED ===")
+    logger.info(f"Update ID: {update.update_id}")
+    logger.info(f"Message type: {type(update.message)}")
     logger.info(f"Has text: {bool(update.message.text)}")
     logger.info(f"Has photo: {bool(update.message.photo)}")
     logger.info(f"Has document: {bool(update.message.document)}")
     logger.info(f"Has video: {bool(update.message.video)}")
-    logger.info(f"Has animation: {bool(update.message.animation)}")
     logger.info(f"Has voice: {bool(update.message.voice)}")
 
     if update.message.document:
-        logger.info(f"Document name: {update.message.document.file_name}, mime: {update.message.document.mime_type}")
+        logger.info(f"DOCUMENT DETECTED: {update.message.document.file_name}")
+    # ... rest of your function
 
     user       = update.message.from_user
     chat       = update.message.chat
