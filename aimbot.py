@@ -1377,18 +1377,19 @@ def debug_worker_status():
 def set_webhook():
     if not bot or not WEBHOOK_URL: return jsonify({"error":"Not configured"}), 500
     try:
-        bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-        return jsonify({"status":"Webhook set!"})
-    except Exception as e: return jsonify({"error":str(e)}), 500
+        run_async(bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"))
+        return jsonify({"status":"Webhook set successfully!"})
+    except Exception as e: 
+        return jsonify({"error":str(e)}), 500
 
 @app.route("/delete-webhook", methods=["GET"])
 def delete_webhook():
     if not bot: return jsonify({"error":"Bot not configured"}), 500
     try:
-        bot.delete_webhook()
+        run_async(bot.delete_webhook())
         return jsonify({"status":"Webhook deleted!"})
-    except Exception as e: return jsonify({"error":str(e)}), 500
-
+    except Exception as e: 
+        return jsonify({"error":str(e)}), 500
 
 @app.route("/debug/logto", methods=["GET"])
 def debug_logto():
