@@ -1130,7 +1130,9 @@ async def handle_message_async(update: Update):
     if update.message.document:
         logger.info(f"DOCUMENT DETECTED: {update.message.document.file_name}")
     # ... rest of your function
+    media_processed = False
 
+    
     user       = update.message.from_user
     chat       = update.message.chat
     user_text  = update.message.text or ""
