@@ -1395,9 +1395,14 @@ async def handle_message_async(update: Update):
                 audio_bytes = await nebulae.generate_audio(audio_text)
                 if audio_bytes:
                     try:
-                        await bot.send_audio(chat_id=chat.id, audio=audio_bytes, caption="🔊 Audio by Nebulae", reply_to_message_id=message_id)
+                        from io import BytesIO as _BIO
+                        audio_file = _BIO(audio_bytes)
+                        audio_file.name = "aim_audio.mp3"
+                        await bot.send_audio(chat_id=chat.id, audio=audio_file, caption="🔊 Audio by Nebulae", reply_to_message_id=message_id)
                         answer = "✅ Here is your audio!"
-                    except Exception: answer = "❌ Audio failed to send."
+                    except Exception as _ae:
+                        logger.error("Audio send error: %s", _ae)
+                        answer = "❌ Audio failed to send."
                 else: answer = "❌ Nebulae couldn't generate the audio."
                 answer = re.sub(r'\[NEBULAE_AUDIO:.*?\]', '', answer, flags=re.IGNORECASE).strip()
 
@@ -1409,9 +1414,14 @@ async def handle_message_async(update: Update):
                 pdf_bytes = nebulae.generate_pdf(pdf_title, pdf_content)
                 if pdf_bytes:
                     try:
-                        await bot.send_document(chat_id=chat.id, document=pdf_bytes, filename=f"{pdf_title.replace(' ','_')}.pdf", caption=f"📄 {pdf_title}", reply_to_message_id=message_id)
+                        from io import BytesIO as _BIO
+                        pdf_file = _BIO(pdf_bytes)
+                        pdf_file.name = f"{pdf_title.replace(' ','_')}.pdf"
+                        await bot.send_document(chat_id=chat.id, document=pdf_file, filename=f"{pdf_title.replace(' ','_')}.pdf", caption=f"📄 {pdf_title}", reply_to_message_id=message_id)
                         answer = "✅ Here is your PDF!"
-                    except Exception: answer = "❌ PDF failed to send."
+                    except Exception as _pe:
+                        logger.error("PDF send error: %s", _pe)
+                        answer = "❌ PDF failed to send."
                 else: answer = "❌ Nebulae couldn't generate the PDF."
                 answer = re.sub(r'\[NEBULAE_PDF:.*?\]', '', answer, flags=re.IGNORECASE | re.DOTALL).strip()
 
