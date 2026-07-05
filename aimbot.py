@@ -1258,7 +1258,183 @@ async def handle_message_async(update: Update):
     if user_text.startswith("/"):
         if await handle_bot_command(user_id, chat.id, message_id, user_text): return
 
-    # ... (the rest of the function stays the same - from "if user_text.startswith("/"): " onwards)
+    profile = await get_user_profile_data(user_id)
+
+    is_ph, ph_query = is_inline_placeholder(user_text)
+    if is_ph and ph_query:
+        await process_inline_answer(chat.id, message_id, ph_query, user_id)
+        return
+
+    if is_memory_search_query(user_text):
+        kws    = extract_search_keywords(user_text)
+        result = await search_memory_by_keyword(user_id, user_text) if kws else await search_memory(user_id)
+        await send_text_chunks(chat.id, result, reply_to=message_id)
+        return
+
+    if await handle_task_message(user_text, user_id, chat.id, message_id):
+        try:
+            last_response = supabase.table("chat_memory").select("response").eq("user_id",str(user_id)).order("created_at",desc=True).limit(1).execute()
+            ai_response   = last_response.data[0]["response"] if last_response.data else "Task created"
+            await save_chat_memory(user_id, username, user_text, ai_response, chat_type, "reminder")
+            await update_user_profile(user_id, username, "reminder")
+        except Exception as e:
+            logger.error("Failed to save task interaction: %s", e)
+        return
+
+    # ── Casual Empire ID / link intent ──
+    if _is_empire_intent(user_text):
+        profile_check = await get_user_profile_data(user_id)
+        if not profile_check.get("logto_id"):
+            await send_text_chunks(chat.id, (
+                "🌍 Sounds like you want to set up your <b>Empire AI account</b>!\n\n"
+                "This links your Telegram to the Empire AI web app — so when it launches, "
+                "AIM will remember everything you\'ve told me here.\n\n"
+                "Want me to send you the link? Just say <b>yes</b> or tap /link anytime. 🇳🇬"
+            ), reply_to=message_id)
+            return
+        await _handle_link_command(user_id, chat.id, message_id)
+        return
+
+    if chat_type in ("group", "supergroup"):
+        mentioned      = "@askaimbot" in user_text.lower()
+        replied_to_bot = (
+            update.message.reply_to_message
+            and update.message.reply_to_message.from_user
+            and update.message.reply_to_message.from_user.is_bot
+            and update.message.reply_to_message.from_user.username == "askaimbot"
+        )
+        if not mentioned and not replied_to_bot:
+            return
+        user_text = re.sub(r'@askaimbot', '', user_text, flags=re.IGNORECASE).strip()
+
+    try:
+        session_summary                          = await get_session_summary(user_id)
+        recent_history, older_context, gap_seconds = await get_conversation_context(user_id, user_text)
+        web_context = ""
+
+        for url in detect_urls(user_text):
+            c = fetch_url_content(url)
+            if c and "Failed" not in c:
+                web_context += f"Content from {url}:\n{c}\n"
+
+        if is_search_query(user_text) and not web_context:
+            tl = user_text.lower()
+            if "news" in tl or "latest" in tl or "today" in tl:
+                sr = get_latest_news(user_text)
+            elif any(s in tl for s in ["football","match","score","team","player","league","f1","nba","tennis","boxing","ufc","cricket","rugby"]):
+                sr = get_sports_data(user_text)
+            else:
+                sr = search_web(user_text)
+            if "No search results" not in sr:
+                web_context = f"Web Search Results for '{user_text}':\n{sr}"
+
+        max_iter, iteration, final_answer, tool_status = 3, 0, None, ""
+        while iteration < max_iter:
+            iteration += 1
+            answer = await get_ai_response(user_text, user_id, chat_type, profile, session_summary, recent_history, older_context, web_context, tool_status, gap_seconds)
+            if not answer:
+                final_answer = "🔥 High demand right now — please try again."
+                break
+            answer = answer.strip()
+
+            if "SEARCH_TRIGGER:" in answer:
+                m = re.search(r'SEARCH_TRIGGER:\s*(.+)', answer, re.IGNORECASE)
+                if m:
+                    sq = m.group(1).strip()
+                    if "news" in sq.lower() or "latest" in sq.lower(): sr = get_latest_news(sq)
+                    elif any(s in sq.lower() for s in ["football","match","score","f1","nba","tennis","boxing"]): sr = get_sports_data(sq)
+                    else: sr = search_web(sq)
+                    web_context += f"\n\nWeb Search Results for '{sq}':\n{sr}" if "No search results" not in sr else f"\n\nSearch for '{sq}': No results."
+                    continue
+                else:
+                    final_answer = answer
+                    break
+
+            tm = re.search(r'\[TIMER:(\d+)(s|m|h)\]', answer, re.IGNORECASE)
+            if tm:
+                amt, unit = int(tm.group(1)), tm.group(2).lower()
+                dur    = amt * (1 if unit=="s" else 60 if unit=="m" else 3600)
+                target = datetime.now(timezone.utc) + timedelta(seconds=dur)
+                supabase.table("user_tools").insert({"user_id":user_id,"tool_type":"timer","start_time":datetime.now(timezone.utc).isoformat(),"duration_seconds":dur,"target_time":target.isoformat(),"is_active":True}).execute()
+                answer = re.sub(r'\[TIMER:\d+[smh]\]', '', answer, flags=re.IGNORECASE).strip()
+                answer += f"\n\n_✅ Timer set for {amt}{unit}_"
+
+            sm = re.search(r'\[STOPWATCH:(START|STOP)\]', answer, re.IGNORECASE)
+            if sm:
+                action_sw = sm.group(1).upper()
+                if action_sw == "START":
+                    supabase.table("user_tools").insert({"user_id":user_id,"tool_type":"stopwatch","start_time":datetime.now(timezone.utc).isoformat(),"is_active":True}).execute()
+                    answer = re.sub(r'\[STOPWATCH:START\]','',answer,flags=re.IGNORECASE).strip() + "\n\n_⏱️ Stopwatch started!_"
+                elif action_sw == "STOP":
+                    res = supabase.table("user_tools").select("*").eq("user_id",user_id).eq("tool_type","stopwatch").eq("is_active",True).order("created_at",desc=True).limit(1).execute()
+                    if res.data:
+                        row     = res.data[0]
+                        elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(row["start_time"].replace("Z","+00:00"))
+                        mins, secs = divmod(int(elapsed.total_seconds()), 60)
+                        supabase.table("user_tools").update({"is_active":False}).eq("id",row["id"]).execute()
+                        ts = f"{mins}m {secs}s" if mins else f"{secs}s"
+                        answer = re.sub(r'\[STOPWATCH:STOP\]','',answer,flags=re.IGNORECASE).strip() + f"\n\n_⏱️ Stopped! Time: {ts}_"
+
+            img_match = re.search(r'\[NEBULAE_IMAGE:\s*(.+?)\]', answer, re.IGNORECASE)
+            if img_match:
+                img_prompt = img_match.group(1).strip()
+                await send_text_chunks(chat.id, "🎨 Nebulae is painting...", reply_to=message_id)
+                img_bytes = await nebulae.generate_image(img_prompt)
+                if img_bytes:
+                    try:
+                        await bot.send_photo(chat_id=chat.id, photo=img_bytes, caption="✨ Generated by Nebulae", reply_to_message_id=message_id)
+                        answer = "✅ Here is your image!"
+                    except Exception: answer = "❌ Image failed to send."
+                else: answer = "❌ Nebulae couldn't generate the image."
+                answer = re.sub(r'\[NEBULAE_IMAGE:.*?\]', '', answer, flags=re.IGNORECASE).strip()
+
+            audio_match = re.search(r'\[NEBULAE_AUDIO:\s*(.+?)\]', answer, re.IGNORECASE)
+            if audio_match:
+                audio_text = audio_match.group(1).strip()
+                await send_text_chunks(chat.id, "🔊 Nebulae is speaking...", reply_to=message_id)
+                audio_bytes = await nebulae.generate_audio(audio_text)
+                if audio_bytes:
+                    try:
+                        await bot.send_audio(chat_id=chat.id, audio=audio_bytes, caption="🔊 Audio by Nebulae", reply_to_message_id=message_id)
+                        answer = "✅ Here is your audio!"
+                    except Exception: answer = "❌ Audio failed to send."
+                else: answer = "❌ Nebulae couldn't generate the audio."
+                answer = re.sub(r'\[NEBULAE_AUDIO:.*?\]', '', answer, flags=re.IGNORECASE).strip()
+
+            pdf_match = re.search(r'\[NEBULAE_PDF:\s*([^\|]+)\|(.*?)\]', answer, re.IGNORECASE | re.DOTALL)
+            if pdf_match:
+                pdf_title   = pdf_match.group(1).strip()
+                pdf_content = pdf_match.group(2).strip()
+                await send_text_chunks(chat.id, "📄 Nebulae is generating your document...", reply_to=message_id)
+                pdf_bytes = nebulae.generate_pdf(pdf_title, pdf_content)
+                if pdf_bytes:
+                    try:
+                        await bot.send_document(chat_id=chat.id, document=pdf_bytes, filename=f"{pdf_title.replace(' ','_')}.pdf", caption=f"📄 {pdf_title}", reply_to_message_id=message_id)
+                        answer = "✅ Here is your PDF!"
+                    except Exception: answer = "❌ PDF failed to send."
+                else: answer = "❌ Nebulae couldn't generate the PDF."
+                answer = re.sub(r'\[NEBULAE_PDF:.*?\]', '', answer, flags=re.IGNORECASE | re.DOTALL).strip()
+
+            final_answer = answer
+            break
+
+        if final_answer is None:
+            final_answer = "I tried searching but couldn't find results."
+
+        await send_text_chunks(chat.id, final_answer, reply_to=message_id)
+        topic = await extract_topic(user_text, final_answer)
+        await save_chat_memory(user_id, username, user_text, final_answer, chat_type, topic)
+        await update_user_profile(user_id, username, topic)
+
+        if profile.get("total_chats", 0) % 4 == 0:
+            recent_msgs = supabase.table("chat_memory").select("message,response").eq("user_id",str(user_id)).order("created_at",desc=True).limit(4).execute()
+            if recent_msgs.data:
+                recent_msgs.data.reverse()
+                run_async(update_session_summary(user_id, recent_msgs.data, session_summary))
+
+    except Exception as e:
+        logger.error("Critical error in handle_message_async: %s", e)
+        await send_text_chunks(chat.id, "🛠️ Something went wrong.", reply_to=message_id)
 
 # ═══════════════════════════════════════════════════════════
 # FLASK ROUTES
