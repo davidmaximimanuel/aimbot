@@ -150,9 +150,6 @@ def generate_pdf(title: str, content: str) -> bytes:
     c.save()
     return buffer.getvalue()
 
-import cv2
-import numpy as np
-
 # ════════════════════════════════════
 # 5. DOCUMENT READING (Native Gemini PDF + Text Fallback)
 # ════════════════════════════════════
@@ -196,6 +193,12 @@ async def analyze_video(video_bytes: bytes, prompt: str = "Describe what is happ
     if not gemini_client:
         return "❌ Nebulae's video analyzer is offline."
     
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return "❌ Video analysis is not available on this server (missing system libraries)."
+
     temp_video_path = f"temp_video_{os.urandom(4).hex()}.mp4"
     try:
         # Save video bytes to a temp file so OpenCV can read it
