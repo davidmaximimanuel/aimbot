@@ -54,6 +54,7 @@ WEBHOOK_URL         = os.environ.get("WEBHOOK_URL", "")
 BRAVE_API_KEY       = os.environ.get("BRAVE_API_KEY", "")
 GNEWS_API_KEY       = os.environ.get("GNEWS_API_KEY", "")
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
 
 # ─── LOGTO CONFIG ───
 LOGTO_ENDPOINT      = os.environ.get("LOGTO_ENDPOINT", "").rstrip("/")
@@ -904,6 +905,7 @@ I'm your personal AI assistant built for Africans, by Africans. Here's what I ca
 /deep [query] — Deep research
 /claim — Get your Empire ID
 /link — Connect to Empire AI Web App
+/delete — Delete all your data
 
 Just talk to me naturally — I'll understand! 🇳🇬✨"""
         await send_text_chunks(chat_id, welcome_msg, reply_to=message_id)
@@ -1037,11 +1039,45 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
                 await send_text_chunks(chat_id, "❌ Failed to generate Empire ID. Please try again.", reply_to=message_id)
         return True
 
+    elif tl == "/delete":
+        # Ask for confirmation first
+        await send_text_chunks(chat_id, (
+            "⚠️ <b>Delete Your Data</b>\n\n"
+            "This will permanently delete ALL your:\n"
+            "• Chat history and memories\n"
+            "• Tasks and reminders\n"
+            "• Profile and preferences\n\n"
+            "Type <b>YES DELETE MY DATA</b> to confirm, or anything else to cancel."
+        ), reply_to=message_id)
+        return True
+
+    elif user_text.strip() == "YES DELETE MY DATA":
+        if not supabase:
+            await send_text_chunks(chat_id, "❌ Cannot delete — database offline.", reply_to=message_id)
+            return True
+        try:
+            uid_str = str(user_id)
+            supabase.table("chat_memory").delete().eq("user_id", uid_str).execute()
+            supabase.table("user_tasks").delete().eq("user_id", uid_str).execute()
+            supabase.table("user_tools").delete().eq("user_id", uid_str).execute()
+            supabase.table("user_profiles").delete().eq("user_id", uid_str).execute()
+            logger.info("🗑️ User %s deleted all their data", uid_str)
+            await send_text_chunks(chat_id, (
+                "✅ <b>All your data has been deleted.</b>\n\n"
+                "Your chat history, tasks, and profile have been permanently removed from our servers. "
+                "If you ever want to start fresh, just send me a message. 🌍"
+            ), reply_to=message_id)
+        except Exception as e:
+            logger.error("Delete user data error: %s", e)
+            await send_text_chunks(chat_id, "❌ Something went wrong during deletion. Please try again.", reply_to=message_id)
+        return True
+
     # ── ADMIN COMMANDS — delegated entirely to admin.py ──────
     elif tl.startswith("/admin"):
         return await handle_admin_command(
             user_id, chat_id, message_id, user_text,
-            supabase, get_ai_response, send_text_chunks, USE_DEEPSEEK
+            supabase, get_ai_response, send_text_chunks, USE_DEEPSEEK,
+            bot=bot, save_chat_memory=save_chat_memory,
         )
 
     return False
@@ -1256,7 +1292,17 @@ async def handle_message_async(update: Update):
     logger.info("📩 [%s/%s] '%s'", user_id, chat_type, user_text[:80])
 
     if user_text.startswith("/"):
-        if await handle_bot_command(user_id, chat.id, message_id, user_text): return
+        cmd_handled = await handle_bot_command(user_id, chat.id, message_id, user_text)
+        if cmd_handled:
+            # Save command to memory so AIM always remembers what was asked
+            try:
+                cmd_response = f"[Command handled: {user_text.split()[0]}]"
+                topic = "tech" if user_text.lower().startswith("/admin") else "general"
+                await save_chat_memory(user_id, username, user_text, cmd_response, chat_type, topic)
+                await update_user_profile(user_id, username, topic)
+            except Exception as _me:
+                logger.error("Failed to save command to memory: %s", _me)
+            return
 
     profile = await get_user_profile_data(user_id)
 
@@ -1269,6 +1315,8 @@ async def handle_message_async(update: Update):
         kws    = extract_search_keywords(user_text)
         result = await search_memory_by_keyword(user_id, user_text) if kws else await search_memory(user_id)
         await send_text_chunks(chat.id, result, reply_to=message_id)
+        await save_chat_memory(user_id, username, user_text, result[:500], chat_type, "general")
+        await update_user_profile(user_id, username, "general")
         return
 
     if await handle_task_message(user_text, user_id, chat.id, message_id):
@@ -1285,14 +1333,21 @@ async def handle_message_async(update: Update):
     if _is_empire_intent(user_text):
         profile_check = await get_user_profile_data(user_id)
         if not profile_check.get("logto_id"):
+            _empire_resp = (
+                "🌍 Sounds like you want to set up your Empire AI account! "
+                "Told user to say yes or tap /link to get started."
+            )
             await send_text_chunks(chat.id, (
                 "🌍 Sounds like you want to set up your <b>Empire AI account</b>!\n\n"
                 "This links your Telegram to the Empire AI web app — so when it launches, "
                 "AIM will remember everything you\'ve told me here.\n\n"
                 "Want me to send you the link? Just say <b>yes</b> or tap /link anytime. 🇳🇬"
             ), reply_to=message_id)
-            return
-        await _handle_link_command(user_id, chat.id, message_id)
+        else:
+            _empire_resp = "Showed user their already-linked Empire account."
+            await _handle_link_command(user_id, chat.id, message_id)
+        await save_chat_memory(user_id, username, user_text, _empire_resp, chat_type, "general")
+        await update_user_profile(user_id, username, "general")
         return
 
     if chat_type in ("group", "supergroup"):
@@ -1308,7 +1363,7 @@ async def handle_message_async(update: Update):
         user_text = re.sub(r'@askaimbot', '', user_text, flags=re.IGNORECASE).strip()
 
     try:
-        session_summary                          = await get_session_summary(user_id)
+        session_summary                            = await get_session_summary(user_id)
         recent_history, older_context, gap_seconds = await get_conversation_context(user_id, user_text)
         web_context = ""
 
@@ -1375,6 +1430,24 @@ async def handle_message_async(update: Update):
                         ts = f"{mins}m {secs}s" if mins else f"{secs}s"
                         answer = re.sub(r'\[STOPWATCH:STOP\]','',answer,flags=re.IGNORECASE).strip() + f"\n\n_⏱️ Stopped! Time: {ts}_"
 
+            # ── CODE FILE HANDLER ──
+            code_match = re.search(r'\[CODE_FILE:(\w+)\|(.*?)\]', answer, re.IGNORECASE | re.DOTALL)
+            if code_match:
+                file_ext     = code_match.group(1).strip().lower()
+                code_content = code_match.group(2).strip()
+                ext_map = {"py":"python","js":"javascript","ts":"typescript","html":"html","css":"css","json":"json","sh":"bash","sql":"sql","java":"java","cpp":"c++","c":"c","rb":"ruby","go":"go","rs":"rust","swift":"swift","kt":"kotlin","php":"php","r":"r","md":"markdown"}
+                if file_ext in ext_map:
+                    await send_text_chunks(chat.id, f"💾 Generating {ext_map[file_ext]} file...", reply_to=message_id)
+                    try:
+                        from io import BytesIO as _BIO
+                        code_file = _BIO(code_content.encode("utf-8"))
+                        code_file.name = f"aim_code.{file_ext}"
+                        await bot.send_document(chat_id=chat.id, document=code_file, filename=code_file.name, caption=f"💾 {ext_map[file_ext].title()} file by AIM", reply_to_message_id=message_id)
+                        answer = f"✅ Here is your {ext_map[file_ext]} file!"
+                    except Exception as _ce:
+                        logger.error("Code file send error: %s", _ce)
+                answer = re.sub(r'\[CODE_FILE:\w+\|.*?\]', '', answer, flags=re.IGNORECASE | re.DOTALL).strip()
+
             img_match = re.search(r'\[NEBULAE_IMAGE:\s*(.+?)\]', answer, re.IGNORECASE)
             if img_match:
                 img_prompt = img_match.group(1).strip()
@@ -1385,7 +1458,7 @@ async def handle_message_async(update: Update):
                         await bot.send_photo(chat_id=chat.id, photo=img_bytes, caption="✨ Generated by Nebulae", reply_to_message_id=message_id)
                         answer = "✅ Here is your image!"
                     except Exception: answer = "❌ Image failed to send."
-                else: answer = "❌ Nebulae couldn't generate the image."
+                else: answer = "❌ Nebulae couldn\'t generate the image."
                 answer = re.sub(r'\[NEBULAE_IMAGE:.*?\]', '', answer, flags=re.IGNORECASE).strip()
 
             audio_match = re.search(r'\[NEBULAE_AUDIO:\s*(.+?)\]', answer, re.IGNORECASE)
@@ -1403,7 +1476,7 @@ async def handle_message_async(update: Update):
                     except Exception as _ae:
                         logger.error("Audio send error: %s", _ae)
                         answer = "❌ Audio failed to send."
-                else: answer = "❌ Nebulae couldn't generate the audio."
+                else: answer = "❌ Nebulae couldn\'t generate the audio."
                 answer = re.sub(r'\[NEBULAE_AUDIO:.*?\]', '', answer, flags=re.IGNORECASE).strip()
 
             pdf_match = re.search(r'\[NEBULAE_PDF:\s*([^\|]+)\|(.*?)\]', answer, re.IGNORECASE | re.DOTALL)
@@ -1417,19 +1490,19 @@ async def handle_message_async(update: Update):
                         from io import BytesIO as _BIO
                         pdf_file = _BIO(pdf_bytes)
                         pdf_file.name = f"{pdf_title.replace(' ','_')}.pdf"
-                        await bot.send_document(chat_id=chat.id, document=pdf_file, filename=f"{pdf_title.replace(' ','_')}.pdf", caption=f"📄 {pdf_title}", reply_to_message_id=message_id)
+                        await bot.send_document(chat_id=chat.id, document=pdf_file, filename=pdf_file.name, caption=f"📄 {pdf_title}", reply_to_message_id=message_id)
                         answer = "✅ Here is your PDF!"
                     except Exception as _pe:
                         logger.error("PDF send error: %s", _pe)
                         answer = "❌ PDF failed to send."
-                else: answer = "❌ Nebulae couldn't generate the PDF."
+                else: answer = "❌ Nebulae couldn\'t generate the PDF."
                 answer = re.sub(r'\[NEBULAE_PDF:.*?\]', '', answer, flags=re.IGNORECASE | re.DOTALL).strip()
 
             final_answer = answer
             break
 
         if final_answer is None:
-            final_answer = "I tried searching but couldn't find results."
+            final_answer = "I tried searching but couldn\'t find results."
 
         await send_text_chunks(chat.id, final_answer, reply_to=message_id)
         topic = await extract_topic(user_text, final_answer)
@@ -1516,6 +1589,23 @@ def auth_callback():
         logger.error("Supabase link error: %s", e)
         run_async(bot.send_message(chat_id=chat_id, text="⚠️ Login verified but we couldn't save your link. Please try /link again."))
         return _html_page("❌ Database Error", "<p>We couldn't save your account link. Please try again.</p>", success=False), 500
+
+    # ── Dual-write to Empire Supabase (identity store) ──
+    _emp_url = os.environ.get("EMPIRE_SUPABASE_URL", "")
+    _emp_key = os.environ.get("EMPIRE_SUPABASE_KEY", "")
+    if _emp_url and _emp_key:
+        try:
+            _emp_sb = create_client(_emp_url, _emp_key)
+            _emp_sb.table("empire_users").upsert({
+                "logto_id":      logto_sub,
+                "telegram_id":   telegram_user_id,
+                "email":         logto_email,
+                "name":          logto_name,
+                "signup_method": "telegram_link",
+            }, on_conflict="logto_id").execute()
+            logger.info("✅ Empire Supabase updated for logto_id=%s", logto_sub)
+        except Exception as _ee:
+            logger.error("⚠️ Empire Supabase write failed (non-fatal): %s", _ee)
 
     display = logto_name or logto_email or "there"
     run_async(bot.send_message(
