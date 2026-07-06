@@ -892,7 +892,7 @@ I'm your personal AI assistant built for Africans, by Africans. Here's what I ca
 • "Daily bible verse" or "Word of the day"
 
 <b>🎨 Creative Tools</b>
-• Generate images, audio, PDFs
+• Generate images, audio, PDFs, and code files
 • Analyze photos and documents
 
 <b>🎙️ Voice Support</b>
@@ -1294,14 +1294,17 @@ async def handle_message_async(update: Update):
     if user_text.startswith("/"):
         cmd_handled = await handle_bot_command(user_id, chat.id, message_id, user_text)
         if cmd_handled:
-            # Save command to memory so AIM always remembers what was asked
-            try:
-                cmd_response = f"[Command handled: {user_text.split()[0]}]"
-                topic = "tech" if user_text.lower().startswith("/admin") else "general"
-                await save_chat_memory(user_id, username, user_text, cmd_response, chat_type, topic)
-                await update_user_profile(user_id, username, topic)
-            except Exception as _me:
-                logger.error("Failed to save command to memory: %s", _me)
+            # NOTE: /admin commands save their OWN memory entries inside
+            # admin.py (with the real question + real answer), so AIM
+            # actually remembers what it was asked to do. We skip the
+            # generic placeholder save here to avoid double / low-value entries.
+            if not user_text.lower().strip().startswith("/admin"):
+                try:
+                    cmd_response = f"[Command handled: {user_text.split()[0]}]"
+                    await save_chat_memory(user_id, username, user_text, cmd_response, chat_type, "general")
+                    await update_user_profile(user_id, username, "general")
+                except Exception as _me:
+                    logger.error("Failed to save command to memory: %s", _me)
             return
 
     profile = await get_user_profile_data(user_id)
@@ -1317,6 +1320,21 @@ async def handle_message_async(update: Update):
         await send_text_chunks(chat.id, result, reply_to=message_id)
         await save_chat_memory(user_id, username, user_text, result[:500], chat_type, "general")
         await update_user_profile(user_id, username, "general")
+        return
+
+    # ── Music generation intercept ──
+    # AIM/Nebulae cannot generate music. Catch this BEFORE the AI call so
+    # we never accidentally route a "make me a song" request through the
+    # TTS (spoken word) pipeline.
+    if nebulae.is_music_generation_request(user_text):
+        _music_resp = (
+            "🎵 I can't generate music yet — Nebulae only handles spoken "
+            "audio (text-to-speech), not composed music or singing. "
+            "I can still write you lyrics, or read text aloud for you!"
+        )
+        await send_text_chunks(chat.id, _music_resp, reply_to=message_id)
+        await save_chat_memory(user_id, username, user_text, _music_resp, chat_type, "entertainment")
+        await update_user_profile(user_id, username, "entertainment")
         return
 
     if await handle_task_message(user_text, user_id, chat.id, message_id):
@@ -1431,11 +1449,19 @@ async def handle_message_async(update: Update):
                         answer = re.sub(r'\[STOPWATCH:STOP\]','',answer,flags=re.IGNORECASE).strip() + f"\n\n_⏱️ Stopped! Time: {ts}_"
 
             # ── CODE FILE HANDLER ──
-            code_match = re.search(r'\[CODE_FILE:(\w+)\|(.*?)\]', answer, re.IGNORECASE | re.DOTALL)
+            # Uses an explicit closing tag [/CODE_FILE] instead of matching up to
+            # the next "]" — code almost always contains "]" characters itself
+            # (lists, array indexing, JSON, etc.), so a naive non-greedy match up
+            # to the first "]" would truncate the file. The explicit closing tag
+            # fixes that.
+            code_match = re.search(
+                r'\[CODE_FILE:(\w+)\|(.*?)\]\[/CODE_FILE\]',
+                answer, re.IGNORECASE | re.DOTALL
+            )
             if code_match:
                 file_ext     = code_match.group(1).strip().lower()
                 code_content = code_match.group(2).strip()
-                ext_map = {"py":"python","js":"javascript","ts":"typescript","html":"html","css":"css","json":"json","sh":"bash","sql":"sql","java":"java","cpp":"c++","c":"c","rb":"ruby","go":"go","rs":"rust","swift":"swift","kt":"kotlin","php":"php","r":"r","md":"markdown"}
+                ext_map = {"py":"python","js":"javascript","ts":"typescript","jsx":"javascript","tsx":"typescript","html":"html","css":"css","json":"json","sh":"bash","sql":"sql","java":"java","cpp":"c++","c":"c","rb":"ruby","go":"go","rs":"rust","swift":"swift","kt":"kotlin","php":"php","r":"r","md":"markdown","yml":"yaml","yaml":"yaml","xml":"xml","txt":"text"}
                 if file_ext in ext_map:
                     await send_text_chunks(chat.id, f"💾 Generating {ext_map[file_ext]} file...", reply_to=message_id)
                     try:
@@ -1446,7 +1472,8 @@ async def handle_message_async(update: Update):
                         answer = f"✅ Here is your {ext_map[file_ext]} file!"
                     except Exception as _ce:
                         logger.error("Code file send error: %s", _ce)
-                answer = re.sub(r'\[CODE_FILE:\w+\|.*?\]', '', answer, flags=re.IGNORECASE | re.DOTALL).strip()
+                        answer = "❌ Couldn't send the code file — here it is inline instead:\n\n" + code_content[:3500]
+                answer = re.sub(r'\[CODE_FILE:\w+\|.*?\]\[/CODE_FILE\]', '', answer, flags=re.IGNORECASE | re.DOTALL).strip()
 
             img_match = re.search(r'\[NEBULAE_IMAGE:\s*(.+?)\]', answer, re.IGNORECASE)
             if img_match:

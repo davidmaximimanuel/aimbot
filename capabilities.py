@@ -3,9 +3,7 @@ capabilities.py — Semantic Search Routing
 """
 import numpy as np
 from sentence_transformers import SentenceTransformer
-
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-
 SEARCH_TRIGGER_PHRASES = [
     "who won the match", "what is the score", "latest news about", "current events",
     "what happened today", "search for information", "look up", "find out about",
@@ -38,9 +36,7 @@ SEARCH_TRIGGER_PHRASES = [
     "nigerian government", "nigerian politics", "tinubu", "lagos news", "abuja news",
     "nigeria economy", "nigeria inflation", "nigeria election", "nigeria insecurity",
 ]
-
 trigger_embeddings = semantic_model.encode(SEARCH_TRIGGER_PHRASES)
-
 def is_search_query_semantic(text: str, threshold: float = 0.45) -> bool:
     try:
         sims = np.dot(trigger_embeddings, semantic_model.encode([text]).T).flatten()
@@ -49,7 +45,6 @@ def is_search_query_semantic(text: str, threshold: float = 0.45) -> bool:
         return result
     except Exception:
         return False
-
 def is_search_query(text: str) -> bool:
     tl = text.lower().strip()
     if any(t in tl for t in ["search for","google","look up","find out","search the web","browse","search"]):

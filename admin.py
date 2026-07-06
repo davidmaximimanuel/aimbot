@@ -120,6 +120,21 @@ def get_server_metrics() -> str:
     )
 
 
+async def _remember(save_chat_memory, user_id: str, user_text: str, response_text: str):
+    """
+    Saves the REAL admin interaction (actual question asked + actual answer
+    given) to chat_memory, so AIM genuinely remembers what an admin asked it
+    to do and what it did — instead of a generic "[Command handled]" stub.
+    Silently no-ops if save_chat_memory wasn't passed in (backward compat).
+    """
+    if not save_chat_memory:
+        return
+    try:
+        await save_chat_memory(user_id, "", user_text, response_text, "private", "tech")
+    except Exception as e:
+        logger.error("Admin memory save failed: %s", e)
+
+
 async def handle_admin_command(
     user_id: str,
     chat_id: int,
@@ -129,6 +144,8 @@ async def handle_admin_command(
     get_ai_response,   # kept for backward compat — no longer used internally
     send_text_chunks,
     USE_DEEPSEEK: bool,
+    bot=None,                 # accepted for future use / parity with call site
+    save_chat_memory=None,    # NEW: lets admin actions save real memory entries
 ) -> bool:
     """
     Handles all /admin subcommands.
@@ -138,6 +155,13 @@ async def handle_admin_command(
     NOTE: get_ai_response is intentionally no longer called here.
     The analyze command now calls the AI client directly so it gets a clean
     response without the user-chat prompt overhead (history, profile, etc.).
+
+    NOTE 2: bot and save_chat_memory are accepted here because aimbot.py calls
+    this function with those as keyword args. Previously this signature did
+    NOT accept them, which meant every /admin command crashed with a
+    TypeError before even reaching the logic below — this is now fixed.
+    save_chat_memory lets each branch persist the real Q&A to chat_memory so
+    AIM actually remembers admin interactions instead of a generic stub.
     """
     if not is_admin(user_id):
         await send_text_chunks(chat_id, "❌ Access Denied.", reply_to=message_id)
@@ -178,30 +202,39 @@ async def handle_admin_command(
                 f"👑 Admins: {len(ADMIN_IDS)}"
             )
             await send_text_chunks(chat_id, msg, reply_to=message_id)
+            await _remember(save_chat_memory, user_id, user_text, msg)
         except Exception as e:
-            await send_text_chunks(chat_id, f"❌ Error: {e}", reply_to=message_id)
+            err = f"❌ Error: {e}"
+            await send_text_chunks(chat_id, err, reply_to=message_id)
+            await _remember(save_chat_memory, user_id, user_text, err)
 
     # ── list ───────────────────────────────────────────────
     elif action == "list":
         admins_list = "\n".join(f"👑 {aid}" for aid in ADMIN_IDS) or "No admins loaded."
-        await send_text_chunks(chat_id, f"<b>Current Admins:</b>\n{admins_list}", reply_to=message_id)
+        msg = f"<b>Current Admins:</b>\n{admins_list}"
+        await send_text_chunks(chat_id, msg, reply_to=message_id)
+        await _remember(save_chat_memory, user_id, user_text, msg)
 
     # ── reload ─────────────────────────────────────────────
     elif action == "reload":
         load_admins(supabase)
-        await send_text_chunks(chat_id, f"🔄 Admin list reloaded. {len(ADMIN_IDS)} admin(s) active.", reply_to=message_id)
+        msg = f"🔄 Admin list reloaded. {len(ADMIN_IDS)} admin(s) active."
+        await send_text_chunks(chat_id, msg, reply_to=message_id)
+        await _remember(save_chat_memory, user_id, user_text, msg)
 
     # ── server ─────────────────────────────────────────────
     elif action == "server":
-        await send_text_chunks(chat_id, get_server_metrics(), reply_to=message_id)
+        msg = get_server_metrics()
+        await send_text_chunks(chat_id, msg, reply_to=message_id)
+        await _remember(save_chat_memory, user_id, user_text, msg)
 
-    # ── read [file] ────────────────────────────────────────
-    # FIX: was `action.startswith("read ")` which is always False because
-    # action is just the single word "read" (split into parts[1]).
+    # ── files ────────────────────────────────────────────
     elif action == "files":
         files_list = list_project_files(supabase)
         await send_text_chunks(chat_id, files_list, reply_to=message_id)
+        await _remember(save_chat_memory, user_id, user_text, files_list)
 
+    # ── read [file] ────────────────────────────────────────
     elif action == "read":
         target    = filename or "aimbot.py"
         content   = read_file_safely(target, supabase)
@@ -210,7 +243,9 @@ async def handle_admin_command(
         header    = f"📄 <b>File: {target}</b>"
         if truncated:
             header += f"\n<i>(truncated — file is longer than 3800 chars)</i>"
-        await send_text_chunks(chat_id, f"{header}\n\n<pre>{display}</pre>", reply_to=message_id)
+        full_msg = f"{header}\n\n<pre>{display}</pre>"
+        await send_text_chunks(chat_id, full_msg, reply_to=message_id)
+        await _remember(save_chat_memory, user_id, user_text, f"Read file: {target} ({len(content)} chars, truncated={truncated})")
 
     # ── analyze [file] ─────────────────────────────────────
     elif action == "analyze":
@@ -220,6 +255,7 @@ async def handle_admin_command(
         content = read_file_safely(target, supabase)
         if content.startswith("❌"):
             await send_text_chunks(chat_id, content, reply_to=message_id)
+            await _remember(save_chat_memory, user_id, user_text, content)
             return True
 
         await send_text_chunks(chat_id, f"🔍 Analyzing <b>{target}</b>...", reply_to=message_id)
@@ -266,17 +302,23 @@ async def handle_admin_command(
         except Exception as _e:
             # ✅ Bug 3 fix: show the REAL error instead of a generic message
             logger.error("❌ Admin analyze error: %s", _e)
-            await send_text_chunks(chat_id, f"❌ AI call failed: <code>{_e}</code>", reply_to=message_id)
+            err_msg = f"❌ AI call failed: <code>{_e}</code>"
+            await send_text_chunks(chat_id, err_msg, reply_to=message_id)
+            await _remember(save_chat_memory, user_id, user_text, err_msg)
             return True
 
         if analysis:
-            await send_text_chunks(chat_id, f"📊 <b>Analysis: {target}</b>\n\n{analysis}", reply_to=message_id)
+            full_msg = f"📊 <b>Analysis: {target}</b>\n\n{analysis}"
+            await send_text_chunks(chat_id, full_msg, reply_to=message_id)
+            await _remember(save_chat_memory, user_id, user_text, full_msg)
         else:
-            await send_text_chunks(chat_id, "❌ AI returned an empty response. Check your API key env vars.", reply_to=message_id)
+            err_msg = "❌ AI returned an empty response. Check your API key env vars."
+            await send_text_chunks(chat_id, err_msg, reply_to=message_id)
+            await _remember(save_chat_memory, user_id, user_text, err_msg)
 
     # ── help / unknown ─────────────────────────────────────
     else:
-        await send_text_chunks(chat_id, (
+        help_msg = (
             "<b>👑 Admin Commands:</b>\n\n"
             "/admin stats — User & message counts\n"
             "/admin server — Server health & uptime\n"
@@ -286,6 +328,8 @@ async def handle_admin_command(
             "/admin read [file] — Read a project file\n"
             "/admin analyze [file] — AI analysis of a file\n\n"
             "<i>Default file for read/analyze: aimbot.py</i>"
-        ), reply_to=message_id)
+        )
+        await send_text_chunks(chat_id, help_msg, reply_to=message_id)
+        await _remember(save_chat_memory, user_id, user_text, help_msg)
 
     return True

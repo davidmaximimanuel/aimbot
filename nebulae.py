@@ -35,6 +35,18 @@ if OPENAI_API_KEY:
 else:
     logger.warning("⚠️ Nebulae: OPENAI_API_KEY not set — TTS uses Edge-TTS, Image Gen uses Pollinations")
 
+# Model choice notes (as of mid-2026):
+#   Image gen : gpt-image-1.5 is OpenAI's current flagship image model with the
+#               best quality/price balance — gpt-image-1 is being deprecated
+#               (Oct 23, 2026), and gpt-image-1-mini trades quality for cost.
+#               "medium" quality tier keeps cost reasonable without giving up
+#               much fidelity.
+#   TTS       : gpt-4o-mini-tts is OpenAI's current best value TTS model
+#               (natural, steerable prosody, ~$0.015/min of audio).
+OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1.5")
+OPENAI_IMAGE_QUALITY = os.environ.get("OPENAI_IMAGE_QUALITY", "medium")
+OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+
 # ════════════════════════════════════════
 # 1. VISION (Analyze Images)
 # ════════════════════════════════════════
@@ -59,27 +71,32 @@ async def analyze_image(image_bytes: bytes, prompt: str = "Describe this image i
 
 
 # ════════════════════════════════════════
-# 2. IMAGE GENERATION (Free via Pollinations)
+# 2. IMAGE GENERATION
 # ════════════════════════════════════════
 async def generate_image(prompt: str, width: int = 1024, height: int = 1024) -> Optional[bytes]:
-    """Generates an image. Uses OpenAI DALL-E 3 if key is set, else Pollinations (free)."""
-    # ── OpenAI DALL-E 3 (paid, higher quality) ──────────────
+    """Generates an image. Uses OpenAI GPT Image 1.5 if key is set, else Pollinations (free)."""
+    # ── OpenAI GPT Image 1.5 (best quality/price balance) ───
+    # NOTE: GPT Image models (gpt-image-1, gpt-image-1.5, gpt-image-2, ...)
+    # ALWAYS return base64 JSON — they do not support response_format="url"
+    # and never populate response.data[0].url. (Only legacy dall-e-2/3 do.)
+    # Decoding b64_json directly is required here.
     if _openai_client:
         try:
-            logger.info("Nebulae: Generating image via DALL-E 3: %s", prompt[:50])
+            import base64 as _b64
+            logger.info("Nebulae: Generating image via %s (%s): %s", OPENAI_IMAGE_MODEL, OPENAI_IMAGE_QUALITY, prompt[:50])
             response = await _openai_client.images.generate(
-                model="gpt-image-1",
+                model=OPENAI_IMAGE_MODEL,
                 prompt=prompt,
                 size="1024x1024",
+                quality=OPENAI_IMAGE_QUALITY,
                 n=1,
             )
-            image_url = response.data[0].url
-            img_resp  = requests.get(image_url, timeout=30)
-            if img_resp.status_code == 200:
-                return img_resp.content
-            logger.error("Nebulae DALL-E 3: failed to download image")
+            b64_data = response.data[0].b64_json if response.data else None
+            if b64_data:
+                return _b64.b64decode(b64_data)
+            logger.error("Nebulae %s: no b64_json in response", OPENAI_IMAGE_MODEL)
         except Exception as e:
-            logger.error("Nebulae DALL-E 3 error: %s — falling back to Pollinations", e)
+            logger.error("Nebulae %s error: %s — falling back to Pollinations", OPENAI_IMAGE_MODEL, e)
 
     # ── Pollinations fallback (free) ─────────────────────────
     try:
@@ -97,7 +114,7 @@ async def generate_image(prompt: str, width: int = 1024, height: int = 1024) -> 
 
 
 # ════════════════════════════════════════
-# 3. AUDIO / TEXT-TO-SPEECH (Free via Edge-TTS)
+# 3. AUDIO / TEXT-TO-SPEECH
 # ════════════════════════════════════════
 async def generate_audio(text: str, voice: str = "alloy") -> Optional[bytes]:
     """Converts text to speech. Uses OpenAI TTS if key is set, else Edge-TTS (free).
@@ -107,12 +124,12 @@ async def generate_audio(text: str, voice: str = "alloy") -> Optional[bytes]:
     if not text:
         return None
 
-    # ── OpenAI TTS (paid, natural quality) ──────────────────
+    # ── OpenAI TTS (gpt-4o-mini-tts — best value/quality) ────
     if _openai_client:
         try:
-            logger.info("Nebulae: TTS via OpenAI (voice=%s), %d chars", voice, len(text))
+            logger.info("Nebulae: TTS via OpenAI %s (voice=%s), %d chars", OPENAI_TTS_MODEL, voice, len(text))
             response = await _openai_client.audio.speech.create(
-                model="gpt-4o-mini-tts",  # Best quality/price balance
+                model=OPENAI_TTS_MODEL,
                 voice=voice,
                 input=text,
                 response_format="mp3",
@@ -278,6 +295,29 @@ def is_audio_request(text: str) -> bool:
     t = text.lower()
     keywords = ["read this out loud", "say this", "convert to audio", "make an audio", "text to speech"]
     return any(kw in t for kw in keywords)
+
+def is_music_generation_request(text: str) -> bool:
+    """
+    Detects requests to generate MUSIC/SONGS/BEATS (which Nebulae cannot do —
+    it only has spoken text-to-speech), as opposed to requests to simply read
+    text aloud (which is_audio_request already covers).
+    """
+    t = text.lower()
+    # Reading text aloud is fine — don't misfire on those.
+    if is_audio_request(t):
+        return False
+    keywords = [
+        "make me a song", "make a song", "create a song", "generate a song",
+        "compose a song", "write and sing", "sing me a song", "sing a song",
+        "make music", "create music", "generate music", "compose music",
+        "make a beat", "create a beat", "generate a beat", "produce a beat",
+        "make an instrumental", "create an instrumental", "compose a melody",
+        "generate a melody", "make a jingle", "compose a jingle",
+        "produce a track", "make a track for me", "write me a song and sing",
+        "can you sing", "can you make music", "can you produce music",
+    ]
+    return any(kw in t for kw in keywords)
+
 
 # ═══════════════════════════════════════════════════════════
 # LOGO RECOGNITION
