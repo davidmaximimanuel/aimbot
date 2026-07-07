@@ -24,7 +24,8 @@ import nebulae
 from telegram import InputMediaPhoto, InputMediaAudio, InputMediaDocument
 from flask import Flask, request, jsonify, redirect
 from telegram import (
-    Update, Bot, InlineQueryResultArticle, InputTextMessageContent
+    Update, Bot, InlineQueryResultArticle, InputTextMessageContent,
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from telegram.constants import ParseMode
 from supabase import create_client, Client
@@ -607,6 +608,106 @@ async def get_user_profile_data(user_id: str) -> dict:
         logger.error("Profile fetch error: %s", e)
         return {}
 
+# ═══════════════════════════════════════════════════════════
+# PENDING ACTIONS — lightweight multi-turn state (stored in
+# Supabase, not memory, so it survives across workers/restarts)
+# Requires a table: user_pending_actions(user_id text primary key,
+# action_type text, payload jsonb default '{}', created_at timestamptz)
+# ═══════════════════════════════════════════════════════════
+async def set_pending_action(user_id: str, action_type: str, payload: dict = None):
+    if not supabase: return
+    try:
+        supabase.table("user_pending_actions").upsert({
+            "user_id": str(user_id),
+            "action_type": action_type,
+            "payload": payload or {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        logger.error("set_pending_action error: %s", e)
+
+async def get_pending_action(user_id: str) -> Optional[dict]:
+    if not supabase: return None
+    try:
+        res = supabase.table("user_pending_actions").select("*").eq("user_id", str(user_id)).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.error("get_pending_action error: %s", e)
+        return None
+
+async def clear_pending_action(user_id: str):
+    if not supabase: return
+    try:
+        supabase.table("user_pending_actions").delete().eq("user_id", str(user_id)).execute()
+    except Exception as e:
+        logger.error("clear_pending_action error: %s", e)
+
+# ═══════════════════════════════════════════════════════════
+# DELETE — table map + classifier (any-language free text) + executor
+# ═══════════════════════════════════════════════════════════
+DELETE_TABLE_MAP = {
+    "profile": ["user_profiles"],
+    "memory":  ["chat_memory"],
+    "tasks":   ["user_tasks", "user_tools"],
+    "all":     ["chat_memory", "user_tasks", "user_tools", "user_profiles"],
+}
+DELETE_LABELS = {
+    "profile": "your profile, preferences & Empire ID link",
+    "memory":  "your chat memory",
+    "tasks":   "your tasks & reminders",
+    "all":     "ALL your data",
+}
+
+async def classify_delete_intent(text: str) -> str:
+    """Classifies a free-typed delete request, in ANY language, into one
+    of PROFILE / MEMORY / TASKS / ALL / CANCEL using the raw LLM client
+    directly (bypassing the AIM persona so we get a clean single word)."""
+    sys_prompt = (
+        "You classify what a user wants deleted from their bot account. "
+        "Reply with ONE WORD ONLY, no punctuation, no explanation: "
+        "PROFILE, MEMORY, TASKS, ALL, or CANCEL.\n"
+        "PROFILE = profile/preferences/account link. MEMORY = chat history/memory. "
+        "TASKS = reminders/timers/scheduled tasks. ALL = everything. "
+        "CANCEL = user does not want to delete anything / changed their mind."
+    )
+    try:
+        word = ""
+        if USE_DEEPSEEK and deepseek_client:
+            r = await deepseek_client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": text}],
+                temperature=0.0, max_tokens=10,
+            )
+            word = (r.choices[0].message.content or "").strip().upper() if r.choices else ""
+        elif gemini_client:
+            r = gemini_client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[types.Content(role="user", parts=[types.Part(text=f"{sys_prompt}\n\nUser: {text}")])],
+                config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=10),
+            )
+            word = (r.text or "").strip().upper() if r and r.text else ""
+        for key in ("PROFILE", "MEMORY", "TASKS", "ALL", "CANCEL"):
+            if key in word:
+                return key.lower()
+    except Exception as e:
+        logger.error("classify_delete_intent error: %s", e)
+    return "unknown"
+
+async def execute_delete(user_id: str, choice: str) -> str:
+    if choice not in DELETE_TABLE_MAP:
+        return "❌ I didn't catch which one you meant — try /delete again."
+    if not supabase:
+        return "❌ Cannot delete — database offline."
+    try:
+        uid_str = str(user_id)
+        for table in DELETE_TABLE_MAP[choice]:
+            supabase.table(table).delete().eq("user_id", uid_str).execute()
+        logger.info("🗑️ User %s deleted: %s", uid_str, choice)
+        return f"✅ Deleted {DELETE_LABELS[choice]}."
+    except Exception as e:
+        logger.error("Delete error (%s): %s", choice, e)
+        return "❌ Something went wrong during deletion. Please try again."
+
 async def get_session_summary(user_id: str) -> str:
     if not supabase: return ""
     try:
@@ -1024,6 +1125,25 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
         await send_text_chunks(chat_id, await create_task_in_db(user_id, task_data), reply_to=message_id)
         return True
 
+    # ── BARE /news, /verse, /word (no args) — previously fell through
+    # silently to the general AI chat handler, which correctly said it
+    # couldn't schedule anything on its own. Now we ask for a time and
+    # pick it up via the pending-action check in handle_message_async. ──
+    elif tl == "/news":
+        await set_pending_action(user_id, "awaiting_recurring_time", {"category": "news"})
+        await send_text_chunks(chat_id, "🕒 What time should I send your daily news? (e.g. 8am, 6pm)", reply_to=message_id)
+        return True
+
+    elif tl == "/verse":
+        await set_pending_action(user_id, "awaiting_recurring_time", {"category": "verse"})
+        await send_text_chunks(chat_id, "🕒 What time should I send your daily verse? (e.g. 8am — default is 8am if you skip this)", reply_to=message_id)
+        return True
+
+    elif tl == "/word":
+        await set_pending_action(user_id, "awaiting_recurring_time", {"category": "word"})
+        await send_text_chunks(chat_id, "🕒 What time should I send your word of the day? (e.g. 9am — default is 9am if you skip this)", reply_to=message_id)
+        return True
+
     elif tl == "/claim":
         profile     = await get_user_profile_data(user_id)
         existing_id = profile.get("empire_id")
@@ -1040,36 +1160,28 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
         return True
 
     elif tl == "/delete":
-        # Ask for confirmation first
-        await send_text_chunks(chat_id, (
-            "⚠️ <b>Delete Your Data</b>\n\n"
-            "This will permanently delete ALL your:\n"
-            "• Chat history and memories\n"
-            "• Tasks and reminders\n"
-            "• Profile and preferences\n\n"
-            "Type <b>YES DELETE MY DATA</b> to confirm, or anything else to cancel."
-        ), reply_to=message_id)
-        return True
-
-    elif user_text.strip() == "YES DELETE MY DATA":
-        if not supabase:
-            await send_text_chunks(chat_id, "❌ Cannot delete — database offline.", reply_to=message_id)
-            return True
-        try:
-            uid_str = str(user_id)
-            supabase.table("chat_memory").delete().eq("user_id", uid_str).execute()
-            supabase.table("user_tasks").delete().eq("user_id", uid_str).execute()
-            supabase.table("user_tools").delete().eq("user_id", uid_str).execute()
-            supabase.table("user_profiles").delete().eq("user_id", uid_str).execute()
-            logger.info("🗑️ User %s deleted all their data", uid_str)
-            await send_text_chunks(chat_id, (
-                "✅ <b>All your data has been deleted.</b>\n\n"
-                "Your chat history, tasks, and profile have been permanently removed from our servers. "
-                "If you ever want to start fresh, just send me a message. 🌍"
-            ), reply_to=message_id)
-        except Exception as e:
-            logger.error("Delete user data error: %s", e)
-            await send_text_chunks(chat_id, "❌ Something went wrong during deletion. Please try again.", reply_to=message_id)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👤 Profile & preferences", callback_data="del:profile")],
+            [InlineKeyboardButton("🧠 Chat memory", callback_data="del:memory")],
+            [InlineKeyboardButton("📋 Tasks & reminders", callback_data="del:tasks")],
+            [InlineKeyboardButton("🗑️ Everything (ALL)", callback_data="del:all")],
+        ])
+        await set_pending_action(user_id, "delete_choice")
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ <b>Delete Your Data</b>\n\n"
+                "What would you like to delete?\n"
+                "• <b>Profile & preferences</b> — saved preferences, language, Empire ID link\n"
+                "• <b>Chat memory</b> — everything AIM remembers from your conversations\n"
+                "• <b>Tasks & reminders</b> — timers, stopwatches, scheduled tasks\n"
+                "• <b>Everything</b> — all of the above\n\n"
+                "Tap a button below, or just type what you want deleted — any language works."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            reply_to_message_id=message_id,
+        )
         return True
 
     # ── ADMIN COMMANDS — delegated entirely to admin.py ──────
@@ -1085,6 +1197,27 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
 # ═══════════════════════════════════════════════════════════
 # INLINE QUERY
 # ═══════════════════════════════════════════════════════════
+async def handle_callback_query_async(cb):
+    """Handles taps on inline keyboard buttons (currently: /delete choices)."""
+    data    = cb.data or ""
+    user_id = str(cb.from_user.id) if cb.from_user else ""
+    chat_id = cb.message.chat.id if cb.message else None
+    try:
+        await bot.answer_callback_query(cb.id)  # stop the loading spinner
+    except Exception as e:
+        logger.error("answer_callback_query error: %s", e)
+
+    if data.startswith("del:") and user_id and chat_id:
+        choice = data.split(":", 1)[1]
+        result = await execute_delete(user_id, choice)
+        await clear_pending_action(user_id)
+        await send_text_chunks(chat_id, result)
+        try:
+            if cb.message:
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=cb.message.message_id, reply_markup=None)
+        except Exception:
+            pass  # non-fatal — buttons just stay visible if this fails
+
 async def handle_inline_query_async(inline_query):
     qid, qtext = inline_query.id, inline_query.query.strip()
     uid = str(inline_query.from_user.id) if inline_query.from_user else ""
@@ -1291,7 +1424,52 @@ async def handle_message_async(update: Update):
     username = user.username or user.first_name or "User"
     logger.info("📩 [%s/%s] '%s'", user_id, chat_type, user_text[:80])
 
+    # ── PENDING ACTION CHECK — free-text follow-ups to /delete or bare
+    # /news, /verse, /word. A new "/" command always takes priority and
+    # silently cancels whatever was pending. ──
+    if not user_text.startswith("/"):
+        pending = await get_pending_action(user_id)
+        if pending:
+            action_type = pending.get("action_type")
+            payload     = pending.get("payload") or {}
+
+            if action_type == "delete_choice":
+                choice = await classify_delete_intent(user_text)
+                await clear_pending_action(user_id)
+                if choice == "cancel":
+                    await send_text_chunks(chat.id, "👍 Okay, nothing was deleted.", reply_to=message_id)
+                elif choice in ("profile", "memory", "tasks", "all"):
+                    await send_text_chunks(chat.id, await execute_delete(user_id, choice), reply_to=message_id)
+                else:
+                    await set_pending_action(user_id, "delete_choice")  # keep waiting
+                    await send_text_chunks(chat.id, "❓ Sorry, I couldn't tell what you want deleted — try tapping a button above, or say it plainly (e.g. \"delete my memory\").", reply_to=message_id)
+                return
+
+            elif action_type == "awaiting_recurring_time":
+                category = payload.get("category", "news")
+                m = re.search(r'(\d{1,2})\s*(am|pm)?', user_text.lower())
+                if m:
+                    hour = int(m.group(1))
+                    if m.group(2) == "pm" and hour != 12: hour += 12
+                    if m.group(2) == "am" and hour == 12: hour = 0
+                    rec_time = f"{hour:02d}:00"
+                else:
+                    rec_time = {"news": "08:00", "verse": "08:00", "word": "09:00"}.get(category, "08:00")
+                desc_map = {"news": "Send me the latest news", "verse": "Daily bible verse", "word": "Word of the day"}
+                task_data = {
+                    "description": desc_map.get(category, "Daily update"), "type": "recurring",
+                    "recurrence_pattern": "daily", "recurrence_time": rec_time,
+                    "recurrence_days": [], "category": category, "needs_clarification": False,
+                }
+                await clear_pending_action(user_id)
+                await send_text_chunks(chat.id, await create_task_in_db(user_id, task_data), reply_to=message_id)
+                return
+
+            else:
+                await clear_pending_action(user_id)
+
     if user_text.startswith("/"):
+        await clear_pending_action(user_id)  # a fresh command supersedes any pending follow-up
         cmd_handled = await handle_bot_command(user_id, chat.id, message_id, user_text)
         if cmd_handled:
             # NOTE: /admin commands save their OWN memory entries inside
@@ -1565,8 +1743,9 @@ def webhook():
         uid = data.get("update_id")
         if uid and is_duplicate_update(uid): return "OK", 200
         upd = Update.de_json(data, bot)
-        if upd.inline_query: run_async(handle_inline_query_async(upd.inline_query))
-        elif upd.message:    run_async(handle_message_async(upd))
+        if upd.inline_query:      run_async(handle_inline_query_async(upd.inline_query))
+        elif upd.callback_query:  run_async(handle_callback_query_async(upd.callback_query))
+        elif upd.message:         run_async(handle_message_async(upd))
         return "OK", 200
     except Exception as e:
         logger.error("Webhook error: %s", e)
