@@ -29,6 +29,7 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from supabase import create_client, Client
+from empire_id_generator import create_empire_id as eid_create, get_user_by_logto as eid_get_by_logto
 from google import genai
 from google.genai import types
 
@@ -146,9 +147,9 @@ def exchange_logto_code(code: str) -> Optional[dict]:
         return None
 
 # ─── EMPIRE ID ───
-def generate_empire_id() -> str:
-    random_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    return f"EMP-{random_str}"
+# NOTE: Empire IDs are no longer generated here. They live in the separate
+# EmpireID Supabase project (empire_id_generator.py) and get imported in
+# via eid_create()/eid_get_by_logto() — see /auth/callback and /claim below.
 
 # ─── FILE UTILS (used by admin commands, also available here) ───
 def read_file_safely(filepath: str) -> str:
@@ -1149,14 +1150,21 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
         existing_id = profile.get("empire_id")
         if existing_id:
             await send_text_chunks(chat_id, f"👑 Your Empire ID: <b>{existing_id}</b>\n\nSave it! You'll use it to log into the Web App.", reply_to=message_id)
+        elif profile.get("logto_id"):
+            # Edge case: account is linked but empire_id wasn't saved locally — re-import it.
+            eid_record = eid_get_by_logto(profile["logto_id"])
+            if eid_record and eid_record.get("empire_id"):
+                empire_id = eid_record["empire_id"]
+                try:
+                    supabase.table("user_profiles").update({"empire_id": empire_id}).eq("user_id", str(user_id)).execute()
+                    await send_text_chunks(chat_id, f"👑 Your Empire ID: <b>{empire_id}</b>\n\nSave it! You'll use it to log into the Web App.", reply_to=message_id)
+                except Exception as e:
+                    logger.error("Failed to save re-imported Empire ID: %s", e)
+                    await send_text_chunks(chat_id, "❌ Found your Empire ID but couldn't save it — please try /claim again.", reply_to=message_id)
+            else:
+                await send_text_chunks(chat_id, "❓ Couldn't find an Empire ID for your linked account. Try /link again to reconnect.", reply_to=message_id)
         else:
-            new_id = generate_empire_id()
-            try:
-                supabase.table("user_profiles").update({"empire_id":new_id}).eq("user_id",str(user_id)).execute()
-                await send_text_chunks(chat_id, f"🎉 Empire ID created: <b>{new_id}</b>\n\n⚠️ <b>Save this.</b> You'll use it to sync Telegram memories to the web app.\n\n💡 Type /link to connect your account now!", reply_to=message_id)
-            except Exception as e:
-                logger.error("Failed to save Empire ID: %s", e)
-                await send_text_chunks(chat_id, "❌ Failed to generate Empire ID. Please try again.", reply_to=message_id)
+            await send_text_chunks(chat_id, "🆔 You don't have an Empire ID yet — it's created automatically when you sign in. Type /link to connect your account and get one!", reply_to=message_id)
         return True
 
     elif tl == "/delete":
@@ -1781,37 +1789,34 @@ def auth_callback():
     if not logto_sub:
         return _html_page("❌ No User ID", "<p>Logto did not return a user ID.</p>", success=False), 500
 
+    # ── Get/create the Empire ID from the SEPARATE EmpireID Supabase project.
+    # This is the single source of truth for Empire IDs — AIM never invents
+    # one locally, it only imports whatever this project hands back. ──
+    eid_record = eid_get_by_logto(logto_sub)
+    if eid_record:
+        empire_id = eid_record.get("empire_id")
+    else:
+        ok, result = eid_create(logto_id=logto_sub, username=logto_name, email=logto_email, source="telegram_bot")
+        if ok:
+            empire_id = result
+        elif result.startswith("✅ User already has Empire ID:"):
+            empire_id = result.split(":", 1)[1].strip()  # race: created between our check and now
+        else:
+            logger.error("Empire ID creation failed: %s", result)
+            run_async(bot.send_message(chat_id=chat_id, text="⚠️ Login verified but we couldn't set up your Empire ID. Please try /link again."))
+            return _html_page("❌ Empire ID Error", f"<p>{result}</p>", success=False), 500
+
     try:
         existing = supabase.table("user_profiles").select("*").eq("user_id", telegram_user_id).execute()
         if existing.data:
-            profile   = existing.data[0]
-            empire_id = profile.get("empire_id") or generate_empire_id()
             supabase.table("user_profiles").update({"logto_id":logto_sub,"logto_email":logto_email,"logto_name":logto_name,"empire_id":empire_id,"last_active":datetime.now(timezone.utc).isoformat()}).eq("user_id", telegram_user_id).execute()
         else:
-            empire_id = generate_empire_id()
             supabase.table("user_profiles").insert({"user_id":telegram_user_id,"username":logto_name or "","logto_id":logto_sub,"logto_email":logto_email,"logto_name":logto_name,"empire_id":empire_id,"topic_counts":{},"total_chats":0,"last_active":datetime.now(timezone.utc).isoformat()}).execute()
         logger.info("✅ Linked Telegram %s → Logto %s (Empire ID: %s)", telegram_user_id, logto_sub, empire_id)
     except Exception as e:
         logger.error("Supabase link error: %s", e)
         run_async(bot.send_message(chat_id=chat_id, text="⚠️ Login verified but we couldn't save your link. Please try /link again."))
         return _html_page("❌ Database Error", "<p>We couldn't save your account link. Please try again.</p>", success=False), 500
-
-    # ── Dual-write to Empire Supabase (identity store) ──
-    _emp_url = os.environ.get("EMPIRE_SUPABASE_URL", "")
-    _emp_key = os.environ.get("EMPIRE_SUPABASE_KEY", "")
-    if _emp_url and _emp_key:
-        try:
-            _emp_sb = create_client(_emp_url, _emp_key)
-            _emp_sb.table("empire_users").upsert({
-                "logto_id":      logto_sub,
-                "telegram_id":   telegram_user_id,
-                "email":         logto_email,
-                "name":          logto_name,
-                "signup_method": "telegram_link",
-            }, on_conflict="logto_id").execute()
-            logger.info("✅ Empire Supabase updated for logto_id=%s", logto_sub)
-        except Exception as _ee:
-            logger.error("⚠️ Empire Supabase write failed (non-fatal): %s", _ee)
 
     display = logto_name or logto_email or "there"
     run_async(bot.send_message(
