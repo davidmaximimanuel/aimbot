@@ -938,9 +938,132 @@ _EMPIRE_INTENT_PHRASES = [
     "register", "web version", "use on web", "access on web",
 ]
 
+
+_LEARNING_INTENT_PHRASES = [
+    "teach me", "i want to learn", "learn chess", "learn math", "learn language",
+    "how is my chess", "my chess progress", "chess stats", "chess score",
+    "how am i doing in chess", "chess games", "my chess games", "chess elo",
+    "play chess", "chess lesson", "chess practice", "chess training",
+    "arabic", "french", "spanish", "german", "chinese", "japanese", "korean",
+    "learn arabic", "learn french", "learn spanish", "learn chinese",
+    "math lesson", "calculus", "algebra", "geometry", "practice math",
+]
+
+def _is_learning_intent(text: str) -> bool:
+    tl = text.lower()
+    return any(phrase in tl for phrase in _LEARNING_INTENT_PHRASES)
+
 def _is_empire_intent(text: str) -> bool:
     tl = text.lower()
     return any(phrase in tl for phrase in _EMPIRE_INTENT_PHRASES)
+
+async def _handle_learning_query(user_id: str, chat_id: int, message_id: int, user_text: str):
+    """Handle chess/learning queries — reads from user_learning_profiles and chess tables."""
+    if not supabase:
+        await send_text_chunks(chat_id, "❌ Learning data is offline. Try again later.", reply_to=message_id)
+        return
+
+    profile = await get_user_profile_data(user_id)
+    empire_id = profile.get("empire_id")
+
+    if not empire_id:
+        await send_text_chunks(chat_id, (
+            "🎓 You need an Empire ID to track your learning progress!
+
+"
+            "Tap /link to connect your account, then I can see everything you learn. 🇳🇬"
+        ), reply_to=message_id)
+        return
+
+    tl = user_text.lower()
+
+    # Chess-specific queries
+    if any(kw in tl for kw in ["chess", "elo", "games", "checkmate", "pawn", "knight", "bishop", "rook", "queen", "king"]):
+        try:
+            # Get chess profile
+            lp_res = supabase.table("user_learning_profiles")                .select("*")                .eq("user_id", user_id)                .single()                .execute()
+
+            lp = lp_res.data if lp_res.data else None
+
+            # Get recent games
+            games_res = supabase.table("chess_games")                .select("result, difficulty, created_at, moves")                .eq("user_id", user_id)                .order("created_at", desc=True)                .limit(5)                .execute()
+
+            games = games_res.data or []
+
+            if not lp and not games:
+                await send_text_chunks(chat_id, (
+                    f"🎓 You haven't played any chess games yet!
+
+"
+                    f"Start learning here:
+"
+                    f"👉 <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}">Play Chess</a>
+
+"
+                    f"I'll track your progress and coach you as you improve! ♟️"
+                ), reply_to=message_id)
+                return
+
+            # Build stats message
+            games_played = lp.get("chess_games_played", 0) if lp else len(games)
+            wins = lp.get("chess_wins", 0) if lp else sum(1 for g in games if g.get("result") == "win")
+            losses = lp.get("chess_losses", 0) if lp else sum(1 for g in games if g.get("result") == "loss")
+            draws = lp.get("chess_draws", 0) if lp else sum(1 for g in games if g.get("result") == "draw")
+            elo = lp.get("chess_elo", 400) if lp else 400
+            weaknesses = lp.get("chess_weaknesses", []) if lp else []
+
+            win_rate = round((wins / games_played * 100), 1) if games_played > 0 else 0
+
+            msg_lines = [
+                f"♟️ <b>Your Chess Stats</b>",
+                f"",
+                f"📊 Games: <b>{games_played}</b> (W: {wins} | L: {losses} | D: {draws})",
+                f"🏆 Win Rate: <b>{win_rate}%</b>",
+                f"⭐ ELO Rating: <b>{elo}</b>",
+            ]
+
+            if weaknesses:
+                msg_lines.append(f"")
+                msg_lines.append(f"💡 Areas to improve: {', '.join(weaknesses[:3])}")
+
+            if games:
+                msg_lines.append(f"")
+                msg_lines.append(f"📜 Recent games:")
+                for i, g in enumerate(games[:3], 1):
+                    result_emoji = {"win": "🏆", "loss": "💔", "draw": "🤝"}.get(g.get("result"), "❓")
+                    date = g.get("created_at", "")[:10]
+                    msg_lines.append(f"   {i}. {result_emoji} {g.get('result', 'unknown').title()} — {date}")
+
+            msg_lines.append(f"")
+            msg_lines.append(f"🎯 <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}&skip_intro=true">Continue Playing</a>")
+            msg_lines.append(f"🎓 <a href="https://learn.empireunion.xyz/learn">Explore Other Topics</a>")
+
+            await send_text_chunks(chat_id, "\n".join(msg_lines), reply_to=message_id)
+
+        except Exception as e:
+            logger.error("Chess query error: %s", e)
+            await send_text_chunks(chat_id, (
+                f"🎓 Start your chess journey here:
+"
+                f"👉 <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}">Play Chess</a>"
+            ), reply_to=message_id)
+        return
+
+    # Generic learning intent
+    await send_text_chunks(chat_id, (
+        f"🎓 <b>Empire Learn</b> — What would you like to master?
+
+"
+        f"♟️ <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}">Chess</a>
+"
+        f"📐 <a href="https://learn.empireunion.xyz/learn/math?empire_id={empire_id}">Math</a>
+"
+        f"🌍 <a href="https://learn.empireunion.xyz/learn/language?empire_id={empire_id}">Language</a>
+
+"
+        f"Or just tell me: "Teach me [topic]" and I'll guide you! 🇳🇬"
+    ), reply_to=message_id)
+
 
 async def _handle_link_command(user_id: str, chat_id: int, message_id: int):
     """Sends Logto OAuth link. Called from /link, /account, and casual intent."""
@@ -1192,6 +1315,38 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
         )
         return True
 
+    elif tl.startswith("/learn") or tl.startswith("/chess"):
+        profile = await get_user_profile_data(user_id)
+        empire_id = profile.get("empire_id")
+
+        if not empire_id:
+            await send_text_chunks(chat_id, (
+                "🎓 You need an Empire ID to access Empire Learn!
+
+"
+                "Tap /link to connect your account first. 🇳🇬"
+            ), reply_to=message_id)
+            return True
+
+        # Parse topic from command
+        topic = "chess"  # default
+        if tl.startswith("/learn "):
+            topic_arg = tl[7:].strip().lower()
+            if topic_arg in ["chess", "math", "language"]:
+                topic = topic_arg
+
+        await send_text_chunks(chat_id, (
+            f"🎓 Opening <b>{topic.title()}</b>...
+
+"
+            f"👉 <a href="https://learn.empireunion.xyz/learn/{topic}?empire_id={empire_id}&skip_intro=true">"
+            f"Click here to start learning</a>
+
+"
+            f"Your progress is saved automatically. Come back anytime and I'll remember where you left off! 🇳🇬"
+        ), reply_to=message_id)
+        return True
+
     # ── ADMIN COMMANDS — delegated entirely to admin.py ──────
     elif tl.startswith("/admin"):
         return await handle_admin_command(
@@ -1290,6 +1445,14 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
 # ═══════════════════════════════════════════════════════════
 # MAIN MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════
+
+async def handle_learning_intent(user_id: str, chat_id: int, message_id: int, user_text: str) -> bool:
+    """Detect and handle learning-related messages. Returns True if handled."""
+    if not _is_learning_intent(user_text):
+        return False
+    await _handle_learning_query(user_id, chat_id, message_id, user_text)
+    return True
+
 async def handle_message_async(update: Update):
     if not update.message: 
         logger.info("No message in update")
@@ -1531,6 +1694,15 @@ async def handle_message_async(update: Update):
             await update_user_profile(user_id, username, "reminder")
         except Exception as e:
             logger.error("Failed to save task interaction: %s", e)
+        return
+
+    # ── Learning / Chess intent ──
+    if await handle_learning_intent(user_id, chat.id, message_id, user_text):
+        try:
+            await save_chat_memory(user_id, username, user_text, "[Learning query handled]", chat_type, "education")
+            await update_user_profile(user_id, username, "education")
+        except Exception as e:
+            logger.error("Failed to save learning interaction: %s", e)
         return
 
     # ── Casual Empire ID / link intent ──
