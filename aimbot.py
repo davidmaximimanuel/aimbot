@@ -51,7 +51,15 @@ GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
 DEEPSEEK_API_KEY    = os.environ.get("DEEPSEEK_API_KEY", "")
 USE_DEEPSEEK        = os.environ.get("USE_DEEPSEEK", "false").lower() == "true"
 SUPABASE_URL        = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY        = os.environ.get("SUPABASE_KEY", "")
+# Supabase's new key system replaces the old anon/service_role keys with
+# "publishable" (client-safe, respects RLS) and "secret" (full access,
+# bypasses RLS) keys. This bot runs entirely server-side and needs full
+# read/write across every user's rows (memory, tasks, profile, deletes),
+# so it uses the SECRET key — the direct replacement for service_role.
+# SUPABASE_KEY is kept as a fallback in case the Railway variable hasn't
+# been renamed yet.
+SUPABASE_SECRET_KEY      = os.environ.get("SUPABASE_SECRET_KEY", "") or os.environ.get("SUPABASE_KEY", "")
+SUPABASE_PUBLISHABLE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "")
 WEBHOOK_URL         = os.environ.get("WEBHOOK_URL", "")
 BRAVE_API_KEY       = os.environ.get("BRAVE_API_KEY", "")
 GNEWS_API_KEY       = os.environ.get("GNEWS_API_KEY", "")
@@ -170,9 +178,9 @@ app = Flask(__name__)
 bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
 supabase: Optional[Client] = None
-if SUPABASE_URL and SUPABASE_KEY:
+if SUPABASE_URL and SUPABASE_SECRET_KEY:
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
         logger.info("✅ Supabase connected")
     except Exception as e:
         logger.error("❌ Supabase connection failed: %s", e)
@@ -366,13 +374,39 @@ threading.Thread(target=check_tasks_background, daemon=True, name="task-worker")
 TASK_KEYWORDS      = ["remind me","set a reminder","reminder","remind","notify me","don't let me forget","alert me","schedule","every day","every week","every monday","every tuesday","every wednesday","every thursday","every friday","every saturday","every sunday","daily reminder","always remind"]
 TIMER_ONLY_KEYWORDS = ["set a timer","start a timer","set timer","start timer","set a stopwatch","start stopwatch","stopwatch"]
 
-async def parse_task_with_ai(user_text: str, user_id: str) -> dict:
+# Matches an EXPLICIT, self-contained time reference — a clock time, a
+# relative offset ("in 20 minutes"), or a named day. If a reminder message
+# has none of these, it's almost certainly anchored to an EVENT (a match,
+# a release, a meeting someone else scheduled) whose time we don't know
+# yet and have to look up before we can parse a scheduled_time at all.
+_EXPLICIT_TIME_RE = re.compile(
+    r'(\d{1,2}(:\d{2})?\s*(am|pm)\b)'          # 6pm, 6:30 pm
+    r'|(\bin\s+\d+\s*(min|minute|hour|hr|day)s?\b)'  # in 20 minutes
+    r'|(\btoday\b|\btonight\b|\btomorrow\b)'
+    r'|(\bmonday\b|\btuesday\b|\bwednesday\b|\bthursday\b|\bfriday\b|\bsaturday\b|\bsunday\b)'
+    r'|(\d{1,2}\s*(o\'?clock))',
+    re.IGNORECASE
+)
+
+def _needs_event_lookup(text: str) -> bool:
+    """True if this looks like a reminder tied to an external event
+    (match, game, release, etc.) rather than a plain clock time."""
+    if _EXPLICIT_TIME_RE.search(text):
+        return False
+    event_words = ["match", "game", "kickoff", "kick off", "fixture", "vs", "versus",
+                   "playing", "release", "drop", "launch", "premiere", "starts",
+                   "begins", "airs", "concert", "election", "announcement"]
+    return any(w in text.lower() for w in event_words)
+
+async def parse_task_with_ai(user_text: str, user_id: str, event_context: str = "") -> dict:
     now_wat = datetime.now(WAT)
     current_time_str = now_wat.strftime("%A, %B %d, %Y at %I:%M %p WAT")
+    context_block = f"\n\nRELEVANT SEARCH RESULTS (use these to find the actual date/time of any event mentioned, in WAT — apply any offset the user asked for, e.g. '5 minutes before' means subtract 5 minutes from the event's start time):\n{event_context}\n" if event_context else ""
     prompt = f"""Parse this user message into a task. Return ONLY valid JSON.
 Fields: description, type ("one_time"|"recurring"), scheduled_time (ISO or null), recurrence_pattern, recurrence_time, recurrence_days, category, needs_clarification, clarification_question.
 Current time: {current_time_str}
-User message: "{user_text}"
+User message: "{user_text}"{context_block}
+If the message references an event and search results are provided above, use them to compute scheduled_time yourself — do NOT ask for clarification just because the time wasn't stated directly by the user. Only set needs_clarification to true if the time genuinely cannot be determined even with the search results.
 Return ONLY JSON:"""
     try:
         if USE_DEEPSEEK and deepseek_client:
@@ -449,7 +483,18 @@ async def handle_task_message(user_text: str, user_id: str, chat_id: int, messag
                 if "clarify" in last_response.lower() or "when" in last_response.lower():
                     context_prefix = f"Original request: {recent.data[0].get('message','')}\nUser's answer: "
         except Exception: pass
-    task_data = await parse_task_with_ai(context_prefix + user_text, user_id)
+
+    # ── Event-anchored reminders ("remind me before the Norway vs England
+    # match") need a web search to find the actual date/time FIRST — the
+    # parser has no other way to know when an external event happens. ──
+    event_context = ""
+    if _needs_event_lookup(user_text):
+        await send_text_chunks(chat_id, "🔎 Looking that up first...", reply_to=message_id)
+        sr = get_sports_data(user_text) if any(w in text_lower for w in ["match","game","kickoff","vs","versus","fixture"]) else search_web(user_text)
+        if sr and "No search results" not in sr:
+            event_context = sr
+
+    task_data = await parse_task_with_ai(context_prefix + user_text, user_id, event_context=event_context)
     if task_data.get("needs_clarification"):
         await send_text_chunks(chat_id, f"🤔 {task_data.get('clarification_question','Could you clarify?')}", reply_to=message_id)
         return True
@@ -968,9 +1013,7 @@ async def _handle_learning_query(user_id: str, chat_id: int, message_id: int, us
 
     if not empire_id:
         await send_text_chunks(chat_id, (
-            "🎓 You need an Empire ID to track your learning progress!
-
-"
+            "🎓 You need an Empire ID to track your learning progress!\n\n"
             "Tap /link to connect your account, then I can see everything you learn. 🇳🇬"
         ), reply_to=message_id)
         return
@@ -981,25 +1024,20 @@ async def _handle_learning_query(user_id: str, chat_id: int, message_id: int, us
     if any(kw in tl for kw in ["chess", "elo", "games", "checkmate", "pawn", "knight", "bishop", "rook", "queen", "king"]):
         try:
             # Get chess profile
-            lp_res = supabase.table("user_learning_profiles")                .select("*")                .eq("user_id", user_id)                .single()                .execute()
+            lp_res = supabase.table("user_learning_profiles").select("*").eq("user_id", user_id).single().execute()
 
             lp = lp_res.data if lp_res.data else None
 
             # Get recent games
-            games_res = supabase.table("chess_games")                .select("result, difficulty, created_at, moves")                .eq("user_id", user_id)                .order("created_at", desc=True)                .limit(5)                .execute()
+            games_res = supabase.table("chess_games").select("result, difficulty, created_at, moves").eq("user_id", user_id).order("created_at", desc=True).limit(5).execute()
 
             games = games_res.data or []
 
             if not lp and not games:
                 await send_text_chunks(chat_id, (
-                    f"🎓 You haven't played any chess games yet!
-
-"
-                    f"Start learning here:
-"
-                    f"👉 <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}">Play Chess</a>
-
-"
+                    f"🎓 You haven't played any chess games yet!\n\n"
+                    f"Start learning here:\n"
+                    f'👉 <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}">Play Chess</a>\n\n'
                     f"I'll track your progress and coach you as you improve! ♟️"
                 ), reply_to=message_id)
                 return
@@ -1035,33 +1073,26 @@ async def _handle_learning_query(user_id: str, chat_id: int, message_id: int, us
                     msg_lines.append(f"   {i}. {result_emoji} {g.get('result', 'unknown').title()} — {date}")
 
             msg_lines.append(f"")
-            msg_lines.append(f"🎯 <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}&skip_intro=true">Continue Playing</a>")
-            msg_lines.append(f"🎓 <a href="https://learn.empireunion.xyz/learn">Explore Other Topics</a>")
+            msg_lines.append(f'🎯 <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}&skip_intro=true">Continue Playing</a>')
+            msg_lines.append(f'🎓 <a href="https://learn.empireunion.xyz/learn">Explore Other Topics</a>')
 
             await send_text_chunks(chat_id, "\n".join(msg_lines), reply_to=message_id)
 
         except Exception as e:
             logger.error("Chess query error: %s", e)
             await send_text_chunks(chat_id, (
-                f"🎓 Start your chess journey here:
-"
-                f"👉 <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}">Play Chess</a>"
+                f"🎓 Start your chess journey here:\n"
+                f'👉 <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}">Play Chess</a>'
             ), reply_to=message_id)
         return
 
     # Generic learning intent
     await send_text_chunks(chat_id, (
-        f"🎓 <b>Empire Learn</b> — What would you like to master?
-
-"
-        f"♟️ <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}">Chess</a>
-"
-        f"📐 <a href="https://learn.empireunion.xyz/learn/math?empire_id={empire_id}">Math</a>
-"
-        f"🌍 <a href="https://learn.empireunion.xyz/learn/language?empire_id={empire_id}">Language</a>
-
-"
-        f"Or just tell me: "Teach me [topic]" and I'll guide you! 🇳🇬"
+        f"🎓 <b>Empire Learn</b> — What would you like to master?\n\n"
+        f'♟️ <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}">Chess</a>\n'
+        f'📐 <a href="https://learn.empireunion.xyz/learn/math?empire_id={empire_id}">Math</a>\n'
+        f'🌍 <a href="https://learn.empireunion.xyz/learn/language?empire_id={empire_id}">Language</a>\n\n'
+        f'Or just tell me: "Teach me [topic]" and I\'ll guide you! 🇳🇬'
     ), reply_to=message_id)
 
 
@@ -1321,9 +1352,7 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
 
         if not empire_id:
             await send_text_chunks(chat_id, (
-                "🎓 You need an Empire ID to access Empire Learn!
-
-"
+                "🎓 You need an Empire ID to access Empire Learn!\n\n"
                 "Tap /link to connect your account first. 🇳🇬"
             ), reply_to=message_id)
             return True
@@ -1336,13 +1365,9 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
                 topic = topic_arg
 
         await send_text_chunks(chat_id, (
-            f"🎓 Opening <b>{topic.title()}</b>...
-
-"
-            f"👉 <a href="https://learn.empireunion.xyz/learn/{topic}?empire_id={empire_id}&skip_intro=true">"
-            f"Click here to start learning</a>
-
-"
+            f"🎓 Opening <b>{topic.title()}</b>...\n\n"
+            f'👉 <a href="https://learn.empireunion.xyz/learn/{topic}?empire_id={empire_id}&skip_intro=true">'
+            f"Click here to start learning</a>\n\n"
             f"Your progress is saved automatically. Come back anytime and I'll remember where you left off! 🇳🇬"
         ), reply_to=message_id)
         return True

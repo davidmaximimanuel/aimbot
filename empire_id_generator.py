@@ -19,15 +19,18 @@ from supabase import create_client, Client
 logger = logging.getLogger(__name__)
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
-# These should point to the NEW EmpireID Supabase project (not AIM's main DB)
+# These should point to the NEW EmpireID Supabase project (not AIM's main DB).
+# Uses the SECRET key (full access, bypasses RLS) since this runs server-side
+# and needs to read/write every user's Empire ID record. Falls back to the old
+# EMPIRE_ID_SUPABASE_SERVICE_KEY name in case Railway hasn't been updated yet.
 EMPIRE_ID_SUPABASE_URL = os.environ.get("EMPIRE_ID_SUPABASE_URL", "")
-EMPIRE_ID_SUPABASE_SERVICE_KEY = os.environ.get("EMPIRE_ID_SUPABASE_SERVICE_KEY", "")
+EMPIRE_ID_SUPABASE_SECRET_KEY = os.environ.get("EMPIRE_ID_SUPABASE_SECRET_KEY", "") or os.environ.get("EMPIRE_ID_SUPABASE_SERVICE_KEY", "")
 
 # Initialize Supabase client
 empire_id_client: Optional[Client] = None
-if EMPIRE_ID_SUPABASE_URL and EMPIRE_ID_SUPABASE_SERVICE_KEY:
+if EMPIRE_ID_SUPABASE_URL and EMPIRE_ID_SUPABASE_SECRET_KEY:
     try:
-        empire_id_client = create_client(EMPIRE_ID_SUPABASE_URL, EMPIRE_ID_SUPABASE_SERVICE_KEY)
+        empire_id_client = create_client(EMPIRE_ID_SUPABASE_URL, EMPIRE_ID_SUPABASE_SECRET_KEY)
         logger.info("✅ EmpireID Supabase connected")
     except Exception as e:
         logger.error(f"❌ EmpireID Supabase connection failed: {e}")
