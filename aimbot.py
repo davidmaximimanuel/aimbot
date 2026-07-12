@@ -40,6 +40,7 @@ from capabilities import is_search_query, SEARCH_TRIGGER_PHRASES, trigger_embedd
 # This is what fixes the stale uptime bug — admin.py sets it at import time
 # on fresh deploy, and both files read from it.
 from admin import load_admins, is_admin, handle_admin_command, ADMIN_IDS, START_TIME
+from chess_engine import register_chess_routes
 
 # ─── LOGGING ───
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -2183,6 +2184,9 @@ def debug_logto():
 @app.route("/privacy", methods=["GET"])
 def privacy_policy():
     return "<h1>Privacy Policy</h1><p>Coming soon.</p>", 200, {"Content-Type":"text/html"}
+
+# Register chess API routes
+register_chess_routes(app, supabase)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
