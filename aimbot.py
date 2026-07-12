@@ -65,6 +65,7 @@ BRAVE_API_KEY       = os.environ.get("BRAVE_API_KEY", "")
 GNEWS_API_KEY       = os.environ.get("GNEWS_API_KEY", "")
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
+SPORTAPI_KEY        = os.environ.get("SPORTAPI_KEY", "")  # API-FOOTBALL (api-sports.io) key — real fixture/kickoff data
 
 # ─── LOGTO CONFIG ───
 LOGTO_ENDPOINT      = os.environ.get("LOGTO_ENDPOINT", "").rstrip("/")
@@ -202,6 +203,8 @@ groq_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/o
 if GROQ_API_KEY:     logger.info("✅ Groq API (Voice STT enabled)")
 if BRAVE_API_KEY:    logger.info("✅ Brave Search API")
 if GNEWS_API_KEY:    logger.info("✅ GNews API")
+if SPORTAPI_KEY:     logger.info("✅ API-FOOTBALL (fixture lookups enabled)")
+else:                logger.warning("⚠️ SPORTAPI_KEY not set — reminders tied to match kickoff times will fall back to news search")
 _logto_ok = bool(os.environ.get("LOGTO_ENDPOINT")) and bool(os.environ.get("LOGTO_CLIENT_ID"))
 if _logto_ok:
     logger.info("✅ Logto OAuth configured → %s", get_redirect_uri())
@@ -322,6 +325,51 @@ def _calc_next_run(task: dict, from_time: datetime) -> datetime:
             return base.replace(year=year, month=month, day=last_day)
     return base
 
+def _synthesize_daily_content(category: str, raw_search: str) -> str:
+    """Raw search scrapes (title/snippet/url) aren't fit to send straight to
+    a user — snippets are often empty or just repeat the page title (this is
+    exactly what was happening with Word of the Day). This runs the scrape
+    through the AI once to produce an actual usable message, and — for word/
+    verse, where 'freshness' matters less than just being correct and well
+    formed — falls back to having the model generate one directly if the
+    search came back empty or useless."""
+    prompts = {
+        "news": (
+            "Using ONLY these search results, write a short, well-formatted "
+            "'Daily News Update' with the top headlines for a Nigerian audience. "
+            "If the results are empty or unusable, say so plainly instead of "
+            "inventing news.\n\nSearch results:\n" + raw_search
+        ),
+        "verse": (
+            "These search results may contain a Bible verse for today. If you "
+            "can clearly identify one, present it cleanly with its reference "
+            "(e.g. John 3:16) and one short line of reflection. If the results "
+            "are empty or not actually a verse, just choose an uplifting Bible "
+            "verse yourself and present it the same way — don't mention that "
+            "the search failed.\n\nSearch results:\n" + raw_search
+        ),
+        "word": (
+            "These search results may contain today's dictionary word of the "
+            "day. If you can clearly identify an actual word from them (not "
+            "just a page title), present it as: the WORD, its part of speech, "
+            "a one-line definition, and one example sentence. If the results "
+            "are empty or don't contain a real word (e.g. just a page title "
+            "with no definition), pick an interesting, useful English word "
+            "yourself and present it the same way — don't mention that the "
+            "search failed.\n\nSearch results:\n" + raw_search
+        ),
+    }
+    prompt = prompts.get(category)
+    if not prompt:
+        return raw_search
+    try:
+        future = run_async(get_ai_response(prompt, "system", "private"))
+        result = future.result(timeout=20)
+        return result.strip() if result else raw_search
+    except Exception as e:
+        logger.error("Daily content synthesis error (%s): %s", category, e)
+        return raw_search
+
 def check_tasks_background():
     logger.info("📋 Task worker started.")
     while True:
@@ -337,13 +385,16 @@ def check_tasks_background():
                 description, task_type = task["task_description"], task["task_type"]
                 category = task.get("task_category", "reminder")
                 if category == "news":
-                    content = get_latest_news("Nigeria latest news today", 3)
+                    raw = get_latest_news("Nigeria latest news today", 3)
+                    content = _synthesize_daily_content("news", raw)
                     msg = f"📰 <b>Your Daily News Update:</b>\n\n{content[:3000]}"
                 elif category == "verse":
-                    content = search_web("daily bible verse today", 1)
+                    raw = search_web("daily bible verse today", 1)
+                    content = _synthesize_daily_content("verse", raw)
                     msg = f"📖 <b>Daily Bible Verse:</b>\n\n{content[:1000]}"
                 elif category == "word":
-                    content = search_web("word of the day meaning", 1)
+                    raw = search_web("word of the day meaning", 1)
+                    content = _synthesize_daily_content("word", raw)
                     msg = f"📚 <b>Word of the Day:</b>\n\n{content[:500]}"
                 else:
                     msg = f"⏰ <b>Reminder:</b>\n\n{description}"
@@ -371,59 +422,13 @@ threading.Thread(target=check_tasks_background, daemon=True, name="task-worker")
 # ═══════════════════════════════════════════════════════════
 # TASK SYSTEM
 # ═══════════════════════════════════════════════════════════
-TASK_KEYWORDS      = ["remind me","set a reminder","reminder","remind","notify me","don't let me forget","alert me","schedule","every day","every week","every monday","every tuesday","every wednesday","every thursday","every friday","every saturday","every sunday","daily reminder","always remind"]
-TIMER_ONLY_KEYWORDS = ["set a timer","start a timer","set timer","start timer","set a stopwatch","start stopwatch","stopwatch"]
-
-# Matches an EXPLICIT, self-contained time reference — a clock time, a
-# relative offset ("in 20 minutes"), or a named day. If a reminder message
-# has none of these, it's almost certainly anchored to an EVENT (a match,
-# a release, a meeting someone else scheduled) whose time we don't know
-# yet and have to look up before we can parse a scheduled_time at all.
-_EXPLICIT_TIME_RE = re.compile(
-    r'(\d{1,2}(:\d{2})?\s*(am|pm)\b)'          # 6pm, 6:30 pm
-    r'|(\bin\s+\d+\s*(min|minute|hour|hr|day)s?\b)'  # in 20 minutes
-    r'|(\btoday\b|\btonight\b|\btomorrow\b)'
-    r'|(\bmonday\b|\btuesday\b|\bwednesday\b|\bthursday\b|\bfriday\b|\bsaturday\b|\bsunday\b)'
-    r'|(\d{1,2}\s*(o\'?clock))',
-    re.IGNORECASE
-)
-
-def _needs_event_lookup(text: str) -> bool:
-    """True if this looks like a reminder tied to an external event
-    (match, game, release, etc.) rather than a plain clock time."""
-    if _EXPLICIT_TIME_RE.search(text):
-        return False
-    event_words = ["match", "game", "kickoff", "kick off", "fixture", "vs", "versus",
-                   "playing", "release", "drop", "launch", "premiere", "starts",
-                   "begins", "airs", "concert", "election", "announcement"]
-    return any(w in text.lower() for w in event_words)
-
-async def parse_task_with_ai(user_text: str, user_id: str, event_context: str = "") -> dict:
-    now_wat = datetime.now(WAT)
-    current_time_str = now_wat.strftime("%A, %B %d, %Y at %I:%M %p WAT")
-    context_block = f"\n\nRELEVANT SEARCH RESULTS (use these to find the actual date/time of any event mentioned, in WAT — apply any offset the user asked for, e.g. '5 minutes before' means subtract 5 minutes from the event's start time):\n{event_context}\n" if event_context else ""
-    prompt = f"""Parse this user message into a task. Return ONLY valid JSON.
-Fields: description, type ("one_time"|"recurring"), scheduled_time (ISO or null), recurrence_pattern, recurrence_time, recurrence_days, category, needs_clarification, clarification_question.
-Current time: {current_time_str}
-User message: "{user_text}"{context_block}
-If the message references an event and search results are provided above, use them to compute scheduled_time yourself — do NOT ask for clarification just because the time wasn't stated directly by the user. Only set needs_clarification to true if the time genuinely cannot be determined even with the search results.
-Return ONLY JSON:"""
-    try:
-        if USE_DEEPSEEK and deepseek_client:
-            r   = await deepseek_client.chat.completions.create(model="deepseek-v4-flash", messages=[{"role":"user","content":prompt}], temperature=0.1, max_tokens=400)
-            raw = r.choices[0].message.content.strip()
-        elif gemini_client:
-            r   = gemini_client.models.generate_content(model="gemini-2.5-flash-lite", contents=[types.Content(role="user", parts=[types.Part(text=prompt)])], config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=400))
-            raw = r.text.strip() if r and r.text else ""
-        else:
-            return {"needs_clarification": True, "clarification_question": "Could you clarify when you want this reminder?"}
-        raw = re.sub(r'^```json\s*', '', raw.strip())
-        raw = re.sub(r'^```\s*',     '', raw.strip())
-        raw = re.sub(r'\s*```$',     '', raw.strip())
-        return json.loads(raw.strip())
-    except Exception as e:
-        logger.error("Task parse error: %s", e)
-        return {"needs_clarification": True, "clarification_question": "Could you clarify when you want this reminder?"}
+# NOTE: Reminders are no longer detected via keyword-matching + a separate
+# search-blind parsing call. The main AI now decides for itself whether a
+# reminder request needs a search first, using SEARCH_TRIGGER, and creates
+# the task itself via the [CREATE_TASK:{...}] tag handled in the main loop
+# in handle_message_async. See the TASKS & REMINDERS section of
+# BASE_SYSTEM_PROMPT in core.py. create_task_in_db below is the shared
+# helper both that tag handler and the /news, /verse, /word commands use.
 
 async def create_task_in_db(user_id: str, task_data: dict) -> str:
     if not supabase: return "❌ Memory is offline."
@@ -470,41 +475,106 @@ async def create_task_in_db(user_id: str, task_data: dict) -> str:
         return "❌ Couldn't save the task."
 
 async def handle_task_message(user_text: str, user_id: str, chat_id: int, message_id: int) -> bool:
-    text_lower = user_text.lower()
-    if any(kw in text_lower for kw in TIMER_ONLY_KEYWORDS): return False
-    if not any(kw in text_lower for kw in TASK_KEYWORDS):   return False
-    logger.info("📋 Task intent detected: '%s'", user_text[:60])
-    context_prefix = ""
-    if supabase:
-        try:
-            recent = supabase.table("chat_memory").select("message,response").eq("user_id",str(user_id)).order("created_at",desc=True).limit(1).execute()
-            if recent.data:
-                last_response = recent.data[0].get("response","")
-                if "clarify" in last_response.lower() or "when" in last_response.lower():
-                    context_prefix = f"Original request: {recent.data[0].get('message','')}\nUser's answer: "
-        except Exception: pass
-
-    # ── Event-anchored reminders ("remind me before the Norway vs England
-    # match") need a web search to find the actual date/time FIRST — the
-    # parser has no other way to know when an external event happens. ──
-    event_context = ""
-    if _needs_event_lookup(user_text):
-        await send_text_chunks(chat_id, "🔎 Looking that up first...", reply_to=message_id)
-        sr = get_sports_data(user_text) if any(w in text_lower for w in ["match","game","kickoff","vs","versus","fixture"]) else search_web(user_text)
-        if sr and "No search results" not in sr:
-            event_context = sr
-
-    task_data = await parse_task_with_ai(context_prefix + user_text, user_id, event_context=event_context)
-    if task_data.get("needs_clarification"):
-        await send_text_chunks(chat_id, f"🤔 {task_data.get('clarification_question','Could you clarify?')}", reply_to=message_id)
-        return True
-    result = await create_task_in_db(user_id, task_data)
-    await send_text_chunks(chat_id, result, reply_to=message_id)
-    return True
+    # Deprecated — kept only so nothing else in the file breaks if it's still
+    # referenced elsewhere (e.g. admin.py). Reminders are now handled by the
+    # main AI loop via SEARCH_TRIGGER + [CREATE_TASK:{...}] — see the note
+    # above create_task_in_db.
+    return False
 
 # ═══════════════════════════════════════════════════════════
 # WEB SEARCH
 # ═══════════════════════════════════════════════════════════
+def _api_football_get(path: str, params: dict) -> Optional[dict]:
+    if not SPORTAPI_KEY: return None
+    try:
+        resp = requests.get(
+            f"https://v3.football.api-sports.io/{path}",
+            headers={"x-apisports-key": SPORTAPI_KEY},
+            params=params, timeout=10
+        )
+        if resp.status_code != 200:
+            logger.warning("API-FOOTBALL %s returned %s", path, resp.status_code)
+            return None
+        return resp.json()
+    except Exception as e:
+        logger.error("API-FOOTBALL error: %s", e)
+        return None
+
+def _find_team_id(name: str) -> Optional[int]:
+    data = _api_football_get("teams", {"search": name})
+    if not data or not data.get("response"):
+        return None
+    return data["response"][0]["team"]["id"]
+
+# Matches "Team A vs Team B", "Team A and Team B", "Team A versus/against
+# Team B" — with an explicit connector word.
+_TEAM_CONNECTOR_RE = re.compile(
+    r'\b([A-Za-z][A-Za-z\.]*(?:\s+[A-Za-z][A-Za-z\.]*){0,2})'
+    r'\s+(?:vs\.?|versus|v\.?|and|against)\s+'
+    r'([A-Za-z][A-Za-z\.]*(?:\s+[A-Za-z][A-Za-z\.]*){0,2})\b',
+    re.IGNORECASE
+)
+# Fallback: no connector at all, just "Team A Team B match/game/fixture"
+# (how people often type it on mobile, e.g. "Norway england match").
+_TEAM_NOCONNECTOR_RE = re.compile(
+    r'\b([A-Za-z]+)\s+([A-Za-z]+)\s+(?:match|game|fixture|kickoff|kick off)\b',
+    re.IGNORECASE
+)
+_SKIP_WORDS = {"the","a","an","this","that","next","upcoming","today","tomorrow","when","does","is","remind","me"}
+
+def get_fixture_datetime(query_text: str) -> Optional[str]:
+    """Looks up the real kickoff date/time for a match mentioned in query_text
+    using API-FOOTBALL (api-sports.io), rather than guessing from news search.
+    Returns a short description string for the task parser, or None if no
+    fixture could be found (caller should fall back to a general search)."""
+    if not SPORTAPI_KEY:
+        return None
+
+    candidates = []
+    m = _TEAM_CONNECTOR_RE.search(query_text)
+    if m:
+        candidates.append((m.group(1).strip(), m.group(2).strip()))
+    m2 = _TEAM_NOCONNECTOR_RE.search(query_text)
+    if m2:
+        a, b = m2.group(1).strip(), m2.group(2).strip()
+        if a.lower() not in _SKIP_WORDS and b.lower() not in _SKIP_WORDS:
+            candidates.append((a, b))
+    if not candidates:
+        return None
+
+    id_a = id_b = None
+    for team_a_name, team_b_name in candidates:
+        id_a, id_b = _find_team_id(team_a_name), _find_team_id(team_b_name)
+        if id_a and id_b:
+            break
+    if not id_a or not id_b:
+        return None
+    h2h = _api_football_get("fixtures/headtohead", {"h2h": f"{id_a}-{id_b}"})
+    if not h2h or not h2h.get("response"):
+        return None
+    now_utc = datetime.now(timezone.utc)
+    upcoming = []
+    for fx in h2h["response"]:
+        try:
+            fx_date = datetime.fromisoformat(fx["fixture"]["date"].replace("Z", "+00:00"))
+            if fx_date >= now_utc:
+                upcoming.append((fx_date, fx))
+        except Exception:
+            continue
+    if not upcoming:
+        return None
+    upcoming.sort(key=lambda x: x[0])
+    fx_date, fx = upcoming[0]
+    home = fx["teams"]["home"]["name"]
+    away = fx["teams"]["away"]["name"]
+    league = fx.get("league", {}).get("name", "")
+    venue = fx.get("fixture", {}).get("venue", {}).get("name", "")
+    return (
+        f"Fixture found via API-FOOTBALL: {home} vs {away}"
+        f"{' (' + league + ')' if league else ''} kicks off at "
+        f"{fx_date.isoformat()} (UTC).{' Venue: ' + venue + '.' if venue else ''}"
+    )
+
 def get_latest_news(query: str, max_results: int = 5) -> str:
     if not GNEWS_API_KEY: return search_web(query, max_results)
     try:
@@ -1711,15 +1781,16 @@ async def handle_message_async(update: Update):
         await update_user_profile(user_id, username, "entertainment")
         return
 
-    if await handle_task_message(user_text, user_id, chat.id, message_id):
-        try:
-            last_response = supabase.table("chat_memory").select("response").eq("user_id",str(user_id)).order("created_at",desc=True).limit(1).execute()
-            ai_response   = last_response.data[0]["response"] if last_response.data else "Task created"
-            await save_chat_memory(user_id, username, user_text, ai_response, chat_type, "reminder")
-            await update_user_profile(user_id, username, "reminder")
-        except Exception as e:
-            logger.error("Failed to save task interaction: %s", e)
-        return
+    # NOTE: Task/reminder detection used to intercept here with a rigid
+    # keyword+regex pipeline (handle_task_message) that called a separate,
+    # search-blind AI call to parse the message straight into a task. That
+    # meant it could never look anything up first — "remind me before the
+    # Norway v England match" had no way to learn when that match kicks off.
+    # Reminders now flow into the same AI loop as everything else below,
+    # which already knows how to SEARCH_TRIGGER when it needs current info,
+    # and can emit [CREATE_TASK:{...}] once it actually has enough to
+    # schedule. See BASE_SYSTEM_PROMPT in core.py for the instructions that
+    # drive this, and the CREATE_TASK handling in the loop below.
 
     # ── Learning / Chess intent ──
     if await handle_learning_intent(user_id, chat.id, message_id, user_text):
@@ -1797,14 +1868,28 @@ async def handle_message_async(update: Update):
                 m = re.search(r'SEARCH_TRIGGER:\s*(.+)', answer, re.IGNORECASE)
                 if m:
                     sq = m.group(1).strip()
-                    if "news" in sq.lower() or "latest" in sq.lower(): sr = get_latest_news(sq)
-                    elif any(s in sq.lower() for s in ["football","match","score","f1","nba","tennis","boxing"]): sr = get_sports_data(sq)
+                    sq_lower = sq.lower()
+                    if any(w in sq_lower for w in ["match","kickoff","kick off","fixture","vs","versus"]):
+                        sr = get_fixture_datetime(sq) or get_sports_data(sq)
+                    elif "news" in sq_lower or "latest" in sq_lower: sr = get_latest_news(sq)
+                    elif any(s in sq_lower for s in ["football","score","f1","nba","tennis","boxing"]): sr = get_sports_data(sq)
                     else: sr = search_web(sq)
-                    web_context += f"\n\nWeb Search Results for '{sq}':\n{sr}" if "No search results" not in sr else f"\n\nSearch for '{sq}': No results."
+                    web_context += f"\n\nWeb Search Results for '{sq}':\n{sr}" if sr and "No search results" not in sr else f"\n\nSearch for '{sq}': No results."
                     continue
                 else:
                     final_answer = answer
                     break
+
+            ctm = re.search(r'\[CREATE_TASK:(\{.*?\})\]', answer, re.IGNORECASE | re.DOTALL)
+            if ctm:
+                answer = re.sub(r'\[CREATE_TASK:\{.*?\}\]', '', answer, flags=re.IGNORECASE | re.DOTALL).strip()
+                try:
+                    task_data = json.loads(ctm.group(1))
+                    task_result = await create_task_in_db(user_id, task_data)
+                    answer = f"{answer}\n\n{task_result}" if answer else task_result
+                except Exception as e:
+                    logger.error("CREATE_TASK parse error: %s", e)
+                    answer = f"{answer}\n\n❌ Couldn't save that reminder — mind trying again?" if answer else "❌ Couldn't save that reminder — mind trying again?"
 
             tm = re.search(r'\[TIMER:(\d+)(s|m|h)\]', answer, re.IGNORECASE)
             if tm:
