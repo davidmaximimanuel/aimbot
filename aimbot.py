@@ -52,13 +52,6 @@ GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
 DEEPSEEK_API_KEY    = os.environ.get("DEEPSEEK_API_KEY", "")
 USE_DEEPSEEK        = os.environ.get("USE_DEEPSEEK", "false").lower() == "true"
 SUPABASE_URL        = os.environ.get("SUPABASE_URL", "")
-# Supabase's new key system replaces the old anon/service_role keys with
-# "publishable" (client-safe, respects RLS) and "secret" (full access,
-# bypasses RLS) keys. This bot runs entirely server-side and needs full
-# read/write across every user's rows (memory, tasks, profile, deletes),
-# so it uses the SECRET key — the direct replacement for service_role.
-# SUPABASE_KEY is kept as a fallback in case the Railway variable hasn't
-# been renamed yet.
 SUPABASE_SECRET_KEY      = os.environ.get("SUPABASE_SECRET_KEY", "") or os.environ.get("SUPABASE_KEY", "")
 SUPABASE_PUBLISHABLE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "")
 WEBHOOK_URL         = os.environ.get("WEBHOOK_URL", "")
@@ -66,21 +59,18 @@ BRAVE_API_KEY       = os.environ.get("BRAVE_API_KEY", "")
 GNEWS_API_KEY       = os.environ.get("GNEWS_API_KEY", "")
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
-SPORTAPI_KEY        = os.environ.get("SPORTAPI_KEY", "")  # API-FOOTBALL (api-sports.io) key — real fixture/kickoff data
+SPORTAPI_KEY        = os.environ.get("SPORTAPI_KEY", "")
 
-# ─── LOGTO CONFIG ───
 LOGTO_ENDPOINT      = os.environ.get("LOGTO_ENDPOINT", "").rstrip("/")
 LOGTO_CLIENT_ID     = os.environ.get("LOGTO_CLIENT_ID", "")
 LOGTO_CLIENT_SECRET = os.environ.get("LOGTO_CLIENT_SECRET", "")
 
 def get_redirect_uri() -> str:
-    """Built lazily so Railway env vars are always resolved at call time."""
     base = os.environ.get("WEBHOOK_URL", "").rstrip("/")
     return f"{base}/auth/callback" if base else ""
 
 TELEGRAM_MAX_CHARS = 4096
 
-# ─── DUPLICATE PREVENTION ───
 _processed_update_ids: set[int] = set()
 _MAX_PROCESSED_IDS = 200
 _lock = threading.Lock()
@@ -96,7 +86,6 @@ def is_duplicate_update(update_id: int) -> bool:
                 _processed_update_ids.discard(old_id)
         return False
 
-# ─── IN-MEMORY OAUTH STATE STORE ───
 _oauth_states: dict[str, dict] = {}
 _oauth_states_lock = threading.Lock()
 
@@ -156,12 +145,6 @@ def exchange_logto_code(code: str) -> Optional[dict]:
         logger.error("Logto token exchange error: %s", e)
         return None
 
-# ─── EMPIRE ID ───
-# NOTE: Empire IDs are no longer generated here. They live in the separate
-# EmpireID Supabase project (empire_id_generator.py) and get imported in
-# via eid_create()/eid_get_by_logto() — see /auth/callback and /claim below.
-
-# ─── FILE UTILS (used by admin commands, also available here) ───
 def read_file_safely(filepath: str) -> str:
     base_dir = os.path.abspath(os.path.dirname(__file__))
     requested_path = os.path.abspath(os.path.join(base_dir, filepath))
@@ -175,7 +158,6 @@ def read_file_safely(filepath: str) -> str:
     except Exception as e:
         return f"❌ Error reading file: {e}"
 
-# ─── INIT CLIENTS ───
 app = Flask(__name__)
 bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
@@ -212,10 +194,8 @@ if _logto_ok:
 else:
     logger.warning("⚠️ Logto not configured — /link will not work")
 
-# Load admins at startup
 load_admins(supabase)
 
-# ─── ASYNCIO EVENT LOOP ───
 _loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
 def _run_loop():
     asyncio.set_event_loop(_loop)
@@ -226,7 +206,6 @@ def run_async(coro):
     return asyncio.run_coroutine_threadsafe(coro, _loop)
 
 async def dynamic_status_updater(bot_instance, chat_id, message_id, phrases, stop_event):
-    """Edits a message with rotating phrases to show dynamic progress."""
     idx = 0
     try:
         while not stop_event.is_set():
@@ -234,14 +213,12 @@ async def dynamic_status_updater(bot_instance, chat_id, message_id, phrases, sto
             try:
                 await bot_instance.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
             except Exception:
-                pass  # Ignore "message is not modified" errors
+                pass
             idx += 1
-            await asyncio.sleep(1.5)  # Change phrase every 1.5 seconds
+            await asyncio.sleep(1.5)
     except asyncio.CancelledError:
         pass
-# ═══════════════════════════════════════════════════════════
-# VOICE TRANSCRIPTION
-# ═══════════════════════════════════════════════════════════
+
 async def transcribe_voice(file_id: str) -> Optional[str]:
     if not groq_client: return None
     temp_path = f"voice_{file_id}.ogg"
@@ -260,9 +237,6 @@ async def transcribe_voice(file_id: str) -> Optional[str]:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-# ═══════════════════════════════════════════════════════════
-# BACKGROUND WORKERS
-# ═══════════════════════════════════════════════════════════
 def check_timers_background():
     logger.info("⏲️ Timer worker started.")
     while True:
@@ -326,14 +300,51 @@ def _calc_next_run(task: dict, from_time: datetime) -> datetime:
             return base.replace(year=year, month=month, day=last_day)
     return base
 
-def _synthesize_daily_content(category: str, raw_search: str) -> str:
+async def _get_recent_words(user_id: str, limit: int = 30) -> list:
+    """Fetch the words already sent to this user recently so we never repeat one.
+    Requires a `word_of_day_history` table: user_id text, word text, sent_at timestamptz."""
+    if not supabase:
+        return []
+    try:
+        res = (supabase.table("word_of_day_history").select("word")
+               .eq("user_id", str(user_id)).order("sent_at", desc=True).limit(limit).execute())
+        return [r["word"].strip().lower() for r in (res.data or []) if r.get("word")]
+    except Exception as e:
+        logger.error("word history fetch error: %s", e)
+        return []
+
+async def _save_sent_word(user_id: str, word: str):
+    if not supabase or not word:
+        return
+    try:
+        supabase.table("word_of_day_history").insert({
+            "user_id": str(user_id), "word": word.strip(),
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        logger.error("word history save error: %s", e)
+
+def _extract_headword(text: str) -> str:
+    """Best-effort pull of just the headword from a formatted word-of-the-day
+    message, so we can dedupe on the word itself rather than the whole blob."""
+    if not text:
+        return ""
+    first_line = text.strip().split("\n")[0]
+    first_line = re.sub(r"[*_`#>\-•]+", "", first_line).strip()
+    word = re.split(r"[\s,:(\-–—]", first_line)[0] if first_line else ""
+    return word.strip().lower()
+
+def _synthesize_daily_content(category: str, raw_search: str, avoid_words: list = None) -> str:
     """Raw search scrapes (title/snippet/url) aren't fit to send straight to
-    a user — snippets are often empty or just repeat the page title (this is
-    exactly what was happening with Word of the Day). This runs the scrape
-    through the AI once to produce an actual usable message, and — for word/
-    verse, where 'freshness' matters less than just being correct and well
-    formed — falls back to having the model generate one directly if the
-    search came back empty or useless."""
+    a user. This runs the scrape through the AI once to produce an actual
+    usable message. For 'word', we also tell the model which words were
+    already sent recently so it picks something new."""
+    avoid_clause = ""
+    if category == "word" and avoid_words:
+        avoid_clause = (
+            "\n\nDo NOT pick any of these words — they were already sent to this user "
+            f"recently: {', '.join(avoid_words)}. Pick a genuinely different word."
+        )
     prompts = {
         "news": (
             "Using ONLY these search results, write a short, well-formatted "
@@ -357,7 +368,7 @@ def _synthesize_daily_content(category: str, raw_search: str) -> str:
             "are empty or don't contain a real word (e.g. just a page title "
             "with no definition), pick an interesting, useful English word "
             "yourself and present it the same way — don't mention that the "
-            "search failed.\n\nSearch results:\n" + raw_search
+            "search failed." + avoid_clause + "\n\nSearch results:\n" + raw_search
         ),
     }
     prompt = prompts.get(category)
@@ -370,6 +381,22 @@ def _synthesize_daily_content(category: str, raw_search: str) -> str:
     except Exception as e:
         logger.error("Daily content synthesis error (%s): %s", category, e)
         return raw_search
+
+async def _get_deduped_word_of_day(user_id: str) -> str:
+    """Generate a word-of-the-day message that hasn't been sent to this user
+    before, retrying a couple of times if the model repeats itself."""
+    raw = search_web("word of the day meaning", 1)
+    avoid = await _get_recent_words(user_id)
+    for attempt in range(3):
+        content = _synthesize_daily_content("word", raw, avoid_words=avoid)
+        headword = _extract_headword(content)
+        if not headword or headword not in avoid:
+            if headword:
+                await _save_sent_word(user_id, headword)
+            return content
+        # Model repeated a used word — add it to the avoid list and try again
+        avoid.append(headword)
+    return content  # give up after 3 tries, send it anyway rather than fail silently
 
 def check_tasks_background():
     logger.info("📋 Task worker started.")
@@ -394,8 +421,8 @@ def check_tasks_background():
                     content = _synthesize_daily_content("verse", raw)
                     msg = f"📖 <b>Daily Bible Verse:</b>\n\n{content[:1000]}"
                 elif category == "word":
-                    raw = search_web("word of the day meaning", 1)
-                    content = _synthesize_daily_content("word", raw)
+                    future = run_async(_get_deduped_word_of_day(user_id))
+                    content = future.result(timeout=25)
                     msg = f"📚 <b>Word of the Day:</b>\n\n{content[:500]}"
                 else:
                     msg = f"⏰ <b>Reminder:</b>\n\n{description}"
@@ -419,17 +446,6 @@ def check_tasks_background():
             logger.error("Task worker error: %s", e)
 
 threading.Thread(target=check_tasks_background, daemon=True, name="task-worker").start()
-
-# ═══════════════════════════════════════════════════════════
-# TASK SYSTEM
-# ═══════════════════════════════════════════════════════════
-# NOTE: Reminders are no longer detected via keyword-matching + a separate
-# search-blind parsing call. The main AI now decides for itself whether a
-# reminder request needs a search first, using SEARCH_TRIGGER, and creates
-# the task itself via the [CREATE_TASK:{...}] tag handled in the main loop
-# in handle_message_async. See the TASKS & REMINDERS section of
-# BASE_SYSTEM_PROMPT in core.py. create_task_in_db below is the shared
-# helper both that tag handler and the /news, /verse, /word commands use.
 
 async def create_task_in_db(user_id: str, task_data: dict) -> str:
     if not supabase: return "❌ Memory is offline."
@@ -476,15 +492,8 @@ async def create_task_in_db(user_id: str, task_data: dict) -> str:
         return "❌ Couldn't save the task."
 
 async def handle_task_message(user_text: str, user_id: str, chat_id: int, message_id: int) -> bool:
-    # Deprecated — kept only so nothing else in the file breaks if it's still
-    # referenced elsewhere (e.g. admin.py). Reminders are now handled by the
-    # main AI loop via SEARCH_TRIGGER + [CREATE_TASK:{...}] — see the note
-    # above create_task_in_db.
     return False
 
-# ═══════════════════════════════════════════════════════════
-# WEB SEARCH
-# ═══════════════════════════════════════════════════════════
 def _api_football_get(path: str, params: dict) -> Optional[dict]:
     if not SPORTAPI_KEY: return None
     try:
@@ -507,16 +516,12 @@ def _find_team_id(name: str) -> Optional[int]:
         return None
     return data["response"][0]["team"]["id"]
 
-# Matches "Team A vs Team B", "Team A and Team B", "Team A versus/against
-# Team B" — with an explicit connector word.
 _TEAM_CONNECTOR_RE = re.compile(
     r'\b([A-Za-z][A-Za-z\.]*(?:\s+[A-Za-z][A-Za-z\.]*){0,2})'
     r'\s+(?:vs\.?|versus|v\.?|and|against)\s+'
     r'([A-Za-z][A-Za-z\.]*(?:\s+[A-Za-z][A-Za-z\.]*){0,2})\b',
     re.IGNORECASE
 )
-# Fallback: no connector at all, just "Team A Team B match/game/fixture"
-# (how people often type it on mobile, e.g. "Norway england match").
 _TEAM_NOCONNECTOR_RE = re.compile(
     r'\b([A-Za-z]+)\s+([A-Za-z]+)\s+(?:match|game|fixture|kickoff|kick off)\b',
     re.IGNORECASE
@@ -524,10 +529,6 @@ _TEAM_NOCONNECTOR_RE = re.compile(
 _SKIP_WORDS = {"the","a","an","this","that","next","upcoming","today","tomorrow","when","does","is","remind","me"}
 
 def get_fixture_datetime(query_text: str) -> Optional[str]:
-    """Looks up the real kickoff date/time for a match mentioned in query_text
-    using API-FOOTBALL (api-sports.io), rather than guessing from news search.
-    Returns a short description string for the task parser, or None if no
-    fixture could be found (caller should fall back to a general search)."""
     if not SPORTAPI_KEY:
         return None
 
@@ -713,9 +714,6 @@ def fetch_url_content(url: str) -> str:
 def detect_urls(text: str) -> list:
     return re.findall(r'https?://\S+', text)
 
-# ═══════════════════════════════════════════════════════════
-# AI & MEMORY
-# ═══════════════════════════════════════════════════════════
 async def get_user_profile_data(user_id: str) -> dict:
     if not supabase: return {}
     try:
@@ -725,12 +723,6 @@ async def get_user_profile_data(user_id: str) -> dict:
         logger.error("Profile fetch error: %s", e)
         return {}
 
-# ═══════════════════════════════════════════════════════════
-# PENDING ACTIONS — lightweight multi-turn state (stored in
-# Supabase, not memory, so it survives across workers/restarts)
-# Requires a table: user_pending_actions(user_id text primary key,
-# action_type text, payload jsonb default '{}', created_at timestamptz)
-# ═══════════════════════════════════════════════════════════
 async def set_pending_action(user_id: str, action_type: str, payload: dict = None):
     if not supabase: return
     try:
@@ -759,9 +751,6 @@ async def clear_pending_action(user_id: str):
     except Exception as e:
         logger.error("clear_pending_action error: %s", e)
 
-# ═══════════════════════════════════════════════════════════
-# DELETE — table map + classifier (any-language free text) + executor
-# ═══════════════════════════════════════════════════════════
 DELETE_TABLE_MAP = {
     "profile": ["user_profiles"],
     "memory":  ["chat_memory"],
@@ -776,9 +765,6 @@ DELETE_LABELS = {
 }
 
 async def classify_delete_intent(text: str) -> str:
-    """Classifies a free-typed delete request, in ANY language, into one
-    of PROFILE / MEMORY / TASKS / ALL / CANCEL using the raw LLM client
-    directly (bypassing the AIM persona so we get a clean single word)."""
     sys_prompt = (
         "You classify what a user wants deleted from their bot account. "
         "Reply with ONE WORD ONLY, no punctuation, no explanation: "
@@ -911,9 +897,6 @@ async def get_ai_response(
 ) -> Optional[str]:
     try:
         if profile is None: profile = await get_user_profile_data(user_id)
-        # build_enhanced_prompt is in core.py; it does NOT take is_admin_func —
-        # admin detection is injected via the prompt text built inside core.py
-        # using the is_admin import we pass via the is_admin parameter.
         prompt = build_enhanced_prompt(
             user_text, user_id, profile, is_admin,
             session_summary, recent_history, older_context,
@@ -1023,9 +1006,6 @@ async def search_memory(user_id: str) -> str:
         logger.error("Memory search error: %s", e)
         return "Memory search is having issues."
 
-# ═══════════════════════════════════════════════════════════
-# SEND MESSAGE
-# ═══════════════════════════════════════════════════════════
 async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = None, message_id: Optional[int] = None):
     if not bot: return
     try:
@@ -1042,10 +1022,6 @@ async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = No
             else:           await bot.send_message(chat_id=chat_id, text=text[:TELEGRAM_MAX_CHARS])
         except Exception as e2: logger.error("Fallback send failed: %s", e2)
 
-
-# ═══════════════════════════════════════════════════════════
-# EMPIRE ID / LINK HELPERS
-# ═══════════════════════════════════════════════════════════
 _EMPIRE_INTENT_PHRASES = [
     "empire id", "create my id", "get my id", "empire account",
     "link my account", "link telegram", "connect my account",
@@ -1053,25 +1029,6 @@ _EMPIRE_INTENT_PHRASES = [
     "link to web", "connect to web", "i want an account", "how do i sign up",
     "register", "web version", "use on web", "access on web",
 ]
-
-
-_LEARNING_INTENT_PHRASES = [
-    "teach me", "i want to learn", "learn chess", "learn math", "learn language",
-    "how is my chess", "my chess progress", "chess stats", "chess score",
-    "how am i doing in chess", "chess games", "my chess games", "chess elo",
-    "play chess", "chess lesson", "chess practice", "chess training",
-    "arabic", "french", "spanish", "german", "chinese", "japanese", "korean",
-    "learn arabic", "learn french", "learn spanish", "learn chinese",
-    "math lesson", "calculus", "algebra", "geometry", "practice math",
-]
-
-def _is_learning_intent(text: str) -> bool:
-    tl = text.lower()
-    return any(phrase in tl for phrase in _LEARNING_INTENT_PHRASES)
-
-def _is_empire_intent(text: str) -> bool:
-    tl = text.lower()
-    return any(phrase in tl for phrase in _EMPIRE_INTENT_PHRASES)
 
 async def _handle_learning_query(user_id: str, chat_id: int, message_id: int, user_text: str):
     """Handle chess/learning queries — reads from user_learning_profiles and chess tables."""
@@ -1091,15 +1048,12 @@ async def _handle_learning_query(user_id: str, chat_id: int, message_id: int, us
 
     tl = user_text.lower()
 
-    # Chess-specific queries
     if any(kw in tl for kw in ["chess", "elo", "games", "checkmate", "pawn", "knight", "bishop", "rook", "queen", "king"]):
         try:
-            # Get chess profile
             lp_res = supabase.table("user_learning_profiles").select("*").eq("user_id", user_id).single().execute()
 
             lp = lp_res.data if lp_res.data else None
 
-            # Get recent games
             games_res = supabase.table("chess_games").select("result, difficulty, created_at, moves").eq("user_id", user_id).order("created_at", desc=True).limit(5).execute()
 
             games = games_res.data or []
@@ -1113,7 +1067,6 @@ async def _handle_learning_query(user_id: str, chat_id: int, message_id: int, us
                 ), reply_to=message_id)
                 return
 
-            # Build stats message
             games_played = lp.get("chess_games_played", 0) if lp else len(games)
             wins = lp.get("chess_wins", 0) if lp else sum(1 for g in games if g.get("result") == "win")
             losses = lp.get("chess_losses", 0) if lp else sum(1 for g in games if g.get("result") == "loss")
@@ -1157,7 +1110,6 @@ async def _handle_learning_query(user_id: str, chat_id: int, message_id: int, us
             ), reply_to=message_id)
         return
 
-    # Generic learning intent
     await send_text_chunks(chat_id, (
         f"🎓 <b>Empire Learn</b> — What would you like to master?\n\n"
         f'♟️ <a href="https://learn.empireunion.xyz/learn/chess?empire_id={empire_id}">Chess</a>\n'
@@ -1166,9 +1118,7 @@ async def _handle_learning_query(user_id: str, chat_id: int, message_id: int, us
         f'Or just tell me: "Teach me [topic]" and I\'ll guide you! 🇳🇬'
     ), reply_to=message_id)
 
-
 async def _handle_link_command(user_id: str, chat_id: int, message_id: int):
-    """Sends Logto OAuth link. Called from /link, /account, and casual intent."""
     ep  = os.environ.get("LOGTO_ENDPOINT", "").rstrip("/")
     cid = os.environ.get("LOGTO_CLIENT_ID", "")
     if not ep or not cid:
@@ -1194,9 +1144,6 @@ async def _handle_link_command(user_id: str, chat_id: int, message_id: int):
         "⏳ Link expires in <b>10 minutes</b>."
     ), reply_to=message_id)
 
-# ═══════════════════════════════════════════════════════════
-# BOT COMMANDS
-# ═══════════════════════════════════════════════════════════
 async def handle_bot_command(user_id: str, chat_id: int, message_id: int, user_text: str) -> bool:
     tl = user_text.lower().strip()
 
@@ -1351,10 +1298,6 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
         await send_text_chunks(chat_id, await create_task_in_db(user_id, task_data), reply_to=message_id)
         return True
 
-    # ── BARE /news, /verse, /word (no args) — previously fell through
-    # silently to the general AI chat handler, which correctly said it
-    # couldn't schedule anything on its own. Now we ask for a time and
-    # pick it up via the pending-action check in handle_message_async. ──
     elif tl == "/news":
         await set_pending_action(user_id, "awaiting_recurring_time", {"category": "news"})
         await send_text_chunks(chat_id, "🕒 What time should I send your daily news? (e.g. 8am, 6pm)", reply_to=message_id)
@@ -1376,7 +1319,6 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
         if existing_id:
             await send_text_chunks(chat_id, f"👑 Your Empire ID: <b>{existing_id}</b>\n\nSave it! You'll use it to log into the Web App.", reply_to=message_id)
         elif profile.get("logto_id"):
-            # Edge case: account is linked but empire_id wasn't saved locally — re-import it.
             eid_record = eid_get_by_logto(profile["logto_id"])
             if eid_record and eid_record.get("empire_id"):
                 empire_id = eid_record["empire_id"]
@@ -1428,8 +1370,7 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
             ), reply_to=message_id)
             return True
 
-        # Parse topic from command
-        topic = "chess"  # default
+        topic = "chess"
         if tl.startswith("/learn "):
             topic_arg = tl[7:].strip().lower()
             if topic_arg in ["chess", "math", "language"]:
@@ -1443,7 +1384,6 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
         ), reply_to=message_id)
         return True
 
-    # ── ADMIN COMMANDS — delegated entirely to admin.py ──────
     elif tl.startswith("/admin"):
         return await handle_admin_command(
             user_id, chat_id, message_id, user_text,
@@ -1453,16 +1393,12 @@ Just talk to me naturally — I'll understand! 🇳🇬✨"""
 
     return False
 
-# ═══════════════════════════════════════════════════════════
-# INLINE QUERY
-# ═══════════════════════════════════════════════════════════
 async def handle_callback_query_async(cb):
-    """Handles taps on inline keyboard buttons (currently: /delete choices)."""
     data    = cb.data or ""
     user_id = str(cb.from_user.id) if cb.from_user else ""
     chat_id = cb.message.chat.id if cb.message else None
     try:
-        await bot.answer_callback_query(cb.id)  # stop the loading spinner
+        await bot.answer_callback_query(cb.id)
     except Exception as e:
         logger.error("answer_callback_query error: %s", e)
 
@@ -1475,7 +1411,7 @@ async def handle_callback_query_async(cb):
             if cb.message:
                 await bot.edit_message_reply_markup(chat_id=chat_id, message_id=cb.message.message_id, reply_markup=None)
         except Exception:
-            pass  # non-fatal — buttons just stay visible if this fails
+            pass
 
 async def handle_inline_query_async(inline_query):
     qid, qtext = inline_query.id, inline_query.query.strip()
@@ -1538,45 +1474,19 @@ def is_inline_placeholder(text: str) -> Tuple[bool, str]:
     if q: return True, q
     return False, ""
 
-# ═══════════════════════════════════════════════════════════
-# MAIN MESSAGE HANDLER
-# ═══════════════════════════════════════════════════════════
-
-async def handle_learning_intent(user_id: str, chat_id: int, message_id: int, user_text: str) -> bool:
-    """Detect and handle learning-related messages. Returns True if handled."""
-    if not _is_learning_intent(user_text):
-        return False
-    await _handle_learning_query(user_id, chat_id, message_id, user_text)
-    return True
-
 async def handle_message_async(update: Update):
     if not update.message: 
         logger.info("No message in update")
         return
 
-    logger.info("=== MESSAGE RECEIVED ===")
-    logger.info(f"Update ID: {update.update_id}")
-    logger.info(f"Message type: {type(update.message)}")
-    logger.info(f"Has text: {bool(update.message.text)}")
-    logger.info(f"Has photo: {bool(update.message.photo)}")
-    logger.info(f"Has document: {bool(update.message.document)}")
-    logger.info(f"Has video: {bool(update.message.video)}")
-    logger.info(f"Has voice: {bool(update.message.voice)}")
-
-    if update.message.document:
-        logger.info(f"DOCUMENT DETECTED: {update.message.document.file_name}")
-    # ... rest of your function
     media_processed = False
 
-    
     user       = update.message.from_user
     chat       = update.message.chat
     user_text  = update.message.text or ""
     chat_type  = chat.type if chat else "private"
     message_id = update.message.message_id
 
-    # ... rest of your code
-    # Voice / Audio
     if update.message.voice or update.message.audio:
         file_obj = update.message.voice or update.message.audio
         await send_text_chunks(chat.id, "🎙️ Listening...", reply_to=message_id)
@@ -1589,7 +1499,6 @@ async def handle_message_async(update: Update):
             return
         media_processed = True
 
-    # Photo
     if update.message.photo:
         photo     = update.message.photo[-1]
         temp_path = f"photo_{photo.file_id}.jpg"
@@ -1615,7 +1524,6 @@ async def handle_message_async(update: Update):
             if os.path.exists(temp_path): os.remove(temp_path)
         media_processed = True
 
-    # Document
     if update.message.document:
         media_processed = True
         doc      = update.message.document
@@ -1649,7 +1557,6 @@ async def handle_message_async(update: Update):
         finally:
             if os.path.exists(temp_path): os.remove(temp_path)
 
-    # Video / Animation
     if update.message.video or update.message.animation:
         media_processed = True
         video_obj = update.message.video or update.message.animation
@@ -1681,19 +1588,14 @@ async def handle_message_async(update: Update):
         finally:
             if os.path.exists(temp_path): os.remove(temp_path)
 
-    # Fallback if nothing was processed
     if not media_processed and not user_text:
         await send_text_chunks(chat.id, "I can only read text, voice, photos, documents, and videos.")
         return
 
-    # === NORMAL FLOW (Commands, AI Response, etc.) ===
     user_id  = str(user.id)
     username = user.username or user.first_name or "User"
     logger.info("📩 [%s/%s] '%s'", user_id, chat_type, user_text[:80])
 
-    # ── PENDING ACTION CHECK — free-text follow-ups to /delete or bare
-    # /news, /verse, /word. A new "/" command always takes priority and
-    # silently cancels whatever was pending. ──
     if not user_text.startswith("/"):
         pending = await get_pending_action(user_id)
         if pending:
@@ -1708,7 +1610,7 @@ async def handle_message_async(update: Update):
                 elif choice in ("profile", "memory", "tasks", "all"):
                     await send_text_chunks(chat.id, await execute_delete(user_id, choice), reply_to=message_id)
                 else:
-                    await set_pending_action(user_id, "delete_choice")  # keep waiting
+                    await set_pending_action(user_id, "delete_choice")
                     await send_text_chunks(chat.id, "❓ Sorry, I couldn't tell what you want deleted — try tapping a button above, or say it plainly (e.g. \"delete my memory\").", reply_to=message_id)
                 return
 
@@ -1736,13 +1638,9 @@ async def handle_message_async(update: Update):
                 await clear_pending_action(user_id)
 
     if user_text.startswith("/"):
-        await clear_pending_action(user_id)  # a fresh command supersedes any pending follow-up
+        await clear_pending_action(user_id)
         cmd_handled = await handle_bot_command(user_id, chat.id, message_id, user_text)
         if cmd_handled:
-            # NOTE: /admin commands save their OWN memory entries inside
-            # admin.py (with the real question + real answer), so AIM
-            # actually remembers what it was asked to do. We skip the
-            # generic placeholder save here to avoid double / low-value entries.
             if not user_text.lower().strip().startswith("/admin"):
                 try:
                     cmd_response = f"[Command handled: {user_text.split()[0]}]"
@@ -1767,10 +1665,6 @@ async def handle_message_async(update: Update):
         await update_user_profile(user_id, username, "general")
         return
 
-    # ── Music generation intercept ──
-    # AIM/Nebulae cannot generate music. Catch this BEFORE the AI call so
-    # we never accidentally route a "make me a song" request through the
-    # TTS (spoken word) pipeline.
     if nebulae.is_music_generation_request(user_text):
         _music_resp = (
             "🎵 I can't generate music yet — Nebulae only handles spoken "
@@ -1780,47 +1674,6 @@ async def handle_message_async(update: Update):
         await send_text_chunks(chat.id, _music_resp, reply_to=message_id)
         await save_chat_memory(user_id, username, user_text, _music_resp, chat_type, "entertainment")
         await update_user_profile(user_id, username, "entertainment")
-        return
-
-    # NOTE: Task/reminder detection used to intercept here with a rigid
-    # keyword+regex pipeline (handle_task_message) that called a separate,
-    # search-blind AI call to parse the message straight into a task. That
-    # meant it could never look anything up first — "remind me before the
-    # Norway v England match" had no way to learn when that match kicks off.
-    # Reminders now flow into the same AI loop as everything else below,
-    # which already knows how to SEARCH_TRIGGER when it needs current info,
-    # and can emit [CREATE_TASK:{...}] once it actually has enough to
-    # schedule. See BASE_SYSTEM_PROMPT in core.py for the instructions that
-    # drive this, and the CREATE_TASK handling in the loop below.
-
-    # ── Learning / Chess intent ──
-    if await handle_learning_intent(user_id, chat.id, message_id, user_text):
-        try:
-            await save_chat_memory(user_id, username, user_text, "[Learning query handled]", chat_type, "education")
-            await update_user_profile(user_id, username, "education")
-        except Exception as e:
-            logger.error("Failed to save learning interaction: %s", e)
-        return
-
-    # ── Casual Empire ID / link intent ──
-    if _is_empire_intent(user_text):
-        profile_check = await get_user_profile_data(user_id)
-        if not profile_check.get("logto_id"):
-            _empire_resp = (
-                "🌍 Sounds like you want to set up your Empire AI account! "
-                "Told user to say yes or tap /link to get started."
-            )
-            await send_text_chunks(chat.id, (
-                "🌍 Sounds like you want to set up your <b>Empire AI account</b>!\n\n"
-                "This links your Telegram to the Empire AI web app — so when it launches, "
-                "AIM will remember everything you\'ve told me here.\n\n"
-                "Want me to send you the link? Just say <b>yes</b> or tap /link anytime. 🇳🇬"
-            ), reply_to=message_id)
-        else:
-            _empire_resp = "Showed user their already-linked Empire account."
-            await _handle_link_command(user_id, chat.id, message_id)
-        await save_chat_memory(user_id, username, user_text, _empire_resp, chat_type, "general")
-        await update_user_profile(user_id, username, "general")
         return
 
     if chat_type in ("group", "supergroup"):
@@ -1856,7 +1709,7 @@ async def handle_message_async(update: Update):
             if "No search results" not in sr:
                 web_context = f"Web Search Results for '{user_text}':\n{sr}"
 
-        max_iter, iteration, final_answer, tool_status = 3, 0, None, ""
+        max_iter, iteration, final_answer, tool_status = 4, 0, None, ""
         while iteration < max_iter:
             iteration += 1
             answer = await get_ai_response(user_text, user_id, chat_type, profile, session_summary, recent_history, older_context, web_context, tool_status, gap_seconds)
@@ -1880,6 +1733,25 @@ async def handle_message_async(update: Update):
                 else:
                     final_answer = answer
                     break
+
+            elm = re.search(r'\[OPEN_LEARNING:\s*(\w+)\]', answer, re.IGNORECASE)
+            if elm:
+                topic = elm.group(1).strip().lower()
+                answer = re.sub(r'\[OPEN_LEARNING:\s*\w+\]', '', answer, flags=re.IGNORECASE).strip()
+                if answer:
+                    await send_text_chunks(chat.id, answer, reply_to=message_id)
+                await _handle_learning_query(user_id, chat.id, message_id, f"teach me {topic}")
+                final_answer = None
+                break
+
+            elk = re.search(r'\[EMPIRE_LINK\]', answer, re.IGNORECASE)
+            if elk:
+                answer = re.sub(r'\[EMPIRE_LINK\]', '', answer, flags=re.IGNORECASE).strip()
+                if answer:
+                    await send_text_chunks(chat.id, answer, reply_to=message_id)
+                await _handle_link_command(user_id, chat.id, message_id)
+                final_answer = None
+                break
 
             ctm = re.search(r'\[CREATE_TASK:(\{.*?\})\]', answer, re.IGNORECASE | re.DOTALL)
             if ctm:
@@ -1917,12 +1789,6 @@ async def handle_message_async(update: Update):
                         ts = f"{mins}m {secs}s" if mins else f"{secs}s"
                         answer = re.sub(r'\[STOPWATCH:STOP\]','',answer,flags=re.IGNORECASE).strip() + f"\n\n_⏱️ Stopped! Time: {ts}_"
 
-            # ── CODE FILE HANDLER ──
-            # Uses an explicit closing tag [/CODE_FILE] instead of matching up to
-            # the next "]" — code almost always contains "]" characters itself
-            # (lists, array indexing, JSON, etc.), so a naive non-greedy match up
-            # to the first "]" would truncate the file. The explicit closing tag
-            # fixes that.
             code_match = re.search(
                 r'\[CODE_FILE:(\w+)\|(.*?)\]\[/CODE_FILE\]',
                 answer, re.IGNORECASE | re.DOTALL
@@ -1997,13 +1863,17 @@ async def handle_message_async(update: Update):
             final_answer = answer
             break
 
-        if final_answer is None:
+        if final_answer is None and iteration >= max_iter:
             final_answer = "I tried searching but couldn\'t find results."
 
-        await send_text_chunks(chat.id, final_answer, reply_to=message_id)
-        topic = await extract_topic(user_text, final_answer)
-        await save_chat_memory(user_id, username, user_text, final_answer, chat_type, topic)
-        await update_user_profile(user_id, username, topic)
+        if final_answer is not None:
+            await send_text_chunks(chat.id, final_answer, reply_to=message_id)
+            topic = await extract_topic(user_text, final_answer)
+            await save_chat_memory(user_id, username, user_text, final_answer, chat_type, topic)
+            await update_user_profile(user_id, username, topic)
+        else:
+            await save_chat_memory(user_id, username, user_text, "[Handled via action tag]", chat_type, "education")
+            await update_user_profile(user_id, username, "education")
 
         if profile.get("total_chats", 0) % 4 == 0:
             recent_msgs = supabase.table("chat_memory").select("message,response").eq("user_id",str(user_id)).order("created_at",desc=True).limit(4).execute()
@@ -2015,22 +1885,14 @@ async def handle_message_async(update: Update):
         logger.error("Critical error in handle_message_async: %s", e)
         await send_text_chunks(chat.id, "🛠️ Something went wrong.", reply_to=message_id)
 
-# ═══════════════════════════════════════════════════════════
-# FLASK ROUTES
-# ═══════════════════════════════════════════════════════════
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status":"AIM Bot is live!","version":"v9.7","ai":"DeepSeek V4" if USE_DEEPSEEK else "Gemini"})
+    return jsonify({"status":"AIM Bot is live!","version":"v9.8","ai":"DeepSeek V4" if USE_DEEPSEEK else "Gemini"})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json(force=True)
-        logger.info(f"RAW WEBHOOK RECEIVED - keys: {list(data.keys())}")
-        if "message" in data:
-            msg = data["message"]
-            logger.info(f"Message types - text:{'text' in msg}, photo:{'photo' in msg}, document:{'document' in msg}, video:{'video' in msg}")
-        
         uid = data.get("update_id")
         if uid and is_duplicate_update(uid): return "OK", 200
         upd = Update.de_json(data, bot)
@@ -2044,7 +1906,6 @@ def webhook():
 
 @app.route("/auth/callback", methods=["GET"])
 def auth_callback():
-    """Logto OAuth callback — exchanges code for tokens, links accounts."""
     code  = request.args.get("code","")
     state = request.args.get("state","")
     error = request.args.get("error","")
@@ -2072,9 +1933,6 @@ def auth_callback():
     if not logto_sub:
         return _html_page("❌ No User ID", "<p>Logto did not return a user ID.</p>", success=False), 500
 
-    # ── Get/create the Empire ID from the SEPARATE EmpireID Supabase project.
-    # This is the single source of truth for Empire IDs — AIM never invents
-    # one locally, it only imports whatever this project hands back. ──
     eid_record = eid_get_by_logto(logto_sub)
     if eid_record:
         empire_id = eid_record.get("empire_id")
@@ -2083,7 +1941,7 @@ def auth_callback():
         if ok:
             empire_id = result
         elif result.startswith("✅ User already has Empire ID:"):
-            empire_id = result.split(":", 1)[1].strip()  # race: created between our check and now
+            empire_id = result.split(":", 1)[1].strip()
         else:
             logger.error("Empire ID creation failed: %s", result)
             run_async(bot.send_message(chat_id=chat_id, text="⚠️ Login verified but we couldn't set up your Empire ID. Please try /link again."))
@@ -2151,12 +2009,11 @@ def set_webhook():
         return jsonify({"error": "Bot or WEBHOOK_URL not configured"}), 500
     try:
         future = run_async(bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"))
-        future.result(timeout=10)  # Wait for it to complete
+        future.result(timeout=10)
         return jsonify({"status": "Webhook set successfully!"})
     except Exception as e:
         logger.error("Set webhook error: %s", e)
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/delete-webhook", methods=["GET"])
 def delete_webhook():
@@ -2172,7 +2029,6 @@ def delete_webhook():
 
 @app.route("/debug/logto", methods=["GET"])
 def debug_logto():
-    """Check that Logto env vars are actually visible at runtime."""
     return jsonify({
         "LOGTO_ENDPOINT":     bool(os.environ.get("LOGTO_ENDPOINT")),
         "LOGTO_CLIENT_ID":    bool(os.environ.get("LOGTO_CLIENT_ID")),
