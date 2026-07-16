@@ -2037,6 +2037,38 @@ def debug_logto():
         "redirect_uri":       get_redirect_uri(),
         "auth_url_sample":    build_logto_auth_url("test_state_123") if os.environ.get("LOGTO_ENDPOINT") else "NOT CONFIGURED",
     })
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EMPIRE ID LOOKUP API (for chess app and other mini-apps)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/empire-id-by-logto", methods=["POST"])
+async def get_empire_id_by_logto():
+    """Lookup Empire ID by Logto user ID — used by mini-apps for auth."""
+    data = request.get_json() or {}
+    logto_id = data.get("logto_id")
+    
+    if not logto_id:
+        return jsonify({"error": "No logto_id provided"}), 400
+    
+    try:
+        from empire_id_generator import get_user_by_logto
+        user = get_user_by_logto(logto_id)
+        
+        if user:
+            return jsonify({
+                "empire_id": user.get("empire_id"),
+                "username": user.get("username"),
+                "email": user.get("email")
+            })
+        
+        return jsonify({"error": "No Empire ID found for this Logto user"}), 404
+        
+    except Exception as e:
+        logger.error(f"[EmpireID Lookup] Error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+        
 @app.route("/privacy", methods=["GET"])
 def privacy_policy():
     return "<h1>Privacy Policy</h1><p>Coming soon.</p>", 200, {"Content-Type":"text/html"}
