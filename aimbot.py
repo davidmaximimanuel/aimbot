@@ -412,24 +412,38 @@ def check_tasks_background():
                 user_id, task_id = task["user_id"], task["id"]
                 description, task_type = task["task_description"], task["task_type"]
                 category = task.get("task_category", "reminder")
-                if category == "news":
-                    raw = get_latest_news("Nigeria latest news today", 3)
-                    content = _synthesize_daily_content("news", raw)
-                    msg = f"📰 <b>Your Daily News Update:</b>\n\n{content[:3000]}"
-                elif category == "verse":
-                    raw = search_web("daily bible verse today", 1)
-                    content = _synthesize_daily_content("verse", raw)
-                    msg = f"📖 <b>Daily Bible Verse:</b>\n\n{content[:1000]}"
-                elif category == "word":
-                    future = run_async(_get_deduped_word_of_day(user_id))
-                    content = future.result(timeout=25)
-                    msg = f"📚 <b>Word of the Day:</b>\n\n{content[:500]}"
-                else:
-                    msg = f"⏰ <b>Reminder:</b>\n\n{description}"
+                msg = None
+                # CRITICAL: each task gets its own try/except. If content
+                # generation fails (AI timeout, rate limit, etc.) we still
+                # fall through to advancing next_run / deactivating below —
+                # otherwise a single failure leaves next_run in the past and
+                # the task fires again every 30s forever (infinite retry loop
+                # that was silently burning the entire AI quota).
                 try:
-                    run_async(bot.send_message(chat_id=int(user_id), text=msg, parse_mode=ParseMode.HTML))
-                except Exception as send_err:
-                    logger.error("Task send error: %s", send_err)
+                    if category == "news":
+                        raw = get_latest_news("Nigeria latest news today", 3)
+                        content = _synthesize_daily_content("news", raw)
+                        msg = f"📰 <b>Your Daily News Update:</b>\n\n{content[:3000]}"
+                    elif category == "verse":
+                        raw = search_web("daily bible verse today", 1)
+                        content = _synthesize_daily_content("verse", raw)
+                        msg = f"📖 <b>Daily Bible Verse:</b>\n\n{content[:1000]}"
+                    elif category == "word":
+                        future = run_async(_get_deduped_word_of_day(user_id))
+                        content = future.result(timeout=25)
+                        msg = f"📚 <b>Word of the Day:</b>\n\n{content[:500]}"
+                    else:
+                        msg = f"⏰ <b>Reminder:</b>\n\n{description}"
+                except Exception as gen_err:
+                    logger.error("Task content generation error (%s): %s", category, gen_err)
+                    msg = None  # skip sending this cycle, but still advance/deactivate below
+
+                if msg:
+                    try:
+                        run_async(send_text_chunks(int(user_id), msg))
+                    except Exception as send_err:
+                        logger.error("Task send error: %s", send_err)
+
                 if task_type == "one_time":
                     try:
                         supabase.table("user_tasks").update({"is_active": False, "completed_at": datetime.now(timezone.utc).isoformat()}).eq("id", task_id).execute()
@@ -1006,21 +1020,71 @@ async def search_memory(user_id: str) -> str:
         logger.error("Memory search error: %s", e)
         return "Memory search is having issues."
 
-async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = None, message_id: Optional[int] = None):
+SAFE_CHUNK_LIMIT = 3800  # stay comfortably under Telegram's 4096 hard limit
+
+def _split_into_chunks(text: str, limit: int = SAFE_CHUNK_LIMIT) -> list:
+    """Split long text into at most a few human-readable chunks, breaking on
+    paragraph boundaries first, then sentence boundaries, then hard-wrapping
+    as a last resort. Keeps it to a handful of messages, not dozens."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        # Prefer breaking on a paragraph break, then a sentence end, then a space
+        split_at = window.rfind("\n\n")
+        if split_at < limit * 0.4:
+            split_at = window.rfind(". ")
+            if split_at >= 0:
+                split_at += 1  # keep the period with the preceding chunk
+        if split_at < limit * 0.4:
+            split_at = window.rfind("\n")
+        if split_at < limit * 0.4:
+            split_at = window.rfind(" ")
+        if split_at <= 0:
+            split_at = limit  # hard cut, no good break point found
+
+        chunks.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = None, message_id: Optional[int] = None, parse_mode=ParseMode.HTML):
     if not bot: return
-    try:
-        if message_id:
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text[:TELEGRAM_MAX_CHARS], parse_mode=ParseMode.HTML)
-        else:
-            kw = {"chat_id":chat_id, "text":text[:TELEGRAM_MAX_CHARS], "parse_mode":ParseMode.HTML}
-            if reply_to: kw["reply_to_message_id"] = reply_to
-            await bot.send_message(**kw)
-    except Exception as e:
-        logger.error("Send error: %s", e)
+    # Editing an existing message can only ever produce ONE message, so if
+    # we're editing, truncate rather than split (Telegram has no concept of
+    # "edit into multiple messages").
+    if message_id:
         try:
-            if message_id: await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text[:TELEGRAM_MAX_CHARS])
-            else:           await bot.send_message(chat_id=chat_id, text=text[:TELEGRAM_MAX_CHARS])
-        except Exception as e2: logger.error("Fallback send failed: %s", e2)
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text[:TELEGRAM_MAX_CHARS], parse_mode=parse_mode)
+        except Exception as e:
+            logger.error("Send error: %s", e)
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text[:TELEGRAM_MAX_CHARS])
+            except Exception as e2:
+                logger.error("Fallback send failed: %s", e2)
+        return
+
+    chunks = _split_into_chunks(text)
+    for i, chunk in enumerate(chunks):
+        try:
+            kw = {"chat_id": chat_id, "text": chunk, "parse_mode": parse_mode}
+            if reply_to and i == 0:
+                kw["reply_to_message_id"] = reply_to
+            await bot.send_message(**kw)
+        except Exception as e:
+            logger.error("Send error: %s", e)
+            try:
+                kw2 = {"chat_id": chat_id, "text": chunk}
+                if reply_to and i == 0:
+                    kw2["reply_to_message_id"] = reply_to
+                await bot.send_message(**kw2)
+            except Exception as e2:
+                logger.error("Fallback send failed: %s", e2)
 
 _EMPIRE_INTENT_PHRASES = [
     "empire id", "create my id", "get my id", "empire account",
