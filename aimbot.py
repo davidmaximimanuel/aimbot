@@ -29,7 +29,55 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from supabase import create_client, Client
-from empire_id_generator import create_empire_id as eid_create, get_user_by_logto as eid_get_by_logto
+# NOTE: empire_id_generator.py is no longer used — Empire ID lookups/creation
+# now go through the standalone Empire ID service over HTTP (see eid_create /
+# eid_get_by_logto below), so every app (AIM, ai.empireunion.xyz,
+# empireunion.xyz) shares one implementation instead of each having its own.
+EMPIRE_ID_SERVICE_URL = os.environ.get("EMPIRE_ID_SERVICE_URL", "")
+EMPIRE_ID_SERVICE_API_KEY = os.environ.get("EMPIRE_ID_SERVICE_API_KEY", "")
+
+def _eid_headers():
+    return {"X-API-Key": EMPIRE_ID_SERVICE_API_KEY, "Content-Type": "application/json"}
+
+def eid_get_by_logto(logto_id: str) -> Optional[dict]:
+    """Looks up a user's Empire ID record by their Logto id via the
+    Empire ID service. Returns the record dict, or None if not found
+    or the service is unreachable."""
+    if not EMPIRE_ID_SERVICE_URL:
+        logger.error("EMPIRE_ID_SERVICE_URL not configured")
+        return None
+    try:
+        r = requests.get(
+            f"{EMPIRE_ID_SERVICE_URL}/v1/empire-id/by-logto/{logto_id}",
+            headers=_eid_headers(), timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json().get("record")
+        return None  # 404 = not found, anything else also treated as "not found" here
+    except Exception as e:
+        logger.error("eid_get_by_logto error: %s", e)
+        return None
+
+def eid_create(logto_id: str, username: str, email: str, source: str = "telegram_bot"):
+    """Get-or-create via the Empire ID service. Returns (ok: bool, result: str)
+    to match the old empire_id_generator.py signature — result is the empire_id
+    on success, or an error message on failure."""
+    if not EMPIRE_ID_SERVICE_URL:
+        return False, "❌ Empire ID service not configured"
+    try:
+        r = requests.post(
+            f"{EMPIRE_ID_SERVICE_URL}/v1/empire-id",
+            headers=_eid_headers(),
+            json={"logto_id": logto_id, "username": username, "email": email, "source": source},
+            timeout=10,
+        )
+        if r.ok:
+            data = r.json()
+            return True, data.get("empire_id")
+        return False, f"❌ Empire ID service error ({r.status_code}): {r.text}"
+    except Exception as e:
+        logger.error("eid_create error: %s", e)
+        return False, f"❌ Empire ID service unreachable: {e}"
 from google import genai
 from google.genai import types
 
@@ -2004,8 +2052,6 @@ def auth_callback():
         ok, result = eid_create(logto_id=logto_sub, username=logto_name, email=logto_email, source="telegram_bot")
         if ok:
             empire_id = result
-        elif result.startswith("✅ User already has Empire ID:"):
-            empire_id = result.split(":", 1)[1].strip()
         else:
             logger.error("Empire ID creation failed: %s", result)
             run_async(bot.send_message(chat_id=chat_id, text="⚠️ Login verified but we couldn't set up your Empire ID. Please try /link again."))
@@ -2116,8 +2162,7 @@ async def get_empire_id_by_logto():
         return jsonify({"error": "No logto_id provided"}), 400
     
     try:
-        from empire_id_generator import get_user_by_logto
-        user = get_user_by_logto(logto_id)
+        user = eid_get_by_logto(logto_id)
         
         if user:
             return jsonify({
