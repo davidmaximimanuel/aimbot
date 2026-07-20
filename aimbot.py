@@ -865,10 +865,34 @@ async def execute_delete(user_id: str, choice: str) -> str:
         return "❌ Cannot delete — database offline."
     try:
         uid_str = str(user_id)
+
+        # Profile/ALL deletion also removes the shared Empire ID record
+        # (via the Empire ID service, same as the websites use) and
+        # queues their Logto login for manual removal — see that
+        # service's /v1/empire-id/by-logto/<id> DELETE route for why
+        # login deletion is queued rather than instant right now.
+        extra_note = ""
+        if choice in ("profile", "all"):
+            try:
+                profile = await get_user_profile_data(user_id)
+                logto_id = profile.get("logto_id")
+                if logto_id and EMPIRE_ID_SERVICE_URL:
+                    r = requests.delete(
+                        f"{EMPIRE_ID_SERVICE_URL}/v1/empire-id/by-logto/{logto_id}",
+                        params={"source": "telegram_bot"},
+                        headers=_eid_headers(), timeout=10,
+                    )
+                    if r.ok:
+                        extra_note = " Your Empire ID login will be fully removed within 48 hours."
+                    else:
+                        logger.error("Empire ID service delete failed: %s", r.text)
+            except Exception as e:
+                logger.error("Empire ID cleanup during /delete failed: %s", e)
+
         for table in DELETE_TABLE_MAP[choice]:
             supabase.table(table).delete().eq("user_id", uid_str).execute()
         logger.info("🗑️ User %s deleted: %s", uid_str, choice)
-        return f"✅ Deleted {DELETE_LABELS[choice]}."
+        return f"✅ Deleted {DELETE_LABELS[choice]}.{extra_note}"
     except Exception as e:
         logger.error("Delete error (%s): %s", choice, e)
         return "❌ Something went wrong during deletion. Please try again."
