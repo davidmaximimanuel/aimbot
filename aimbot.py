@@ -865,34 +865,10 @@ async def execute_delete(user_id: str, choice: str) -> str:
         return "❌ Cannot delete — database offline."
     try:
         uid_str = str(user_id)
-
-        # Profile/ALL deletion also removes the shared Empire ID record
-        # (via the Empire ID service, same as the websites use) and
-        # queues their Logto login for manual removal — see that
-        # service's /v1/empire-id/by-logto/<id> DELETE route for why
-        # login deletion is queued rather than instant right now.
-        extra_note = ""
-        if choice in ("profile", "all"):
-            try:
-                profile = await get_user_profile_data(user_id)
-                logto_id = profile.get("logto_id")
-                if logto_id and EMPIRE_ID_SERVICE_URL:
-                    r = requests.delete(
-                        f"{EMPIRE_ID_SERVICE_URL}/v1/empire-id/by-logto/{logto_id}",
-                        params={"source": "telegram_bot"},
-                        headers=_eid_headers(), timeout=10,
-                    )
-                    if r.ok:
-                        extra_note = " Your Empire ID login will be fully removed within 48 hours."
-                    else:
-                        logger.error("Empire ID service delete failed: %s", r.text)
-            except Exception as e:
-                logger.error("Empire ID cleanup during /delete failed: %s", e)
-
         for table in DELETE_TABLE_MAP[choice]:
             supabase.table(table).delete().eq("user_id", uid_str).execute()
         logger.info("🗑️ User %s deleted: %s", uid_str, choice)
-        return f"✅ Deleted {DELETE_LABELS[choice]}.{extra_note}"
+        return f"✅ Deleted {DELETE_LABELS[choice]}."
     except Exception as e:
         logger.error("Delete error (%s): %s", choice, e)
         return "❌ Something went wrong during deletion. Please try again."
@@ -1125,22 +1101,43 @@ def _split_into_chunks(text: str, limit: int = SAFE_CHUNK_LIMIT) -> list:
         chunks.append(remaining)
     return chunks
 
-async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = None, message_id: Optional[int] = None, parse_mode=ParseMode.HTML):
+async def send_text_chunks(
+    chat_id: int,
+    text: str,
+    reply_to: Optional[int] = None,
+    message_id: Optional[int] = None,
+    parse_mode=ParseMode.HTML,
+    platform: str = "telegram",
+):
+    """
+    Send a response to the user.
+    platform="telegram"  -> split into chunks, respect Telegram char limit
+    platform="web"/"mobile" -> send full text unsplit
+    """
     if not bot: return
-    # Editing an existing message can only ever produce ONE message, so if
-    # we're editing, truncate rather than split (Telegram has no concept of
-    # "edit into multiple messages").
+
+    # Editing: always truncate — Telegram cannot edit into multiple messages
     if message_id:
+        safe = text[:TELEGRAM_MAX_CHARS] if platform == "telegram" else text
         try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text[:TELEGRAM_MAX_CHARS], parse_mode=parse_mode)
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=safe, parse_mode=parse_mode)
         except Exception as e:
-            logger.error("Send error: %s", e)
+            logger.error("Edit error: %s", e)
             try:
-                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text[:TELEGRAM_MAX_CHARS])
+                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=safe)
             except Exception as e2:
-                logger.error("Fallback send failed: %s", e2)
+                logger.error("Fallback edit failed: %s", e2)
         return
 
+    # Non-Telegram platforms: send once with no char limit
+    if platform != "telegram":
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+        except Exception as e:
+            logger.error("Non-telegram send error: %s", e)
+        return
+
+    # Telegram: split into chunks and send each part
     chunks = _split_into_chunks(text)
     for i, chunk in enumerate(chunks):
         try:
@@ -1148,8 +1145,10 @@ async def send_text_chunks(chat_id: int, text: str, reply_to: Optional[int] = No
             if reply_to and i == 0:
                 kw["reply_to_message_id"] = reply_to
             await bot.send_message(**kw)
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.3)
         except Exception as e:
-            logger.error("Send error: %s", e)
+            logger.error("Send error chunk %d: %s", i, e)
             try:
                 kw2 = {"chat_id": chat_id, "text": chunk}
                 if reply_to and i == 0:
@@ -1793,25 +1792,6 @@ async def handle_message_async(update: Update):
         await process_inline_answer(chat.id, message_id, ph_query, user_id)
         return
 
-    if is_memory_search_query(user_text):
-        kws    = extract_search_keywords(user_text)
-        result = await search_memory_by_keyword(user_id, user_text) if kws else await search_memory(user_id)
-        await send_text_chunks(chat.id, result, reply_to=message_id)
-        await save_chat_memory(user_id, username, user_text, result[:500], chat_type, "general")
-        await update_user_profile(user_id, username, "general")
-        return
-
-    if nebulae.is_music_generation_request(user_text):
-        _music_resp = (
-            "🎵 I can't generate music yet — Nebulae only handles spoken "
-            "audio (text-to-speech), not composed music or singing. "
-            "I can still write you lyrics, or read text aloud for you!"
-        )
-        await send_text_chunks(chat.id, _music_resp, reply_to=message_id)
-        await save_chat_memory(user_id, username, user_text, _music_resp, chat_type, "entertainment")
-        await update_user_profile(user_id, username, "entertainment")
-        return
-
     if chat_type in ("group", "supergroup"):
         mentioned      = "@askaimbot" in user_text.lower()
         replied_to_bot = (
@@ -1829,11 +1809,44 @@ async def handle_message_async(update: Update):
         recent_history, older_context, gap_seconds = await get_conversation_context(user_id, user_text)
         web_context = ""
 
+        # ── Fetch any URLs the user pasted ──
         for url in detect_urls(user_text):
             c = fetch_url_content(url)
             if c and "Failed" not in c:
-                web_context += f"Content from {url}:\n{c}\n"
+                web_context += f"URL content from {url}:\n{c[:2000]}\n"
 
+        # ── AI decides if memory search is needed ──
+        try:
+            _mem_prompt = (
+                f"User message: \"{user_text}\"\n"
+                f"Does this require searching past conversation history? "
+                f"(e.g. asking about previous topics, referencing earlier chats, asking if you remember something)\n"
+                f"Reply ONLY: YES or NO"
+            )
+            _mem_dec = "NO"
+            if USE_DEEPSEEK and deepseek_client:
+                _mr = await deepseek_client.chat.completions.create(
+                    model="deepseek-v4-flash",
+                    messages=[{"role":"user","content":_mem_prompt}],
+                    temperature=0.1, max_tokens=5,
+                )
+                _mem_dec = _mr.choices[0].message.content.strip().upper() if _mr.choices else "NO"
+            elif gemini_client:
+                _mr = gemini_client.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=[types.Content(role="user",parts=[types.Part(text=_mem_prompt)])],
+                    config=types.GenerateContentConfig(temperature=0.1,max_output_tokens=5),
+                )
+                _mem_dec = _mr.text.strip().upper() if _mr and _mr.text else "NO"
+            if "YES" in _mem_dec:
+                kws = extract_search_keywords(user_text)
+                _mem_res = await search_memory_by_keyword(user_id, user_text) if kws else await search_memory(user_id)
+                if _mem_res and "haven't chatted" not in _mem_res:
+                    web_context = f"--- RELEVANT PAST CONVERSATIONS ---\n{_mem_res}\n--- END ---\n" + web_context
+        except Exception as _me:
+            logger.error("AI memory probe error: %s", _me)
+
+        # ── AI also decides if it needs to search the web ──
         if is_search_query(user_text) and not web_context:
             tl = user_text.lower()
             if "news" in tl or "latest" in tl or "today" in tl:
