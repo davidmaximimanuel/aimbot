@@ -1000,10 +1000,10 @@ async def get_ai_response(
             web_context, tool_status, gap_seconds
         )
         if USE_DEEPSEEK and deepseek_client:
-            r = await deepseek_client.chat.completions.create(model="deepseek-v4-flash", messages=[{"role":"system","content":BASE_SYSTEM_PROMPT},{"role":"user","content":prompt}], temperature=0.7, max_tokens=4096)
+            r = await deepseek_client.chat.completions.create(model="deepseek-v4-flash", messages=[{"role":"system","content":BASE_SYSTEM_PROMPT},{"role":"user","content":prompt}], temperature=0.7, max_tokens=1024)
             return r.choices[0].message.content if r.choices else None
         elif gemini_client:
-            r = gemini_client.models.generate_content(model="gemini-2.5-flash-lite", contents=[types.Content(role="user",parts=[types.Part(text=prompt)])], config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=4096))
+            r = gemini_client.models.generate_content(model="gemini-2.5-flash-lite", contents=[types.Content(role="user",parts=[types.Part(text=prompt)])], config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=1024))
             return r.text if r and r.text else None
         return None
     except Exception as e:
@@ -1174,23 +1174,16 @@ async def send_text_chunks(
 
     # Telegram: split into chunks and send each part
     chunks = _split_into_chunks(text)
-    total  = len(chunks)
     for i, chunk in enumerate(chunks):
-        # Add part markers so user knows the response continues
-        if total > 1:
-            if i < total - 1:
-                chunk = chunk + f"\n\n<i>... (continued in next message — part {i+1}/{total})</i>"
-            else:
-                chunk = f"<i>(part {i+1}/{total})</i>\n\n" + chunk
         try:
             kw = {"chat_id": chat_id, "text": chunk, "parse_mode": parse_mode}
             if reply_to and i == 0:
                 kw["reply_to_message_id"] = reply_to
             await bot.send_message(**kw)
-            if i < total - 1:
-                await asyncio.sleep(0.5)  # ensure Telegram orders them correctly
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.3)
         except Exception as e:
-            logger.error("Send error chunk %d/%d: %s", i+1, total, e)
+            logger.error("Send error chunk %d: %s", i, e)
             try:
                 kw2 = {"chat_id": chat_id, "text": chunk}
                 if reply_to and i == 0:
@@ -2232,26 +2225,26 @@ def debug_logto():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/empire-id-by-logto", methods=["POST"])
-async def get_empire_id_by_logto():
+def get_empire_id_by_logto():
     """Lookup Empire ID by Logto user ID — used by mini-apps for auth."""
-    data = request.get_json() or {}
-    logto_id = data.get("logto_id")
-    
-    if not logto_id:
-        return jsonify({"error": "No logto_id provided"}), 400
-    
     try:
+        data = request.get_json(silent=True) or {}
+        logto_id = data.get("logto_id")
+
+        if not logto_id:
+            return jsonify({"error": "No logto_id provided"}), 400
+
         user = eid_get_by_logto(logto_id)
-        
+
         if user:
             return jsonify({
                 "empire_id": user.get("empire_id"),
                 "username": user.get("username"),
                 "email": user.get("email")
             })
-        
+
         return jsonify({"error": "No Empire ID found for this Logto user"}), 404
-        
+
     except Exception as e:
         logger.error(f"[EmpireID Lookup] Error: {e}")
         return jsonify({"error": "Internal server error"}), 500
