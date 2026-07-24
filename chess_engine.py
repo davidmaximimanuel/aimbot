@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Tuple
 from flask import request, jsonify
-from chess import Chess, Move
+import chess as chess_lib
 
 logger = logging.getLogger("aimbot.chess")
 
@@ -76,7 +76,7 @@ Respond with ONLY the move, no explanation."""
             return None
 
         # Validate it's a legal move
-        game = Chess(fen)
+        game = chess_lib.Board(fen)
         legal_moves = [m.uci() for m in game.legal_moves]
 
         if move_text not in legal_moves:
@@ -463,7 +463,7 @@ def register_chess_routes(flask_app, supabase_client):
 
             if not aim_move:
                 # Fallback: random legal move
-                game = Chess(fen)
+                game = chess_lib.Board(fen)
                 legal = [m.uci() for m in game.legal_moves]
                 if legal:
                     import random
