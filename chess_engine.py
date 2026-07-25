@@ -442,6 +442,38 @@ def register_chess_routes(flask_app, supabase_client):
     just bridged in via aimbot's existing run_async() helper, the same
     pattern already used for /set-webhook and /delete-webhook."""
 
+    @flask_app.route("/api/chess/record-move", methods=["POST"])
+    def chess_record_move():
+        """Lightweight move history logging — NO AI calls, just a DB write.
+        This is what saveMoveToBackend() on the frontend should hit for
+        every move (player's and AIM's). It used to (incorrectly) hit
+        /api/chess/move instead — the same endpoint that computes AIM's
+        actual move — meaning every single "just save this move" call
+        was also running two full AI calls it never used the result of.
+        That's what made the whole game feel painfully slow."""
+        from aimbot import run_async
+        try:
+            data = request.get_json(silent=True) or {}
+            user_id = data.get("user_id")
+            empire_id = data.get("empire_id")
+            game_id = data.get("game_id")
+            move_san = data.get("move_san")
+            fen = data.get("fen")
+            move_number = data.get("move_number")
+            is_player_move = data.get("is_player_move", True)
+            coaching = data.get("coaching", "")
+
+            if not all([user_id, empire_id, game_id, move_san, fen]) or move_number is None:
+                return jsonify({"error": "Missing required fields"}), 400
+
+            run_async(save_move_to_db(user_id, empire_id, game_id, move_san, fen, move_number, is_player_move, coaching)).result(timeout=10)
+
+            return jsonify({"success": True})
+
+        except Exception as e:
+            logger.error(f"Chess record-move API error: {e}")
+            return jsonify({"error": str(e)}), 500
+
     @flask_app.route("/api/chess/move", methods=["POST"])
     def chess_move():
         """Handle a chess move from the frontend."""
