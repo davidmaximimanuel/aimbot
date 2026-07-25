@@ -217,6 +217,7 @@ CORS(app, resources={r"/api/*": {"origins": [
     "https://learn.empireunion.xyz",
     "https://ai.empireunion.xyz",
     "https://empireunion.xyz",
+    "http://localhost:3000",  # Next.js dev server for the aim-web app
 ]}})
 bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
@@ -2249,7 +2250,119 @@ def get_empire_id_by_logto():
         logger.error(f"[EmpireID Lookup] Error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
-        
+# ═══════════════════════════════════════════════════════════════════════════════
+#  WEB CHAT API (for the Next.js web app — same brain as Telegram, different door)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/chat", methods=["POST"])
+async def web_chat():
+    """Lets the Next.js web app talk to AIM directly over HTTP.
+
+    Mirrors the Telegram message pipeline (profile, session summary,
+    recent/older memory, web search, the SEARCH_TRIGGER loop) so the
+    web app gets the same brain as Telegram. Telegram-only action tags
+    (timers, tasks, Nebulae image/audio/pdf, empire linking, learning
+    mode) aren't wired up for web yet — they're stripped out of the
+    reply instead of silently leaking into the chat as raw text.
+    CODE_FILE is the one exception: it's returned as structured JSON
+    so the frontend can offer it as a download.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        user_text = (data.get("message") or "").strip()
+        user_id = str(data.get("user_id") or "").strip()
+
+        if not user_text:
+            return jsonify({"error": "message is required"}), 400
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+
+        profile = await get_user_profile_data(user_id)
+        session_summary = await get_session_summary(user_id)
+        recent_history, older_context, gap_seconds = await get_conversation_context(user_id, user_text)
+
+        web_context = ""
+        if is_search_query(user_text):
+            tl = user_text.lower()
+            if "news" in tl or "latest" in tl or "today" in tl:
+                sr = get_latest_news(user_text)
+            elif any(s in tl for s in ["football", "match", "score", "team", "player", "league", "f1", "nba", "tennis", "boxing", "ufc", "cricket", "rugby"]):
+                sr = get_sports_data(user_text)
+            else:
+                sr = search_web(user_text)
+            if sr and "No search results" not in sr:
+                web_context = f"Web Search Results for '{user_text}':\n{sr}"
+
+        max_iter, iteration, final_answer, tool_status, code_file = 4, 0, None, "", None
+        while iteration < max_iter:
+            iteration += 1
+            answer = await get_ai_response(
+                user_text, user_id, "web", profile, session_summary,
+                recent_history, older_context, web_context, tool_status, gap_seconds
+            )
+            if not answer:
+                final_answer = "🔥 High demand right now — please try again."
+                break
+            answer = answer.strip()
+
+            if "SEARCH_TRIGGER:" in answer:
+                m = re.search(r'SEARCH_TRIGGER:\s*(.+)', answer, re.IGNORECASE)
+                if m:
+                    sq = m.group(1).strip()
+                    sq_lower = sq.lower()
+                    if any(w in sq_lower for w in ["match", "kickoff", "kick off", "fixture", "vs", "versus"]):
+                        sr = get_fixture_datetime(sq) or get_sports_data(sq)
+                    elif "news" in sq_lower or "latest" in sq_lower:
+                        sr = get_latest_news(sq)
+                    elif any(s in sq_lower for s in ["football", "score", "f1", "nba", "tennis", "boxing"]):
+                        sr = get_sports_data(sq)
+                    else:
+                        sr = search_web(sq)
+                    web_context += f"\n\nWeb Search Results for '{sq}':\n{sr}" if sr and "No search results" not in sr else f"\n\nSearch for '{sq}': No results."
+                    continue
+                else:
+                    final_answer = answer
+                    break
+
+            # Strip Telegram-only action tags — not wired up for web yet.
+            answer = re.sub(r'\[OPEN_LEARNING:\s*\w+\]', '', answer, flags=re.IGNORECASE)
+            answer = re.sub(r'\[EMPIRE_LINK\]', '', answer, flags=re.IGNORECASE)
+            answer = re.sub(r'\[CREATE_TASK:\{.*?\}\]', '', answer, flags=re.IGNORECASE | re.DOTALL)
+            answer = re.sub(r'\[TIMER:\d+[smh]\]', '', answer, flags=re.IGNORECASE)
+            answer = re.sub(r'\[STOPWATCH:(START|STOP)\]', '', answer, flags=re.IGNORECASE)
+            answer = re.sub(r'\[NEBULAE_IMAGE:.*?\]', '', answer, flags=re.IGNORECASE)
+            answer = re.sub(r'\[NEBULAE_AUDIO:.*?\]', '', answer, flags=re.IGNORECASE)
+            answer = re.sub(r'\[NEBULAE_PDF:.*?\]', '', answer, flags=re.IGNORECASE | re.DOTALL)
+
+            code_match = re.search(r'\[CODE_FILE:(\w+)\|(.*?)\]\[/CODE_FILE\]', answer, re.IGNORECASE | re.DOTALL)
+            if code_match:
+                code_file = {"extension": code_match.group(1).strip().lower(), "content": code_match.group(2).strip()}
+                answer = re.sub(r'\[CODE_FILE:\w+\|.*?\]\[/CODE_FILE\]', '', answer, flags=re.IGNORECASE | re.DOTALL)
+
+            final_answer = answer.strip()
+            break
+
+        if not final_answer:
+            final_answer = "Sorry, something went wrong on my end — mind trying that again?"
+
+        topic = await extract_topic(user_text, final_answer)
+        await save_chat_memory(user_id, "", user_text, final_answer, "web", topic)
+        await update_user_profile(user_id, "", topic)
+        await update_session_summary(
+            user_id,
+            [{"message": user_text, "response": final_answer}],
+            session_summary,
+        )
+
+        resp = {"reply": final_answer}
+        if code_file:
+            resp["code_file"] = code_file
+        return jsonify(resp)
+
+    except Exception as e:
+        logger.error("Web chat error: %s", e)
+        return jsonify({"error": "Something went wrong. Please try again."}), 500
+
 @app.route("/privacy", methods=["GET"])
 def privacy_policy():
     return "<h1>Privacy Policy</h1><p>Coming soon.</p>", 200, {"Content-Type":"text/html"}
