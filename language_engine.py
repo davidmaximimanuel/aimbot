@@ -2,6 +2,13 @@
 AIM Language Engine — Type 1 (alphabet-first) language template.
 AIM classifies the language, then fills in a JSON schema per-unit
 on demand, rather than us hardcoding per-language content.
+
+Caching note: the *static* unit content (which letters exist, their
+sounds, example words) is the same fact for every learner of a given
+language — so it's generated once per (language, unit_index) and
+reused from language_unit_cache. Per-user session_state (progress,
+mistakes, chat replies) is never cached — that stays personal and is
+always generated fresh, per user, per request.
 """
 
 import json
@@ -29,7 +36,6 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         if not language:
             return jsonify({"error": "language is required"}), 400
 
-        # Resume if an active session already exists
         existing = _get_active_session(supabase_client, user_id, language)
         if existing:
             return jsonify({
@@ -38,8 +44,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
                 "session_state": existing["session_state"],
             })
 
-        # Fresh start — ask AIM to design unit 1 only (not the whole course).
-        unit_zero = _generate_unit(gemini_client, language, unit_index=0, known_symbols=[])
+        unit_zero = _generate_unit(gemini_client, supabase_client, language, unit_index=0, known_symbols=[])
         if unit_zero is None:
             return jsonify({"error": "Failed to generate lesson content"}), 500
 
@@ -85,7 +90,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
             known_symbols.extend([s["symbol"] for s in u.get("introduces", [])])
 
         next_index = len(static_content["units"])
-        new_unit = _generate_unit(gemini_client, language, unit_index=next_index, known_symbols=known_symbols)
+        new_unit = _generate_unit(gemini_client, supabase_client, language, unit_index=next_index, known_symbols=known_symbols)
         if new_unit is None:
             return jsonify({"error": "Failed to generate next unit"}), 500
 
@@ -100,13 +105,12 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
 
     @flask_app.route("/api/language/answer", methods=["POST"])
     def language_answer():
-        """Checks a user's answer/attempt against the current unit and gives feedback."""
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         empire_id = data.get("empire_id", "unknown")
         language = data.get("language", "").strip()
         user_answer = data.get("answer", "")
-        expected_context = data.get("context", "")  # e.g. "letter alif, isolated form"
+        expected_context = data.get("context", "")
 
         session = _get_active_session(supabase_client, user_id, language)
         if not session:
@@ -168,6 +172,35 @@ def _save_session(supabase, user_id, empire_id, language, static_content, sessio
         logger.error("Language session save error: %s", e)
 
 
+def _get_cached_unit(supabase, language, unit_index):
+    if supabase is None:
+        return None
+    try:
+        resp = (supabase.table("language_unit_cache")
+                .select("*")
+                .eq("language", language)
+                .eq("unit_index", unit_index)
+                .single()
+                .execute())
+        return resp.data
+    except Exception:
+        return None
+
+
+def _save_cached_unit(supabase, language, unit_index, has_positional_forms, unit_data):
+    if supabase is None:
+        return
+    try:
+        supabase.table("language_unit_cache").upsert({
+            "language": language,
+            "unit_index": unit_index,
+            "has_positional_forms": has_positional_forms,
+            "unit_data": unit_data,
+        }, on_conflict="language,unit_index").execute()
+    except Exception as e:
+        logger.error("Unit cache save error: %s", e)
+
+
 UNIT_SCHEMA_PROMPT = """You are designing one unit of a language-learning lesson for a beginner learning {language}, using an alphabet-first approach.
 
 This is unit index {unit_index}. The learner already knows these symbols: {known_symbols}.
@@ -191,10 +224,18 @@ Return ONLY valid JSON (no markdown, no commentary) matching exactly this shape:
 Introduce 3-5 new symbols max for this unit. Only use symbols already known or being introduced in this unit for practice_words. If the language has positional letterforms (like Arabic), set has_positional_forms to true and mention the forms in example_word naturally."""
 
 
-def _generate_unit(gemini_client, language, unit_index, known_symbols):
+def _generate_unit(gemini_client, supabase_client, language, unit_index, known_symbols):
+    cached = _get_cached_unit(supabase_client, language, unit_index)
+    if cached:
+        return {
+            "has_positional_forms": cached.get("has_positional_forms", False),
+            "unit": cached.get("unit_data"),
+        }
+
     if gemini_client is None:
         logger.error("Gemini client not configured (missing GEMINI_API_KEY)")
         return None
+
     prompt = UNIT_SCHEMA_PROMPT.format(
         language=language, unit_index=unit_index,
         known_symbols=", ".join(known_symbols) if known_symbols else "none yet",
@@ -205,10 +246,17 @@ def _generate_unit(gemini_client, language, unit_index, known_symbols):
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        return json.loads(resp.text)
+        result = json.loads(resp.text)
     except Exception as e:
         logger.error("Unit generation error: %s", e)
         return None
+
+    _save_cached_unit(
+        supabase_client, language, unit_index,
+        result.get("has_positional_forms", False),
+        result.get("unit"),
+    )
+    return result
 
 
 def _check_answer(gemini_client, language, context, user_answer):
