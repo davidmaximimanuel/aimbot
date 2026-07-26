@@ -1025,9 +1025,13 @@ async def extract_topic(user_text: str, bot_response: str) -> str:
         return t if t in topics else "general"
     except Exception: return "general"
 
-async def save_chat_memory(user_id: str, username: str, message: str, response: str, chat_type: str, topic: str = "general"):
+async def save_chat_memory(user_id: str, username: str, message: str, response: str, chat_type: str, topic: str = "general", conversation_id: str = None):
     if not supabase: return
-    try: supabase.table("chat_memory").insert({"user_id":str(user_id),"username":username or "","message":message[:2000],"response":response[:2000],"chat_type":chat_type,"topic":topic}).execute()
+    try:
+        row = {"user_id":str(user_id),"username":username or "","message":message[:2000],"response":response[:2000],"chat_type":chat_type,"topic":topic}
+        if conversation_id:
+            row["conversation_id"] = conversation_id
+        supabase.table("chat_memory").insert(row).execute()
     except Exception as e: logger.error("Memory save failed: %s", e)
 
 async def update_user_profile(user_id: str, username: str, topic: str):
@@ -2251,6 +2255,327 @@ def get_empire_id_by_logto():
         return jsonify({"error": "Internal server error"}), 500
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  WEB APP DATA APIS — Projects, Conversations (sidebar), Memories
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _require_user_id(data_or_args) -> Optional[str]:
+    uid = str(data_or_args.get("user_id") or "").strip()
+    return uid or None
+
+# ── Projects ─────────────────────────────────────────────────────────
+
+@app.route("/api/projects", methods=["GET"])
+def list_projects():
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"projects": []})
+    try:
+        rows = supabase.table("projects").select("*").eq("user_id", user_id).order("pinned", desc=True).order("updated_at", desc=True).execute()
+        projects = rows.data or []
+        # attach a live chat count per project
+        for p in projects:
+            c = supabase.table("conversations").select("id", count="exact").eq("project_id", p["id"]).execute()
+            p["chat_count"] = c.count or 0
+        return jsonify({"projects": projects})
+    except Exception as e:
+        logger.error("list_projects error: %s", e)
+        return jsonify({"error": "Could not load projects"}), 500
+
+@app.route("/api/projects", methods=["POST"])
+def create_project():
+    data = request.get_json(silent=True) or {}
+    user_id = _require_user_id(data)
+    name = (data.get("name") or "").strip()
+    if not user_id or not name:
+        return jsonify({"error": "user_id and name are required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        row = {
+            "user_id": user_id,
+            "name": name,
+            "description": (data.get("description") or "").strip(),
+            "emoji": data.get("emoji") or "🚀",
+            "color": data.get("color") or "rgba(74,144,217,0.12)",
+        }
+        res = supabase.table("projects").insert(row).execute()
+        project = res.data[0] if res.data else row
+        project["chat_count"] = 0
+        return jsonify({"project": project}), 201
+    except Exception as e:
+        logger.error("create_project error: %s", e)
+        return jsonify({"error": "Could not create project"}), 500
+
+@app.route("/api/projects/<project_id>", methods=["PATCH"])
+def update_project(project_id):
+    data = request.get_json(silent=True) or {}
+    user_id = _require_user_id(data)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        allowed = {k: v for k, v in data.items() if k in ("name", "description", "emoji", "color", "pinned")}
+        if not allowed:
+            return jsonify({"error": "Nothing to update"}), 400
+        allowed["updated_at"] = datetime.now(timezone.utc).isoformat()
+        res = supabase.table("projects").update(allowed).eq("id", project_id).eq("user_id", user_id).execute()
+        if not res.data:
+            return jsonify({"error": "Project not found"}), 404
+        return jsonify({"project": res.data[0]})
+    except Exception as e:
+        logger.error("update_project error: %s", e)
+        return jsonify({"error": "Could not update project"}), 500
+
+@app.route("/api/projects/<project_id>", methods=["DELETE"])
+def delete_project(project_id):
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        supabase.table("projects").delete().eq("id", project_id).eq("user_id", user_id).execute()
+        return jsonify({"deleted": True})
+    except Exception as e:
+        logger.error("delete_project error: %s", e)
+        return jsonify({"error": "Could not delete project"}), 500
+
+# ── Conversations (sidebar "Recent" list) ───────────────────────────
+
+def generate_conversation_title(text: str, max_words: int = 6) -> str:
+    """Cheap, instant auto-naming — no extra model call. Takes the
+    first few words of the opening message, same way most chat apps
+    title a new conversation."""
+    clean = re.sub(r'\s+', ' ', text or "").strip()
+    if not clean:
+        return "New chat"
+    words = clean.split(" ")[:max_words]
+    title = " ".join(words)
+    if len(words) == max_words and len(clean.split(" ")) > max_words:
+        title += "…"
+    return title[:60].strip().capitalize() if title else "New chat"
+
+@app.route("/api/conversations", methods=["GET"])
+def list_conversations():
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"conversations": []})
+    try:
+        rows = (
+            supabase.table("conversations")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("pinned", desc=True)
+            .order("updated_at", desc=True)
+            .limit(30)
+            .execute()
+        )
+        return jsonify({"conversations": rows.data or []})
+    except Exception as e:
+        logger.error("list_conversations error: %s", e)
+        return jsonify({"error": "Could not load conversations"}), 500
+
+@app.route("/api/conversations", methods=["POST"])
+def create_conversation():
+    data = request.get_json(silent=True) or {}
+    user_id = _require_user_id(data)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        row = {"user_id": user_id, "title": "New chat"}
+        if data.get("project_id"):
+            row["project_id"] = data["project_id"]
+        res = supabase.table("conversations").insert(row).execute()
+        return jsonify({"conversation": res.data[0] if res.data else row}), 201
+    except Exception as e:
+        logger.error("create_conversation error: %s", e)
+        return jsonify({"error": "Could not create conversation"}), 500
+
+@app.route("/api/conversations/<conversation_id>", methods=["PATCH"])
+def update_conversation(conversation_id):
+    data = request.get_json(silent=True) or {}
+    user_id = _require_user_id(data)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        allowed = {k: v for k, v in data.items() if k in ("title", "pinned", "project_id")}
+        if not allowed:
+            return jsonify({"error": "Nothing to update"}), 400
+        allowed["updated_at"] = datetime.now(timezone.utc).isoformat()
+        res = supabase.table("conversations").update(allowed).eq("id", conversation_id).eq("user_id", user_id).execute()
+        if not res.data:
+            return jsonify({"error": "Conversation not found"}), 404
+        return jsonify({"conversation": res.data[0]})
+    except Exception as e:
+        logger.error("update_conversation error: %s", e)
+        return jsonify({"error": "Could not update conversation"}), 500
+
+@app.route("/api/conversations/<conversation_id>", methods=["DELETE"])
+def delete_conversation(conversation_id):
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        supabase.table("conversations").delete().eq("id", conversation_id).eq("user_id", user_id).execute()
+        return jsonify({"deleted": True})
+    except Exception as e:
+        logger.error("delete_conversation error: %s", e)
+        return jsonify({"error": "Could not delete conversation"}), 500
+
+@app.route("/api/conversations/<conversation_id>/messages", methods=["GET"])
+def get_conversation_messages(conversation_id):
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"messages": []})
+    try:
+        rows = (
+            supabase.table("chat_memory")
+            .select("message,response,created_at")
+            .eq("conversation_id", conversation_id)
+            .eq("user_id", user_id)
+            .order("created_at")
+            .execute()
+        )
+        messages = []
+        for r in rows.data or []:
+            messages.append({"role": "user", "text": r["message"]})
+            messages.append({"role": "aim", "text": r["response"]})
+        return jsonify({"messages": messages})
+    except Exception as e:
+        logger.error("get_conversation_messages error: %s", e)
+        return jsonify({"error": "Could not load conversation"}), 500
+
+# ── Memories (Memory page) ──────────────────────────────────────────
+
+@app.route("/api/memories", methods=["GET"])
+def list_memories():
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"memories": [], "memory_enabled": True})
+    try:
+        q = supabase.table("user_memories").select("*").eq("user_id", user_id)
+        category = request.args.get("category")
+        if category and category != "all":
+            q = q.eq("category", category)
+        search = request.args.get("search")
+        if search:
+            q = q.ilike("text", f"%{search}%")
+        rows = q.order("created_at", desc=True).execute()
+
+        prof = supabase.table("user_profiles").select("memory_enabled").eq("user_id", user_id).execute()
+        memory_enabled = True
+        if prof.data and prof.data[0].get("memory_enabled") is not None:
+            memory_enabled = bool(prof.data[0]["memory_enabled"])
+
+        return jsonify({"memories": rows.data or [], "memory_enabled": memory_enabled})
+    except Exception as e:
+        logger.error("list_memories error: %s", e)
+        return jsonify({"error": "Could not load memories"}), 500
+
+@app.route("/api/memories", methods=["POST"])
+def create_memory():
+    data = request.get_json(silent=True) or {}
+    user_id = _require_user_id(data)
+    text = (data.get("text") or "").strip()
+    if not user_id or not text:
+        return jsonify({"error": "user_id and text are required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        row = {"user_id": user_id, "text": text, "category": data.get("category") or "personal"}
+        res = supabase.table("user_memories").insert(row).execute()
+        return jsonify({"memory": res.data[0] if res.data else row}), 201
+    except Exception as e:
+        logger.error("create_memory error: %s", e)
+        return jsonify({"error": "Could not save memory"}), 500
+
+@app.route("/api/memories/<memory_id>", methods=["DELETE"])
+def delete_memory(memory_id):
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        supabase.table("user_memories").delete().eq("id", memory_id).eq("user_id", user_id).execute()
+        return jsonify({"deleted": True})
+    except Exception as e:
+        logger.error("delete_memory error: %s", e)
+        return jsonify({"error": "Could not delete memory"}), 500
+
+@app.route("/api/memories", methods=["DELETE"])
+def clear_memories():
+    """Clears BOTH the discrete memory facts and the raw chat_memory
+    log, so 'Clear all memory' actually means AIM forgets everything —
+    not just the visible list."""
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        supabase.table("user_memories").delete().eq("user_id", user_id).execute()
+        supabase.table("chat_memory").delete().eq("user_id", user_id).execute()
+        return jsonify({"cleared": True})
+    except Exception as e:
+        logger.error("clear_memories error: %s", e)
+        return jsonify({"error": "Could not clear memory"}), 500
+
+@app.route("/api/memory-setting", methods=["GET"])
+def get_memory_setting():
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"memory_enabled": True})
+    try:
+        res = supabase.table("user_profiles").select("memory_enabled").eq("user_id", user_id).execute()
+        enabled = True
+        if res.data and res.data[0].get("memory_enabled") is not None:
+            enabled = bool(res.data[0]["memory_enabled"])
+        return jsonify({"memory_enabled": enabled})
+    except Exception as e:
+        logger.error("get_memory_setting error: %s", e)
+        return jsonify({"error": "Could not load setting"}), 500
+
+@app.route("/api/memory-setting", methods=["PATCH"])
+def set_memory_setting():
+    data = request.get_json(silent=True) or {}
+    user_id = _require_user_id(data)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if "memory_enabled" not in data:
+        return jsonify({"error": "memory_enabled is required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        enabled = bool(data["memory_enabled"])
+        ex = supabase.table("user_profiles").select("user_id").eq("user_id", user_id).execute()
+        if ex.data:
+            supabase.table("user_profiles").update({"memory_enabled": enabled}).eq("user_id", user_id).execute()
+        else:
+            supabase.table("user_profiles").insert({"user_id": user_id, "memory_enabled": enabled}).execute()
+        return jsonify({"memory_enabled": enabled})
+    except Exception as e:
+        logger.error("set_memory_setting error: %s", e)
+        return jsonify({"error": "Could not update setting"}), 500
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  WEB CHAT API (for the Next.js web app — same brain as Telegram, different door)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2266,20 +2591,51 @@ async def web_chat():
     reply instead of silently leaking into the chat as raw text.
     CODE_FILE is the one exception: it's returned as structured JSON
     so the frontend can offer it as a download.
+
+    Also creates/auto-titles a `conversations` row (for the sidebar)
+    and respects the memory_enabled setting from the Memory page.
     """
     try:
         data = request.get_json(silent=True) or {}
         user_text = (data.get("message") or "").strip()
         user_id = str(data.get("user_id") or "").strip()
+        conversation_id = (data.get("conversation_id") or "").strip() or None
 
         if not user_text:
             return jsonify({"error": "message is required"}), 400
         if not user_id:
             return jsonify({"error": "user_id is required"}), 400
 
+        memory_enabled = True
+        if supabase:
+            try:
+                prof_row = supabase.table("user_profiles").select("memory_enabled").eq("user_id", user_id).execute()
+                if prof_row.data and prof_row.data[0].get("memory_enabled") is not None:
+                    memory_enabled = bool(prof_row.data[0]["memory_enabled"])
+            except Exception as e:
+                logger.error("memory_enabled read error: %s", e)
+
+        # Ensure a conversation row exists for the sidebar, before we
+        # need its id below.
+        is_new_conversation = False
+        if supabase:
+            try:
+                if conversation_id:
+                    existing = supabase.table("conversations").select("id,title").eq("id", conversation_id).eq("user_id", user_id).execute()
+                    if not existing.data:
+                        conversation_id = None
+                if not conversation_id:
+                    created = supabase.table("conversations").insert({"user_id": user_id, "title": "New chat"}).execute()
+                    conversation_id = created.data[0]["id"] if created.data else None
+                    is_new_conversation = True
+            except Exception as e:
+                logger.error("conversation ensure error: %s", e)
+
         profile = await get_user_profile_data(user_id)
-        session_summary = await get_session_summary(user_id)
-        recent_history, older_context, gap_seconds = await get_conversation_context(user_id, user_text)
+        session_summary = await get_session_summary(user_id) if memory_enabled else ""
+        recent_history, older_context, gap_seconds = (
+            await get_conversation_context(user_id, user_text) if memory_enabled else ("", "", 0.0)
+        )
 
         web_context = ""
         if is_search_query(user_text):
@@ -2346,15 +2702,29 @@ async def web_chat():
             final_answer = "Sorry, something went wrong on my end — mind trying that again?"
 
         topic = await extract_topic(user_text, final_answer)
-        await save_chat_memory(user_id, "", user_text, final_answer, "web", topic)
-        await update_user_profile(user_id, "", topic)
-        await update_session_summary(
-            user_id,
-            [{"message": user_text, "response": final_answer}],
-            session_summary,
-        )
+        if memory_enabled:
+            await save_chat_memory(user_id, "", user_text, final_answer, "web", topic, conversation_id=conversation_id)
+            await update_user_profile(user_id, "", topic)
+            await update_session_summary(
+                user_id,
+                [{"message": user_text, "response": final_answer}],
+                session_summary,
+            )
 
-        resp = {"reply": final_answer}
+        conversation_title = None
+        if supabase and conversation_id:
+            try:
+                update_fields = {"updated_at": datetime.now(timezone.utc).isoformat()}
+                if is_new_conversation:
+                    conversation_title = generate_conversation_title(user_text)
+                    update_fields["title"] = conversation_title
+                supabase.table("conversations").update(update_fields).eq("id", conversation_id).execute()
+            except Exception as e:
+                logger.error("conversation title/touch error: %s", e)
+
+        resp = {"reply": final_answer, "conversation_id": conversation_id}
+        if conversation_title:
+            resp["conversation_title"] = conversation_title
         if code_file:
             resp["code_file"] = code_file
         return jsonify(resp)
