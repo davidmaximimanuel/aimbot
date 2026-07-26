@@ -29,6 +29,7 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from supabase import create_client, Client
+
 # NOTE: empire_id_generator.py is no longer used — Empire ID lookups/creation
 # now go through the standalone Empire ID service over HTTP (see eid_create /
 # eid_get_by_logto below), so every app (AIM, ai.empireunion.xyz,
@@ -89,6 +90,8 @@ from capabilities import is_search_query, SEARCH_TRIGGER_PHRASES, trigger_embedd
 # on fresh deploy, and both files read from it.
 from admin import load_admins, is_admin, handle_admin_command, ADMIN_IDS, START_TIME
 from chess_engine import register_chess_routes
+from language_engine import register_language_routes
+from last_activity import register_last_activity_route
 
 # ─── LOGGING ───
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -2739,6 +2742,8 @@ def privacy_policy():
 
 # Register chess API routes
 register_chess_routes(app, supabase)
+register_language_routes(app, supabase)
+register_last_activity_route(app, supabase)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
