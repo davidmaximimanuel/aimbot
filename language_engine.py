@@ -171,15 +171,23 @@ def _get_active_session(supabase, user_id, language):
     if supabase is None:
         return None
     try:
+        # .limit(1) instead of .single(): single() throws if it finds
+        # zero rows OR more than one, which made this silently fail
+        # (returning None -> "No active session") whenever duplicate
+        # active rows existed for a user+language, even though a real
+        # session was sitting right there. This just takes the most
+        # recent one instead of erroring out.
         resp = (supabase.table("language_sessions")
                 .select("*")
                 .eq("user_id", user_id)
                 .eq("language", language)
                 .eq("status", "active")
-                .single()
+                .order("last_active_at", desc=True)
+                .limit(1)
                 .execute())
-        return resp.data
-    except Exception:
+        return resp.data[0] if resp.data else None
+    except Exception as e:
+        logger.error("Active session lookup error (user=%s, language=%s): %s", user_id, language, e)
         return None
 
 
