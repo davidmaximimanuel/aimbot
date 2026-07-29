@@ -28,6 +28,18 @@ GEMINI_MODEL = "gemini-2.5-flash-lite"  # matches the model used elsewhere in ai
 VALID_TEMPLATE_TYPES = {"type1_alphabet", "type2_grammar_translation", "type3_speech_conversation"}
 
 
+def _normalize_language(language):
+    """
+    'Arabic', 'arabic', 'ARABIC ' all need to hit the same cache row and
+    the same session row — otherwise casing differences silently create
+    duplicate classifications, duplicate unit caches, and mismatched
+    session lookups (a real bug we hit in testing). Every route below
+    normalizes the incoming language string through this before using
+    it anywhere.
+    """
+    return language.strip().title()
+
+
 def register_language_routes(flask_app, supabase_client, gemini_client):
 
     @flask_app.route("/api/language/start", methods=["POST"])
@@ -35,7 +47,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         empire_id = data.get("empire_id", "unknown")
-        language = data.get("language", "").strip()
+        language = _normalize_language(data.get("language", ""))
         native_language = data.get("native_language", "English").strip() or "English"
         session_length_minutes = data.get("session_length_minutes", 15)
         preferred_type = data.get("preferred_type")
@@ -96,7 +108,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         empire_id = data.get("empire_id", "unknown")
-        language = data.get("language", "").strip()
+        language = _normalize_language(data.get("language", ""))
 
         session = _get_active_session(supabase_client, user_id, language)
         if not session:
@@ -129,7 +141,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         empire_id = data.get("empire_id", "unknown")
-        language = data.get("language", "").strip()
+        language = _normalize_language(data.get("language", ""))
         user_answer = data.get("answer", "")
         expected_context = data.get("context", "")
 
@@ -152,7 +164,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
     @flask_app.route("/api/language/chat", methods=["POST"])
     def language_chat():
         data = request.get_json() or {}
-        language = data.get("language", "")
+        language = _normalize_language(data.get("language", ""))
         native_language = data.get("native_language", "English")
         user_message = data.get("message", "")
         unit_title = data.get("unit_title", "")
@@ -160,8 +172,12 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         # grounded in what's actually on screen, not just guessing from
         # the title.
         unit_content = data.get("unit_content") or {}
+        # True when this call fires automatically on unit load, rather
+        # than in response to something the learner typed.
+        auto_intro = bool(data.get("auto_intro", False))
 
-        reply = _chat_reply(gemini_client, language, native_language, unit_title, unit_content, user_message)
+        reply = _chat_reply(gemini_client, language, native_language, unit_title,
+                             unit_content, user_message, auto_intro)
         return jsonify({"response": reply})
 
 
@@ -378,7 +394,7 @@ def _check_answer(gemini_client, language, native_language, context, user_answer
         return {"correct": False, "feedback": "I couldn't check that just now — let's continue."}
 
 
-def _chat_reply(gemini_client, language, native_language, unit_title, unit_content, user_message):
+def _chat_reply(gemini_client, language, native_language, unit_title, unit_content, user_message, auto_intro=False):
     if gemini_client is None:
         return "I'm here to help, but my brain's offline right now — try again in a moment."
 
@@ -395,12 +411,22 @@ def _chat_reply(gemini_client, language, native_language, unit_title, unit_conte
         word_lines = "; ".join(f'{w.get("word")} ({w.get("translation")})' for w in practice_words)
         on_screen += f"\nPractice words currently on screen: {word_lines}."
 
-    prompt = (f"You are AIM, teaching {language} to a native {native_language} speaker, "
-              f"currently on unit \"{unit_title}\".{on_screen}\n"
-              f"The learner said: \"{user_message}\". Reply helpfully in 1-3 short sentences, "
-              f"referencing the symbols/words above if relevant to their question, "
-              f"mixing in a word or two of {language} they've likely learned if natural, "
-              f"but explain in plain {native_language}.")
+    if auto_intro:
+        prompt = (f"You are AIM, teaching {language} to a native {native_language} speaker, who has just "
+                  f"opened the unit \"{unit_title}\".{on_screen}\n"
+                  f"Narrate a short spoken-style introduction to this unit, as if walking them through what's "
+                  f"on their screen. Name each symbol and its sound, mention how each is used, and give one or "
+                  f"two everyday {native_language} words that share a similar sound where that helps (e.g. "
+                  f"comparing to a familiar sound in their own language). Keep it warm and conversational, "
+                  f"4-6 sentences, entirely in plain {native_language} except for the {language} symbols/words "
+                  f"themselves.")
+    else:
+        prompt = (f"You are AIM, teaching {language} to a native {native_language} speaker, "
+                  f"currently on unit \"{unit_title}\".{on_screen}\n"
+                  f"The learner said: \"{user_message}\". Reply helpfully in 1-3 short sentences, "
+                  f"referencing the symbols/words above if relevant to their question, "
+                  f"mixing in a word or two of {language} they've likely learned if natural, "
+                  f"but explain in plain {native_language}.")
     try:
         resp = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         return resp.text

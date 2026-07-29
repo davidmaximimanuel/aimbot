@@ -110,8 +110,14 @@ def build_enhanced_prompt(user_text: str, user_id: str, profile: dict, is_admin_
     pref_language = profile.get("preferred_language", "english")
     topic_counts = profile.get("topic_counts", {})
     total_chats = profile.get("total_chats", 0)
+    display_name = (profile.get("display_name") or "").strip()
+    bio = (profile.get("bio") or "").strip()
     
     pref_lines = ["\n--- USER PREFERENCES ---", f"  User ID: {user_id}  |  Language: {pref_language}  |  Total chats: {total_chats}"]
+    if display_name:
+        pref_lines.append(f"  Name: {display_name} (address them by this name when it feels natural)")
+    if bio:
+        pref_lines.append(f"  About them (self-described): {bio}")
     if topic_counts:
         top = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3]
         pref_lines.append(f"  Interests: {', '.join(f'{k}({v})' for k,v in top)}")

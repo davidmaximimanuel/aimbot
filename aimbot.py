@@ -150,6 +150,19 @@ def _create_oauth_state(telegram_user_id: str, chat_id: int) -> str:
         _oauth_states[state] = {"telegram_user_id": telegram_user_id, "chat_id": chat_id, "created_at": now}
     return state
 
+def _create_web_oauth_state(web_user_id: str, return_url: str) -> str:
+    """Same idea as _create_oauth_state, but for the web app's 'Link account'
+    button — no Telegram chat_id to notify, and it redirects back into the
+    web app instead of posting a Telegram message when it's done."""
+    state = secrets.token_urlsafe(32)
+    with _oauth_states_lock:
+        now = time.time()
+        stale = [k for k, v in _oauth_states.items() if now - v["created_at"] > 600]
+        for k in stale:
+            del _oauth_states[k]
+        _oauth_states[state] = {"web_user_id": web_user_id, "return_url": return_url, "created_at": now}
+    return state
+
 def _consume_oauth_state(state: str) -> Optional[dict]:
     with _oauth_states_lock:
         ctx = _oauth_states.pop(state, None)
@@ -2096,62 +2109,92 @@ def webhook():
         logger.error("Webhook error: %s", e)
         return "Error", 500
 
+@app.route("/api/web-link/start", methods=["GET"])
+def web_link_start():
+    """Kicks off the same Logto login as Telegram's /link, but for the
+    web app. The frontend just sets window.location to this URL; we
+    redirect straight into Logto, and /auth/callback below sends the
+    browser back to `return_url` once linking is done."""
+    web_user_id = request.args.get("user_id", "")
+    return_url = request.args.get("return_url", "")
+    if not web_user_id or not return_url:
+        return jsonify({"error": "user_id and return_url are required"}), 400
+    if not _logto_ok:
+        return jsonify({"error": "Logto is not configured on the server"}), 503
+    state = _create_web_oauth_state(web_user_id, return_url)
+    return redirect(build_logto_auth_url(state))
+
 @app.route("/auth/callback", methods=["GET"])
 def auth_callback():
     code  = request.args.get("code","")
     state = request.args.get("state","")
     error = request.args.get("error","")
 
+    ctx = None if error else _consume_oauth_state(state)
+    is_web = bool(ctx and "web_user_id" in ctx)
+
+    def _fail_redirect_or_page(title, body, query):
+        if is_web and ctx and ctx.get("return_url"):
+            sep = "&" if "?" in ctx["return_url"] else "?"
+            return redirect(f"{ctx['return_url']}{sep}{query}")
+        return _html_page(title, body, success=False)
+
     if error:
         logger.warning("Logto error: %s", error)
-        return _html_page("❌ Login Failed", f"<p>Error: {error}</p>", success=False), 400
+        return _fail_redirect_or_page("❌ Login Failed", f"<p>Error: {error}</p>", "linked=error"), (302 if is_web else 400)
 
-    ctx = _consume_oauth_state(state)
     if not ctx:
-        return _html_page("❌ Invalid Session", "<p>This link has expired or is invalid. Please use /link again.</p>", success=False), 400
-
-    telegram_user_id = ctx["telegram_user_id"]
-    chat_id          = ctx["chat_id"]
+        return _fail_redirect_or_page("❌ Invalid Session", "<p>This link has expired or is invalid. Please try again.</p>", "linked=expired"), (302 if is_web else 400)
 
     claims = exchange_logto_code(code)
     if not claims:
-        run_async(bot.send_message(chat_id=chat_id, text="❌ Something went wrong during login. Please try /link again."))
-        return _html_page("❌ Token Error", "<p>Could not verify your login. Please try again.</p>", success=False), 500
+        if not is_web:
+            run_async(bot.send_message(chat_id=ctx["chat_id"], text="❌ Something went wrong during login. Please try /link again."))
+        return _fail_redirect_or_page("❌ Token Error", "<p>Could not verify your login. Please try again.</p>", "linked=error"), (302 if is_web else 500)
 
     logto_sub   = claims.get("sub","")
     logto_email = claims.get("email","")
     logto_name  = claims.get("name","") or claims.get("username","")
 
     if not logto_sub:
-        return _html_page("❌ No User ID", "<p>Logto did not return a user ID.</p>", success=False), 500
+        return _fail_redirect_or_page("❌ No User ID", "<p>Logto did not return a user ID.</p>", "linked=error"), (302 if is_web else 500)
 
     eid_record = eid_get_by_logto(logto_sub)
     if eid_record:
         empire_id = eid_record.get("empire_id")
     else:
-        ok, result = eid_create(logto_id=logto_sub, username=logto_name, email=logto_email, source="telegram_bot")
+        ok, result = eid_create(logto_id=logto_sub, username=logto_name, email=logto_email, source="web_app" if is_web else "telegram_bot")
         if ok:
             empire_id = result
         else:
             logger.error("Empire ID creation failed: %s", result)
-            run_async(bot.send_message(chat_id=chat_id, text="⚠️ Login verified but we couldn't set up your Empire ID. Please try /link again."))
-            return _html_page("❌ Empire ID Error", f"<p>{result}</p>", success=False), 500
+            if not is_web:
+                run_async(bot.send_message(chat_id=ctx["chat_id"], text="⚠️ Login verified but we couldn't set up your Empire ID. Please try /link again."))
+            return _fail_redirect_or_page("❌ Empire ID Error", f"<p>{result}</p>", "linked=error"), (302 if is_web else 500)
+
+    target_user_id = ctx["web_user_id"] if is_web else ctx["telegram_user_id"]
 
     try:
-        existing = supabase.table("user_profiles").select("*").eq("user_id", telegram_user_id).execute()
+        existing = supabase.table("user_profiles").select("*").eq("user_id", target_user_id).execute()
         if existing.data:
-            supabase.table("user_profiles").update({"logto_id":logto_sub,"logto_email":logto_email,"logto_name":logto_name,"empire_id":empire_id,"last_active":datetime.now(timezone.utc).isoformat()}).eq("user_id", telegram_user_id).execute()
+            supabase.table("user_profiles").update({"logto_id":logto_sub,"logto_email":logto_email,"logto_name":logto_name,"empire_id":empire_id,"last_active":datetime.now(timezone.utc).isoformat()}).eq("user_id", target_user_id).execute()
         else:
-            supabase.table("user_profiles").insert({"user_id":telegram_user_id,"username":logto_name or "","logto_id":logto_sub,"logto_email":logto_email,"logto_name":logto_name,"empire_id":empire_id,"topic_counts":{},"total_chats":0,"last_active":datetime.now(timezone.utc).isoformat()}).execute()
-        logger.info("✅ Linked Telegram %s → Logto %s (Empire ID: %s)", telegram_user_id, logto_sub, empire_id)
+            supabase.table("user_profiles").insert({"user_id":target_user_id,"username":logto_name or "","logto_id":logto_sub,"logto_email":logto_email,"logto_name":logto_name,"empire_id":empire_id,"topic_counts":{},"total_chats":0,"last_active":datetime.now(timezone.utc).isoformat()}).execute()
+        logger.info("✅ Linked %s %s → Logto %s (Empire ID: %s)", "web" if is_web else "Telegram", target_user_id, logto_sub, empire_id)
     except Exception as e:
         logger.error("Supabase link error: %s", e)
-        run_async(bot.send_message(chat_id=chat_id, text="⚠️ Login verified but we couldn't save your link. Please try /link again."))
-        return _html_page("❌ Database Error", "<p>We couldn't save your account link. Please try again.</p>", success=False), 500
+        if not is_web:
+            run_async(bot.send_message(chat_id=ctx["chat_id"], text="⚠️ Login verified but we couldn't save your link. Please try /link again."))
+        return _fail_redirect_or_page("❌ Database Error", "<p>We couldn't save your account link. Please try again.</p>", "linked=error"), (302 if is_web else 500)
 
     display = logto_name or logto_email or "there"
+
+    if is_web:
+        sep = "&" if "?" in ctx["return_url"] else "?"
+        return redirect(f"{ctx['return_url']}{sep}linked=success&empire_id={empire_id}")
+
     run_async(bot.send_message(
-        chat_id=chat_id,
+        chat_id=ctx["chat_id"],
         text=(f"🎉 <b>Account linked, {display}!</b>\n\n🆔 Empire ID: <b>{empire_id}</b>\n📧 Email: {logto_email or 'N/A'}\n\n✅ Your Telegram memory is now connected to the Empire AI web app. 🌍🇳🇬"),
         parse_mode=ParseMode.HTML,
     ))
@@ -2577,6 +2620,77 @@ def set_memory_setting():
     except Exception as e:
         logger.error("set_memory_setting error: %s", e)
         return jsonify({"error": "Could not update setting"}), 500
+
+# ── Profile (Settings > Profile tab) ────────────────────────────────
+
+@app.route("/api/profile", methods=["GET"])
+def get_profile():
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"profile": {}})
+    try:
+        rows = supabase.table("user_profiles").select(
+            "display_name,bio,avatar_url,logto_email,logto_name,empire_id,logto_id"
+        ).eq("user_id", user_id).execute()
+        row = rows.data[0] if rows.data else {}
+        return jsonify({"profile": {
+            "display_name": row.get("display_name") or "",
+            "bio": row.get("bio") or "",
+            "avatar_url": row.get("avatar_url") or "",
+            "email": row.get("logto_email") or "",
+            "empire_id": row.get("empire_id") or "",
+            "linked": bool(row.get("logto_id")),
+        }})
+    except Exception as e:
+        logger.error("get_profile error: %s", e)
+        return jsonify({"error": "Could not load profile"}), 500
+
+@app.route("/api/profile", methods=["PATCH"])
+def update_profile():
+    data = request.get_json(silent=True) or {}
+    user_id = _require_user_id(data)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        allowed = {k: v for k, v in data.items() if k in ("display_name", "bio", "avatar_url")}
+        if not allowed:
+            return jsonify({"error": "Nothing to update"}), 400
+        # Cheap guardrails so one bad request can't blow up storage.
+        if "display_name" in allowed:
+            allowed["display_name"] = str(allowed["display_name"])[:80]
+        if "bio" in allowed:
+            allowed["bio"] = str(allowed["bio"])[:500]
+        if "avatar_url" in allowed and allowed["avatar_url"] and len(allowed["avatar_url"]) > 1_500_000:
+            return jsonify({"error": "Image is too large — please use something smaller"}), 400
+
+        ex = supabase.table("user_profiles").select("user_id").eq("user_id", user_id).execute()
+        if ex.data:
+            supabase.table("user_profiles").update(allowed).eq("user_id", user_id).execute()
+        else:
+            supabase.table("user_profiles").insert({"user_id": user_id, **allowed}).execute()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error("update_profile error: %s", e)
+        return jsonify({"error": "Could not update profile"}), 500
+
+@app.route("/api/account", methods=["DELETE"])
+def delete_account():
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    if not supabase:
+        return jsonify({"error": "Database offline"}), 503
+    try:
+        for table in ("chat_memory", "conversations", "projects", "user_memories", "user_profiles"):
+            supabase.table(table).delete().eq("user_id", user_id).execute()
+        return jsonify({"deleted": True})
+    except Exception as e:
+        logger.error("delete_account error: %s", e)
+        return jsonify({"error": "Could not delete account"}), 500
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  WEB CHAT API (for the Next.js web app — same brain as Telegram, different door)
