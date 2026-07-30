@@ -2277,10 +2277,15 @@ def debug_logto():
 
 @app.route("/api/empire-id-by-logto", methods=["POST"])
 def get_empire_id_by_logto():
-    """Lookup Empire ID by Logto user ID — used by mini-apps for auth."""
+    """Lookup Empire ID by Logto user ID — used by mini-apps for auth.
+    If none exists yet, mints one via the same get-or-create path the
+    Telegram bot already uses, instead of leaving a fresh web signup
+    stuck with no Empire ID at all."""
     try:
         data = request.get_json(silent=True) or {}
         logto_id = data.get("logto_id")
+        username = data.get("username") or ""
+        email = data.get("email") or ""
 
         if not logto_id:
             return jsonify({"error": "No logto_id provided"}), 400
@@ -2294,12 +2299,22 @@ def get_empire_id_by_logto():
                 "email": user.get("email")
             })
 
-        return jsonify({"error": "No Empire ID found for this Logto user"}), 404
+        # No record yet for this Logto identity — create one.
+        ok, result = eid_create(logto_id, username, email, source="web")
+        if ok:
+            return jsonify({
+                "empire_id": result,
+                "username": username,
+                "email": email,
+                "created": True
+            })
+
+        logger.error(f"[EmpireID Lookup] Create failed: {result}")
+        return jsonify({"error": result}), 502
 
     except Exception as e:
         logger.error(f"[EmpireID Lookup] Error: {e}")
         return jsonify({"error": "Internal server error"}), 500
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  WEB APP DATA APIS — Projects, Conversations (sidebar), Memories
 # ═══════════════════════════════════════════════════════════════════════════════
