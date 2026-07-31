@@ -180,6 +180,114 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
                              unit_content, user_message, auto_intro)
         return jsonify({"response": reply})
 
+    @flask_app.route("/api/language/quiz/start", methods=["POST"])
+    def language_quiz_start():
+        data = request.get_json() or {}
+        user_id = data.get("user_id", "unknown")
+        language = _normalize_language(data.get("language", ""))
+
+        session = _get_active_session(supabase_client, user_id, language)
+        if not session:
+            return jsonify({"error": "No active session"}), 404
+
+        native_language = session.get("native_language", "English")
+        units = session["static_content"].get("units", [])
+        if not units:
+            return jsonify({"error": "Nothing learned yet to quiz on"}), 400
+
+        questions = _generate_quiz(gemini_client, language, native_language, units)
+        if not questions:
+            return jsonify({"error": "Failed to generate quiz"}), 500
+
+        session_state = session["session_state"]
+        session_state["active_quiz"] = {
+            "questions": questions,  # includes correct_answer — never sent to frontend as-is
+            "answered": {},
+            "score": 0,
+            "total": len(questions),
+        }
+        session_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _save_session(supabase_client, user_id, session.get("empire_id", "unknown"), language,
+                      native_language, session["static_content"], session_state)
+
+        # Strip correct_answer before sending to the client.
+        safe_questions = [
+            {k: v for k, v in q.items() if k != "correct_answer"} for q in questions
+        ]
+        return jsonify({"questions": safe_questions, "total": len(questions)})
+
+    @flask_app.route("/api/language/quiz/answer", methods=["POST"])
+    def language_quiz_answer():
+        data = request.get_json() or {}
+        user_id = data.get("user_id", "unknown")
+        language = _normalize_language(data.get("language", ""))
+        question_id = data.get("question_id", "")
+        user_answer = data.get("answer", "")
+
+        session = _get_active_session(supabase_client, user_id, language)
+        if not session:
+            return jsonify({"error": "No active session"}), 404
+
+        native_language = session.get("native_language", "English")
+        session_state = session["session_state"]
+        active_quiz = session_state.get("active_quiz")
+        if not active_quiz:
+            return jsonify({"error": "No active quiz — call /quiz/start first"}), 404
+
+        question = next((q for q in active_quiz["questions"] if q["id"] == question_id), None)
+        if not question:
+            return jsonify({"error": "Unknown question_id for this quiz"}), 400
+
+        if question_id in active_quiz["answered"]:
+            # Already graded — return the stored result instead of re-scoring.
+            return jsonify(active_quiz["answered"][question_id])
+
+        verdict = _grade_quiz_answer(gemini_client, native_language, question, user_answer)
+        active_quiz["answered"][question_id] = verdict
+        if verdict.get("correct"):
+            active_quiz["score"] += 1
+
+        session_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _save_session(supabase_client, user_id, session.get("empire_id", "unknown"), language,
+                      native_language, session["static_content"], session_state)
+
+        return jsonify({
+            **verdict,
+            "score": active_quiz["score"],
+            "total": active_quiz["total"],
+            "answered_count": len(active_quiz["answered"]),
+        })
+
+    @flask_app.route("/api/language/quiz/finish", methods=["POST"])
+    def language_quiz_finish():
+        data = request.get_json() or {}
+        user_id = data.get("user_id", "unknown")
+        language = _normalize_language(data.get("language", ""))
+
+        session = _get_active_session(supabase_client, user_id, language)
+        if not session:
+            return jsonify({"error": "No active session"}), 404
+
+        native_language = session.get("native_language", "English")
+        session_state = session["session_state"]
+        active_quiz = session_state.pop("active_quiz", None)
+        if not active_quiz:
+            return jsonify({"error": "No active quiz to finish"}), 404
+
+        history = session_state.setdefault("quiz_history", [])
+        result = {
+            "score": active_quiz["score"],
+            "total": active_quiz["total"],
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        history.append(result)
+        session_state["updated_at"] = result["completed_at"]
+
+        _save_session(supabase_client, user_id, session.get("empire_id", "unknown"), language,
+                      native_language, session["static_content"], session_state)
+
+        return jsonify(result)
+
 
 # ── Internal helpers ────────────────────────────────────────────
 
@@ -433,3 +541,77 @@ def _chat_reply(gemini_client, language, native_language, unit_title, unit_conte
     except Exception as e:
         logger.error("Chat reply error: %s", e)
         return "Let's keep going — what would you like to know?"
+
+
+QUIZ_GENERATION_PROMPT = """You are creating a short quiz for a learner of {language} (native language: {native_language}) covering ONLY what they've been taught so far. Do not introduce anything new.
+
+Known symbols and sounds: {symbol_list}
+Known words: {word_list}
+
+Return ONLY valid JSON: an array of up to 5 quiz questions, mixing these types where the known content allows:
+- "symbol_to_sound": show a known symbol, ask what sound it makes
+- "sound_to_symbol": describe a known sound, ask which known symbol makes it
+- "word_meaning": show a known word, ask its meaning in {native_language}
+
+Each item exactly this shape:
+{{"id": "q1", "type": "...", "prompt": "...", "expects_free_text": boolean, "correct_answer": "..."}}
+
+expects_free_text should be true only for word_meaning-style questions (short phrase answers); false for single symbol/sound answers. Use ONLY symbols/words from the known lists above — never invent new ones the learner hasn't seen."""
+
+
+def _generate_quiz(gemini_client, language, native_language, units):
+    if gemini_client is None:
+        return None
+
+    symbols, words = [], []
+    for u in units:
+        for s in u.get("introduces", []):
+            symbols.append(f'{s.get("symbol")} (sound: {s.get("sound")})')
+        for w in u.get("practice_words", []):
+            words.append(f'{w.get("word")} ({w.get("translation")})')
+
+    prompt = QUIZ_GENERATION_PROMPT.format(
+        language=language, native_language=native_language,
+        symbol_list="; ".join(symbols) if symbols else "none",
+        word_list="; ".join(words) if words else "none",
+    )
+    try:
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        questions = json.loads(resp.text)
+        return questions if isinstance(questions, list) else None
+    except Exception as e:
+        logger.error("Quiz generation error: %s", e)
+        return None
+
+
+def _grade_quiz_answer(gemini_client, native_language, question, user_answer):
+    correct_answer = question.get("correct_answer", "")
+
+    if not question.get("expects_free_text"):
+        is_correct = user_answer.strip().lower() == correct_answer.strip().lower()
+        feedback = "Correct!" if is_correct else f"Not quite — the answer was {correct_answer}."
+        return {"correct": is_correct, "feedback": feedback}
+
+    if gemini_client is None:
+        return {"correct": False, "feedback": "Grading is unavailable right now."}
+
+    prompt = (f"A quiz question was: \"{question.get('prompt')}\". "
+              f"Reference answer: \"{correct_answer}\". "
+              f"The learner (native {native_language} speaker) answered: \"{user_answer}\". "
+              f"Judge if their answer is essentially correct, allowing reasonable phrasing differences. "
+              f"Return ONLY JSON: {{\"correct\": boolean, \"feedback\": \"one short encouraging sentence "
+              f"in plain {native_language}\"}}")
+    try:
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        return json.loads(resp.text)
+    except Exception as e:
+        logger.error("Quiz grading error: %s", e)
+        return {"correct": False, "feedback": "I couldn't check that just now."}
