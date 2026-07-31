@@ -80,6 +80,7 @@ def eid_create(logto_id: str, username: str, email: str, source: str = "telegram
         logger.error("eid_create error: %s", e)
         return False, f"❌ Empire ID service unreachable: {e}"
 from google import genai
+import stripe
 from google.genai import types
 
 # ── Module imports (deduplicated) ──────────────────────────
@@ -111,6 +112,11 @@ GNEWS_API_KEY       = os.environ.get("GNEWS_API_KEY", "")
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
 SPORTAPI_KEY        = os.environ.get("SPORTAPI_KEY", "")
+
+STRIPE_SECRET_KEY     = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_BASIC    = os.environ.get("STRIPE_PRICE_BASIC", "")
+STRIPE_PRICE_PRO      = os.environ.get("STRIPE_PRICE_PRO", "")
 
 LOGTO_ENDPOINT      = os.environ.get("LOGTO_ENDPOINT", "").rstrip("/")
 LOGTO_CLIENT_ID     = os.environ.get("LOGTO_CLIENT_ID", "")
@@ -269,6 +275,12 @@ if _logto_ok:
     logger.info("✅ Logto OAuth configured → %s", get_redirect_uri())
 else:
     logger.warning("⚠️ Logto not configured — /link will not work")
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+    logger.info("✅ Stripe billing configured")
+else:
+    logger.warning("⚠️ Stripe not configured — billing endpoints will be unavailable")
 
 load_admins(supabase)
 
@@ -2277,15 +2289,10 @@ def debug_logto():
 
 @app.route("/api/empire-id-by-logto", methods=["POST"])
 def get_empire_id_by_logto():
-    """Lookup Empire ID by Logto user ID — used by mini-apps for auth.
-    If none exists yet, mints one via the same get-or-create path the
-    Telegram bot already uses, instead of leaving a fresh web signup
-    stuck with no Empire ID at all."""
+    """Lookup Empire ID by Logto user ID — used by mini-apps for auth."""
     try:
         data = request.get_json(silent=True) or {}
         logto_id = data.get("logto_id")
-        username = data.get("username") or ""
-        email = data.get("email") or ""
 
         if not logto_id:
             return jsonify({"error": "No logto_id provided"}), 400
@@ -2299,22 +2306,12 @@ def get_empire_id_by_logto():
                 "email": user.get("email")
             })
 
-        # No record yet for this Logto identity — create one.
-        ok, result = eid_create(logto_id, username, email, source="web")
-        if ok:
-            return jsonify({
-                "empire_id": result,
-                "username": username,
-                "email": email,
-                "created": True
-            })
-
-        logger.error(f"[EmpireID Lookup] Create failed: {result}")
-        return jsonify({"error": result}), 502
+        return jsonify({"error": "No Empire ID found for this Logto user"}), 404
 
     except Exception as e:
         logger.error(f"[EmpireID Lookup] Error: {e}")
         return jsonify({"error": "Internal server error"}), 500
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  WEB APP DATA APIS — Projects, Conversations (sidebar), Memories
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2706,6 +2703,156 @@ def delete_account():
     except Exception as e:
         logger.error("delete_account error: %s", e)
         return jsonify({"error": "Could not delete account"}), 500
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BILLING (Settings > Billing tab) — Stripe
+#
+#  Card details are never handled or stored by us — Stripe's Checkout and
+#  Billing Portal collect/display/update the actual card. We only store a
+#  stripe_customer_id and read back plan/card-summary/renewal info to show
+#  on the Billing tab, which is what "truly dynamic" card details means
+#  here: real data pulled live from Stripe, not something we invented.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_PLAN_PRICE_IDS = {"basic": STRIPE_PRICE_BASIC, "pro": STRIPE_PRICE_PRO}
+_PRICE_ID_TO_PLAN = {v: k for k, v in _PLAN_PRICE_IDS.items() if v}
+
+def _get_or_create_stripe_customer(user_id: str, email: str = "") -> Optional[str]:
+    if not supabase:
+        return None
+    try:
+        row = supabase.table("user_profiles").select("stripe_customer_id,logto_email").eq("user_id", user_id).execute()
+        existing_id = row.data[0].get("stripe_customer_id") if row.data else None
+        if existing_id:
+            return existing_id
+        customer = stripe.Customer.create(email=email or (row.data[0].get("logto_email") if row.data else "") or None, metadata={"user_id": user_id})
+        if row.data:
+            supabase.table("user_profiles").update({"stripe_customer_id": customer.id}).eq("user_id", user_id).execute()
+        else:
+            supabase.table("user_profiles").insert({"user_id": user_id, "stripe_customer_id": customer.id}).execute()
+        return customer.id
+    except Exception as e:
+        logger.error("_get_or_create_stripe_customer error: %s", e)
+        return None
+
+@app.route("/api/billing/checkout", methods=["POST"])
+def billing_checkout():
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "Billing is not configured on the server"}), 503
+    data = request.get_json(silent=True) or {}
+    user_id = _require_user_id(data)
+    plan = (data.get("plan") or "").strip().lower()
+    return_url = (data.get("return_url") or "").strip()
+    if not user_id or plan not in _PLAN_PRICE_IDS or not return_url:
+        return jsonify({"error": "user_id, a valid plan, and return_url are required"}), 400
+    price_id = _PLAN_PRICE_IDS[plan]
+    if not price_id:
+        return jsonify({"error": f"No Stripe price configured for the {plan} plan yet"}), 503
+    customer_id = _get_or_create_stripe_customer(user_id)
+    if not customer_id:
+        return jsonify({"error": "Could not set up billing customer"}), 500
+    try:
+        sep = "&" if "?" in return_url else "?"
+        session = stripe.checkout.Session.create(
+            customer=customer_id,
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=f"{return_url}{sep}billing=success",
+            cancel_url=f"{return_url}{sep}billing=cancelled",
+        )
+        return jsonify({"url": session.url})
+    except Exception as e:
+        logger.error("billing_checkout error: %s", e)
+        return jsonify({"error": "Could not start checkout"}), 500
+
+@app.route("/api/billing/portal", methods=["POST"])
+def billing_portal():
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "Billing is not configured on the server"}), 503
+    data = request.get_json(silent=True) or {}
+    user_id = _require_user_id(data)
+    return_url = (data.get("return_url") or "").strip()
+    if not user_id or not return_url:
+        return jsonify({"error": "user_id and return_url are required"}), 400
+    customer_id = _get_or_create_stripe_customer(user_id)
+    if not customer_id:
+        return jsonify({"error": "No billing account found yet — subscribe to a plan first"}), 400
+    try:
+        session = stripe.billing_portal.Session.create(customer=customer_id, return_url=return_url)
+        return jsonify({"url": session.url})
+    except Exception as e:
+        logger.error("billing_portal error: %s", e)
+        return jsonify({"error": "Could not open billing portal"}), 500
+
+@app.route("/api/billing", methods=["GET"])
+def get_billing():
+    user_id = _require_user_id(request.args)
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    result = {
+        "plan": "free", "status": "none", "card": None,
+        "renews_at": None, "cancel_at_period_end": False,
+    }
+    if not supabase:
+        return jsonify(result)
+    try:
+        row = supabase.table("user_profiles").select("stripe_customer_id,plan").eq("user_id", user_id).execute()
+        customer_id = row.data[0].get("stripe_customer_id") if row.data else None
+        result["plan"] = (row.data[0].get("plan") if row.data else None) or "free"
+        if not customer_id or not STRIPE_SECRET_KEY:
+            return jsonify(result)
+
+        subs = stripe.Subscription.list(customer=customer_id, status="all", limit=1)
+        if subs.data:
+            sub = subs.data[0]
+            result["status"] = sub.status
+            result["renews_at"] = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc).isoformat()
+            result["cancel_at_period_end"] = bool(sub.cancel_at_period_end)
+            price_id = sub["items"]["data"][0]["price"]["id"] if sub["items"]["data"] else None
+            if price_id in _PRICE_ID_TO_PLAN:
+                result["plan"] = _PRICE_ID_TO_PLAN[price_id]
+
+        customer = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
+        pm = customer.get("invoice_settings", {}).get("default_payment_method")
+        if pm and pm.get("type") == "card":
+            card = pm["card"]
+            result["card"] = {"brand": card["brand"], "last4": card["last4"], "exp_month": card["exp_month"], "exp_year": card["exp_year"]}
+
+        return jsonify(result)
+    except Exception as e:
+        logger.error("get_billing error: %s", e)
+        return jsonify(result)
+
+@app.route("/api/billing/webhook", methods=["POST"])
+def billing_webhook():
+    """Keeps user_profiles.plan in sync with Stripe so the rest of the
+    app (model routing, feature limits) can gate on a plain DB field
+    instead of calling Stripe on every request."""
+    if not STRIPE_WEBHOOK_SECRET:
+        return jsonify({"error": "Webhook not configured"}), 503
+    payload = request.get_data()
+    sig = request.headers.get("Stripe-Signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        logger.error("Stripe webhook signature error: %s", e)
+        return jsonify({"error": "Invalid signature"}), 400
+
+    obj = event["data"]["object"]
+    if event["type"] in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
+        customer_id = obj.get("customer")
+        status = obj.get("status")
+        price_id = obj["items"]["data"][0]["price"]["id"] if obj.get("items", {}).get("data") else None
+        plan = _PRICE_ID_TO_PLAN.get(price_id, "free")
+        if event["type"] == "customer.subscription.deleted" or status in ("canceled", "incomplete_expired"):
+            plan = "free"
+        if supabase and customer_id:
+            try:
+                supabase.table("user_profiles").update({"plan": plan}).eq("stripe_customer_id", customer_id).execute()
+            except Exception as e:
+                logger.error("billing_webhook plan update error: %s", e)
+
+    return jsonify({"received": True})
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  WEB CHAT API (for the Next.js web app — same brain as Telegram, different door)
