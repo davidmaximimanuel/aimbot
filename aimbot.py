@@ -85,6 +85,7 @@ from google.genai import types
 
 # ── Module imports (deduplicated) ──────────────────────────
 from core import BASE_SYSTEM_PROMPT, build_enhanced_prompt, WAT
+from modes import apply_mode, get_generation_overrides, disables_web_search, requires_deepsearch
 from capabilities import is_search_query, SEARCH_TRIGGER_PHRASES, trigger_embeddings, semantic_model
 # Import START_TIME from admin so both files share the SAME start reference.
 # This is what fixes the stale uptime bug — admin.py sets it at import time
@@ -256,12 +257,17 @@ else:
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 deepseek_client: Optional[AsyncOpenAI] = None
 
-if USE_DEEPSEEK and DEEPSEEK_API_KEY:
+# NOTE: deepseek_client is now created whenever a key exists, independent of
+# USE_DEEPSEEK. Model *routing* (which model answers a given message) is
+# decided per-user by plan tier in get_ai_response's TIER_MODEL_CHAIN below,
+# not by this global flag. USE_DEEPSEEK is kept only as a legacy default for
+# the handful of internal helper calls that don't carry a user plan.
+if DEEPSEEK_API_KEY:
     deepseek_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-    logger.info("✅ Using DeepSeek V4 API")
-elif GEMINI_API_KEY:
-    logger.info("✅ Using Gemini API")
-else:
+    logger.info("✅ DeepSeek API available (used for Pro-tier routing)")
+if GEMINI_API_KEY:
+    logger.info("✅ Gemini API available (used for Free/Basic-tier routing)")
+if not DEEPSEEK_API_KEY and not GEMINI_API_KEY:
     logger.warning("⚠️ No AI API configured!")
 
 groq_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1") if GROQ_API_KEY else None
@@ -803,6 +809,22 @@ def deep_research(query: str) -> str:
         lines.append(f"{i}. {r['title']}\n   Summary: {r['description']}\n   Source: {r['url']}")
     return "\n\n".join(lines)
 
+def aim_deepsearch(query: str, max_links: int = 3) -> str:
+    """DeepSearch mode: unlike a normal search (snippets only), this fetches
+    the top few results AND actually visits each page to pull real content,
+    not just the search engine's short description. Slower and more
+    expensive than search_web() — only use when DeepSearch mode is active."""
+    results = _search_brave_scrape(query, max_links) or _search_brave_api(query, max_links) or _search_duckduckgo_lite(query, max_links)
+    if not results:
+        return "DeepSearch found no results to visit."
+    lines = ["=== DEEPSEARCH RESULTS (full page content) ===\n"]
+    for i, r in enumerate(results[:max_links], 1):
+        page_content = fetch_url_content(r["url"])
+        if not page_content or "Failed" in page_content:
+            page_content = r.get("description", "(could not read full page)")
+        lines.append(f"{i}. {r['title']}\n   Source: {r['url']}\n   Content: {page_content[:1500]}")
+    return "\n\n".join(lines)
+
 def fetch_url_content(url: str) -> str:
     try:
         resp = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
@@ -975,24 +997,36 @@ async def update_session_summary(user_id: str, recent_messages: list, current_su
 def _fmt_wat(dt: datetime) -> str:
     return dt.astimezone(WAT).strftime("%a %b %d, %Y · %I:%M %p WAT")
 
-async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, str, float]:
+async def get_conversation_context(user_id: str, query_text: str, plan: str = "free") -> tuple[str, str, float]:
     if not supabase: return "", "", 0.0
+    # Tier-aware depth: free users get a short recent-only window (cheapest
+    # on tokens), basic gets recent + light older-context, pro gets the full
+    # window. This is the main lever for keeping "unlimited" tiers affordable.
+    tier_limits = {
+        "free":  {"recent": 5,  "older": 0},
+        "basic": {"recent": 15, "older": 10},
+        "pro":   {"recent": 40, "older": 10},
+    }
+    limits = tier_limits.get((plan or "free").lower(), tier_limits["free"])
+    fetch_count = max(limits["recent"] + limits["older"], limits["recent"])
     try:
-        rows = supabase.table("chat_memory").select("message,response,topic,created_at").eq("user_id",str(user_id)).order("created_at",desc=True).limit(40).execute()
+        rows = supabase.table("chat_memory").select("message,response,topic,created_at").eq("user_id",str(user_id)).order("created_at",desc=True).limit(max(fetch_count, 40)).execute()
         if not rows.data: return "", "", 0.0
         gap_seconds = 0.0
         try:
             last_ts     = datetime.fromisoformat(rows.data[0]["created_at"].replace("Z","+00:00"))
             gap_seconds = (datetime.now(timezone.utc) - last_ts).total_seconds()
         except Exception: pass
-        recent_rows  = list(reversed(rows.data[:5]))
+        recent_rows  = list(reversed(rows.data[:limits["recent"]]))
         recent_lines = []
         for row in recent_rows:
             try:    tstr = _fmt_wat(datetime.fromisoformat(row["created_at"].replace("Z","+00:00")))
             except: tstr = "unknown time"
             recent_lines += [f"  [{tstr}]", f"  User : {row['message']}", f"  AIM  : {row['response']}", ""]
         recent_history = "\n".join(recent_lines).strip()
-        older_rows     = rows.data[5:]
+        if limits["older"] <= 0:
+            return recent_history, "", gap_seconds
+        older_rows     = rows.data[limits["recent"]:]
         if not older_rows: return recent_history, "", gap_seconds
         query_lower    = query_text.lower()
         keyword_topics = {"space":["tech"],"nigeria":["general","politics"],"money":["finance"],"job":["career"],"health":["health"],"love":["relationships"],"sport":["sports"],"music":["entertainment"],"school":["education"],"code":["tech"],"ai":["tech"]}
@@ -1010,31 +1044,85 @@ async def get_conversation_context(user_id: str, query_text: str) -> tuple[str, 
                 if len(word) > 3 and word in blob: score += 10
             scored.append((score, row))
         scored.sort(key=lambda x: x[0], reverse=True)
-        older_lines = [f"[{r.get('topic','general')}] User: {r['message']} | AIM: {r['response']}" for _, r in scored[:10]]
+        older_lines = [f"[{r.get('topic','general')}] User: {r['message']} | AIM: {r['response']}" for _, r in scored[:limits["older"]]]
         return recent_history, "\n".join(older_lines), gap_seconds
     except Exception as e:
         logger.error("Context retrieval error: %s", e)
         return "", "", 0.0
 
+# ─── PER-TIER MODEL ROUTING ───
+# AIM's own naming vs the actual underlying model, per the plan doc:
+#   AIM Alpha 1 Mini → gemini-2.5-flash-lite   (free tier default)
+#   AIM Alpha 1      → gemini-2.5-flash        (basic tier default)
+#   AIM Alpha 1 Pro  → deepseek-v4 / deepseek-v4-flash when Pro is busy
+# Each tier is a FALLBACK CHAIN, not a single model: if the first choice
+# fails (rate limit, timeout, outage) we automatically drop to the next
+# entry rather than returning nothing. Free/Basic always keep a Gemini
+# fallback since that's the cheapest, most available option.
+TIER_MODEL_CHAIN = {
+    "free":  [("gemini", "gemini-2.5-flash-lite")],
+    "basic": [("gemini", "gemini-2.5-flash"), ("gemini", "gemini-2.5-flash-lite")],
+    "pro":   [("deepseek", "deepseek-v4"), ("deepseek", "deepseek-v4-flash"), ("gemini", "gemini-2.5-flash")],
+}
+
+async def _call_gemini(model_name: str, system_prompt: str, prompt: str, temperature: float, max_tokens: int) -> Optional[str]:
+    if not gemini_client:
+        return None
+    full_text = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+    r = gemini_client.models.generate_content(
+        model=model_name,
+        contents=[types.Content(role="user", parts=[types.Part(text=full_text)])],
+        config=types.GenerateContentConfig(temperature=temperature, max_output_tokens=max_tokens),
+    )
+    return r.text if r and r.text else None
+
+async def _call_deepseek(model_name: str, system_prompt: str, prompt: str, temperature: float, max_tokens: int) -> Optional[str]:
+    if not deepseek_client:
+        return None
+    messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}]
+    r = await deepseek_client.chat.completions.create(model=model_name, messages=messages, temperature=temperature, max_tokens=max_tokens)
+    return r.choices[0].message.content if r.choices else None
+
+async def _route_to_model(plan: str, system_prompt: str, prompt: str, temperature: float = 0.7, max_tokens: int = 1024) -> Optional[str]:
+    """Try each model in the plan's fallback chain in order; return the
+    first successful response. Logs which link in the chain actually
+    answered, and why earlier links were skipped, for debugging."""
+    chain = TIER_MODEL_CHAIN.get((plan or "free").lower(), TIER_MODEL_CHAIN["free"])
+    for provider, model_name in chain:
+        try:
+            if provider == "gemini":
+                result = await _call_gemini(model_name, system_prompt, prompt, temperature, max_tokens)
+            elif provider == "deepseek":
+                result = await _call_deepseek(model_name, system_prompt, prompt, temperature, max_tokens)
+            else:
+                continue
+            if result:
+                return result
+        except Exception as e:
+            logger.warning("Model routing: %s/%s failed (%s), trying next in chain", provider, model_name, e)
+            continue
+    logger.error("Model routing: entire fallback chain exhausted for plan=%s", plan)
+    return None
+
 async def get_ai_response(
     user_text: str, user_id: str, chat_type: str, profile: dict = None,
     session_summary: str = "", recent_history: str = "", older_context: str = "",
-    web_context: str = "", tool_status: str = "", gap_seconds: float = 0.0
+    web_context: str = "", tool_status: str = "", gap_seconds: float = 0.0,
+    plan: str = None, mode: str = None
 ) -> Optional[str]:
     try:
         if profile is None: profile = await get_user_profile_data(user_id)
+        if plan is None: plan = (profile.get("plan") or "free")
         prompt = build_enhanced_prompt(
             user_text, user_id, profile, is_admin,
             session_summary, recent_history, older_context,
             web_context, tool_status, gap_seconds
         )
-        if USE_DEEPSEEK and deepseek_client:
-            r = await deepseek_client.chat.completions.create(model="deepseek-v4-flash", messages=[{"role":"system","content":BASE_SYSTEM_PROMPT},{"role":"user","content":prompt}], temperature=0.7, max_tokens=1024)
-            return r.choices[0].message.content if r.choices else None
-        elif gemini_client:
-            r = gemini_client.models.generate_content(model="gemini-2.5-flash-lite", contents=[types.Content(role="user",parts=[types.Part(text=prompt)])], config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=1024))
-            return r.text if r and r.text else None
-        return None
+        system_prompt = apply_mode(BASE_SYSTEM_PROMPT, mode)
+        gen_overrides = get_generation_overrides(mode)
+        temperature = gen_overrides.get("temperature", 0.7)
+        max_tokens   = gen_overrides.get("max_tokens", 1024)
+        return await _route_to_model(plan, system_prompt, prompt, temperature=temperature, max_tokens=max_tokens)
     except Exception as e:
         logger.error("AI response error: %s", e)
         return None
@@ -1652,7 +1740,7 @@ async def handle_inline_query_async(inline_query):
 async def process_inline_answer(chat_id: int, message_id: int, query_text: str, user_id: str):
     try:
         profile = await get_user_profile_data(user_id)
-        recent, older, gap = await get_conversation_context(user_id, query_text)
+        recent, older, gap = await get_conversation_context(user_id, query_text, plan=(profile.get("plan") or "free"))
         r_text = await get_ai_response(query_text, user_id, "private", profile, recent_history=recent, older_context=older, gap_seconds=gap)
         if r_text:
             answer = r_text.strip()
@@ -1873,8 +1961,9 @@ async def handle_message_async(update: Update):
         user_text = re.sub(r'@askaimbot', '', user_text, flags=re.IGNORECASE).strip()
 
     try:
+        user_plan = (profile.get("plan") or "free")
         session_summary                            = await get_session_summary(user_id)
-        recent_history, older_context, gap_seconds = await get_conversation_context(user_id, user_text)
+        recent_history, older_context, gap_seconds = await get_conversation_context(user_id, user_text, plan=user_plan)
         web_context = ""
 
         # ── Fetch any URLs the user pasted ──
@@ -2913,7 +3002,7 @@ async def web_chat():
         profile = await get_user_profile_data(user_id)
         session_summary = await get_session_summary(user_id) if memory_enabled else ""
         recent_history, older_context, gap_seconds = (
-            await get_conversation_context(user_id, user_text) if memory_enabled else ("", "", 0.0)
+            await get_conversation_context(user_id, user_text, plan=(profile.get("plan") or "free")) if memory_enabled else ("", "", 0.0)
         )
 
         web_context = ""
