@@ -185,6 +185,9 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         language = _normalize_language(data.get("language", ""))
+        level = data.get("level", "intermediate")
+        if level not in ("beginner", "intermediate"):
+            level = "intermediate"
 
         session = _get_active_session(supabase_client, user_id, language)
         if not session:
@@ -195,7 +198,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         if not units:
             return jsonify({"error": "Nothing learned yet to quiz on"}), 400
 
-        questions = _generate_quiz(gemini_client, language, native_language, units)
+        questions = _generate_quiz(gemini_client, language, native_language, units, level)
         if not questions:
             return jsonify({"error": "Failed to generate quiz"}), 500
 
@@ -543,7 +546,7 @@ def _chat_reply(gemini_client, language, native_language, unit_title, unit_conte
         return "Let's keep going — what would you like to know?"
 
 
-QUIZ_GENERATION_PROMPT = """You are creating a short quiz for a learner of {language} (native language: {native_language}) covering ONLY what they've been taught so far. Do not introduce anything new.
+QUIZ_GENERATION_PROMPT = """You are creating a short quiz for a learner of {language} (native language: {native_language}) covering ONLY what they've been taught so far. Do not introduce anything new. Difficulty level: {level}.
 
 Known symbols and sounds: {symbol_list}
 Known words: {word_list}
@@ -554,12 +557,23 @@ Return ONLY valid JSON: an array of up to 5 quiz questions, mixing these types w
 - "word_meaning": show a known word, ask its meaning in {native_language}
 
 Each item exactly this shape:
-{{"id": "q1", "type": "...", "prompt": "...", "expects_free_text": boolean, "correct_answer": "..."}}
+{{"id": "q1", "type": "...", "prompt": "...", "expects_free_text": boolean, "correct_answer": "...", "choices": [array of strings, or null]}}
 
-expects_free_text should be true only for word_meaning-style questions (short phrase answers); false for single symbol/sound answers. Use ONLY symbols/words from the known lists above — never invent new ones the learner hasn't seen."""
+{choices_instruction}
+
+expects_free_text should be true only for word_meaning-style questions with no choices (short phrase answers); false whenever choices are provided or the answer is a single symbol/sound. Use ONLY symbols/words from the known lists above — never invent new ones the learner hasn't seen."""
+
+BEGINNER_CHOICES_INSTRUCTION = (
+    "This is BEGINNER level: every question MUST include a \"choices\" array of 3-4 short options "
+    "(the correct answer plus 2-3 plausible wrong answers drawn from the other known symbols/words), "
+    "in random order, with expects_free_text set to false."
+)
+INTERMEDIATE_CHOICES_INSTRUCTION = (
+    "This is INTERMEDIATE level: set \"choices\" to null for every question — the learner types their own answer."
+)
 
 
-def _generate_quiz(gemini_client, language, native_language, units):
+def _generate_quiz(gemini_client, language, native_language, units, level="intermediate"):
     if gemini_client is None:
         return None
 
@@ -571,15 +585,17 @@ def _generate_quiz(gemini_client, language, native_language, units):
             words.append(f'{w.get("word")} ({w.get("translation")})')
 
     prompt = QUIZ_GENERATION_PROMPT.format(
-        language=language, native_language=native_language,
+        language=language, native_language=native_language, level=level,
         symbol_list="; ".join(symbols) if symbols else "none",
         word_list="; ".join(words) if words else "none",
+        choices_instruction=BEGINNER_CHOICES_INSTRUCTION if level == "beginner" else INTERMEDIATE_CHOICES_INSTRUCTION,
     )
     try:
         resp = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json"),
+
         )
         questions = json.loads(resp.text)
         return questions if isinstance(questions, list) else None
