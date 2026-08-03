@@ -147,6 +147,18 @@ def is_duplicate_update(update_id: int) -> bool:
 _oauth_states: dict[str, dict] = {}
 _oauth_states_lock = threading.Lock()
 
+# ─── MESSAGE COALESCING ("blend a fast follow-up into one answer") ───
+# If a user sends a second message within COALESCE_WINDOW_SECONDS of the
+# first, while AIM is still generating a reply to the first one, we cancel
+# the in-flight generation, merge both messages into one combined prompt,
+# and generate a single answer covering both — instead of answering the
+# first question, then separately answering the second. If no follow-up
+# arrives in time, nothing changes: the first message is answered normally
+# at full speed (no artificial delay is ever added up front).
+_pending_replies: dict[str, dict] = {}
+_pending_replies_lock = threading.Lock()
+COALESCE_WINDOW_SECONDS = 2.5
+
 def _create_oauth_state(telegram_user_id: str, chat_id: int) -> str:
     state = secrets.token_urlsafe(32)
     with _oauth_states_lock:
@@ -1060,9 +1072,16 @@ async def get_conversation_context(user_id: str, query_text: str, plan: str = "f
 # entry rather than returning nothing. Free/Basic always keep a Gemini
 # fallback since that's the cheapest, most available option.
 TIER_MODEL_CHAIN = {
-    "free":  [("gemini", "gemini-2.5-flash-lite")],
-    "basic": [("gemini", "gemini-2.5-flash"), ("gemini", "gemini-2.5-flash-lite")],
-    "pro":   [("deepseek", "deepseek-v4"), ("deepseek", "deepseek-v4-flash"), ("gemini", "gemini-2.5-flash")],
+    # NOTE (Aug 2026): DeepSeek retired the V3/V3.2/R1 lines on 2026-07-24 —
+    # "deepseek-chat" / "deepseek-reasoner" aliases now error out. Only two
+    # live models exist: deepseek-v4-flash (cheap) and deepseek-v4-pro
+    # (stronger, ~3x the cost). DeepSeek is primary here since Gemini
+    # billing is currently broken on this account; Gemini is kept as a
+    # last-resort fallback so it silently starts working again on its own
+    # once billing is fixed, with no code change needed.
+    "free":  [("deepseek", "deepseek-v4-flash"), ("gemini", "gemini-2.5-flash-lite")],
+    "basic": [("deepseek", "deepseek-v4-flash"), ("gemini", "gemini-2.5-flash")],
+    "pro":   [("deepseek", "deepseek-v4-pro"), ("deepseek", "deepseek-v4-flash"), ("gemini", "gemini-2.5-flash")],
 }
 
 async def _call_gemini(model_name: str, system_prompt: str, prompt: str, temperature: float, max_tokens: int) -> Optional[str]:
@@ -1960,6 +1979,19 @@ async def handle_message_async(update: Update):
             return
         user_text = re.sub(r'@askaimbot', '', user_text, flags=re.IGNORECASE).strip()
 
+    # Dispatch generation — this may cancel-and-merge with an in-flight
+    # reply if the user sent a fast follow-up (see _pending_replies above).
+    # Deliberately not awaited: handle_message_async returns immediately so
+    # the webhook responds fast, while the actual generation continues as
+    # its own background task.
+    _dispatch_reply_with_coalescing(user_id, username, chat, message_id, user_text, chat_type, profile)
+
+
+async def _generate_and_send_reply(user_id: str, username: str, chat, message_id: int, user_text: str, chat_type: str, profile: dict):
+    """The full AI-generation-and-send pipeline, pulled out into its own
+    function so it can run as a cancellable asyncio.Task — this is what
+    lets a fast follow-up message cancel and merge into an in-flight reply
+    instead of always waiting for the first answer to finish."""
     try:
         user_plan = (profile.get("plan") or "free")
         session_summary                            = await get_session_summary(user_id)
@@ -2187,9 +2219,43 @@ async def handle_message_async(update: Update):
                 recent_msgs.data.reverse()
                 run_async(update_session_summary(user_id, recent_msgs.data, session_summary))
 
+    except asyncio.CancelledError:
+        # Expected when a fast follow-up message supersedes this generation
+        # (see _pending_replies coalescing logic in handle_message_async).
+        # Not an error — just let it end quietly.
+        logger.info("Reply generation for %s cancelled — merging into follow-up", user_id)
+        raise
     except Exception as e:
-        logger.error("Critical error in handle_message_async: %s", e)
+        logger.error("Critical error in _generate_and_send_reply: %s", e)
         await send_text_chunks(chat.id, "🛠️ Something went wrong.", reply_to=message_id)
+    finally:
+        # Clean up the pending-reply slot once this task is done, but only
+        # if it's still ours (a newer merged task may have already replaced it).
+        with _pending_replies_lock:
+            entry = _pending_replies.get(user_id)
+            if entry and entry.get("current_text") == user_text:
+                _pending_replies.pop(user_id, None)
+
+
+def _dispatch_reply_with_coalescing(user_id: str, username: str, chat, message_id: int, user_text: str, chat_type: str, profile: dict):
+    """Decides whether this message should start a fresh reply, or cancel
+    and merge into one that's still in-flight for this same user. Never
+    awaits the generation itself — it fires the task and returns instantly,
+    so normal (non-follow-up) messages are answered at full speed with no
+    added delay."""
+    now = time.time()
+    with _pending_replies_lock:
+        existing = _pending_replies.get(user_id)
+        if existing and not existing["task"].done() and (now - existing["started_at"]) <= COALESCE_WINDOW_SECONDS:
+            existing["task"].cancel()
+            combined_text = f"{existing['current_text']} {user_text}".strip()
+        else:
+            combined_text = user_text
+
+        new_task = asyncio.create_task(
+            _generate_and_send_reply(user_id, username, chat, message_id, combined_text, chat_type, profile)
+        )
+        _pending_replies[user_id] = {"task": new_task, "started_at": now, "current_text": combined_text}
 
 @app.route("/", methods=["GET"])
 def health():

@@ -25,6 +25,14 @@ logger = logging.getLogger("language_engine")
 
 GEMINI_MODEL = "gemini-2.5-flash-lite"  # matches the model used elsewhere in aimbot.py
 
+
+def _is_quota_error(e):
+    """Detects Gemini quota/rate-limit failures specifically, so they can
+    be logged and surfaced honestly instead of masquerading as a normal
+    (and possibly wrong-looking) answer."""
+    msg = str(e).lower()
+    return any(s in msg for s in ("429", "resource_exhausted", "quota", "rate limit", "rate_limit"))
+
 VALID_TEMPLATE_TYPES = {"type1_alphabet", "type2_grammar_translation", "type3_speech_conversation"}
 
 
@@ -84,6 +92,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
             "template_type": chosen_type,
             "classification_reasoning": classification.get("reasoning", ""),
             "has_positional_forms": unit_zero.get("has_positional_forms", False),
+            "total_alphabet_size": unit_zero.get("total_alphabet_size") or 30,
             "session_length_minutes": session_length_minutes,
             "units": [unit_zero["unit"]],
         }
@@ -120,10 +129,19 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
 
         known_symbols = []
         for u in static_content["units"]:
+            if u.get("phase") == "words_sentences":
+                continue  # only alphabet-phase units count toward "known symbols"
             known_symbols.extend([s["symbol"] for s in u.get("introduces", [])])
 
+        total_alphabet_size = static_content.get("total_alphabet_size", 30)
         next_index = len(static_content["units"])
-        new_unit = _generate_unit(gemini_client, supabase_client, language, unit_index=next_index, known_symbols=known_symbols)
+
+        if len(known_symbols) >= total_alphabet_size:
+            new_unit = _generate_sentence_unit(gemini_client, supabase_client, language, native_language,
+                                                unit_index=next_index, known_symbols=known_symbols)
+        else:
+            new_unit = _generate_unit(gemini_client, supabase_client, language, unit_index=next_index, known_symbols=known_symbols)
+
         if new_unit is None:
             return jsonify({"error": "Failed to generate next unit"}), 500
 
@@ -153,7 +171,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         verdict = _check_answer(gemini_client, language, native_language, expected_context, user_answer)
 
         session_state = session["session_state"]
-        if not verdict.get("correct", False):
+        if verdict.get("checked", True) and not verdict.get("correct", False):
             session_state["last_mistake"] = verdict.get("feedback", "")
         session_state["updated_at"] = datetime.now(timezone.utc).isoformat()
         _save_session(supabase_client, user_id, empire_id, language, native_language,
@@ -246,13 +264,14 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
             return jsonify(active_quiz["answered"][question_id])
 
         verdict = _grade_quiz_answer(gemini_client, native_language, question, user_answer)
-        active_quiz["answered"][question_id] = verdict
-        if verdict.get("correct"):
-            active_quiz["score"] += 1
 
-        session_state["updated_at"] = datetime.now(timezone.utc).isoformat()
-        _save_session(supabase_client, user_id, session.get("empire_id", "unknown"), language,
-                      native_language, session["static_content"], session_state)
+        if verdict.get("checked", True):  # only lock it in on a real result
+            active_quiz["answered"][question_id] = verdict
+            if verdict.get("correct"):
+                active_quiz["score"] += 1
+            session_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _save_session(supabase_client, user_id, session.get("empire_id", "unknown"), language,
+                          native_language, session["static_content"], session_state)
 
         return jsonify({
             **verdict,
@@ -414,7 +433,7 @@ def _get_cached_unit(supabase, language, unit_index):
         return None
 
 
-def _save_cached_unit(supabase, language, unit_index, has_positional_forms, unit_data):
+def _save_cached_unit(supabase, language, unit_index, has_positional_forms, unit_data, total_alphabet_size=None):
     if supabase is None:
         return
     try:
@@ -423,6 +442,7 @@ def _save_cached_unit(supabase, language, unit_index, has_positional_forms, unit
             "unit_index": unit_index,
             "has_positional_forms": has_positional_forms,
             "unit_data": unit_data,
+            "total_alphabet_size": total_alphabet_size,
         }, on_conflict="language,unit_index").execute()
     except Exception as e:
         logger.error("Unit cache save error: %s", e)
@@ -435,7 +455,9 @@ This is unit index {unit_index}. The learner already knows these symbols: {known
 Return ONLY valid JSON (no markdown, no commentary) matching exactly this shape:
 {{
   "has_positional_forms": boolean,
+  "total_alphabet_size": integer (your best estimate of how many distinct symbols/letters this language's script has in total),
   "unit": {{
+    "phase": "alphabet",
     "unit_index": {unit_index},
     "title": "short title",
     "introduces": [
@@ -450,12 +472,34 @@ Return ONLY valid JSON (no markdown, no commentary) matching exactly this shape:
 
 Introduce 3-5 new symbols max for this unit. Only use symbols already known or being introduced in this unit for practice_words. If the language has positional letterforms (like Arabic), set has_positional_forms to true and mention the forms in example_word naturally."""
 
+SENTENCE_UNIT_PROMPT = """You are designing one unit for a learner of {language} (native language: {native_language}) who has now learned the full alphabet: {known_symbols}.
+
+This unit moves past the alphabet into simple words and sentences. The sentence, translation, vocabulary, and comprehension question should all use {language} as the main content — the learner already knows the letters, now they're reading real language.
+
+Return ONLY valid JSON (no markdown, no commentary) matching exactly this shape:
+{{
+  "unit": {{
+    "phase": "words_sentences",
+    "unit_index": {unit_index},
+    "title": "short title",
+    "sentence": "a short, simple sentence in {language} (3-6 words)",
+    "sentence_translation": "translation in {native_language}",
+    "vocabulary": [
+      {{"word": "...", "translation": "..."}}
+    ],
+    "comprehension_prompt": "a short question written in {language} that tests understanding of the sentence, expecting an answer in {language}"
+  }}
+}}
+
+Keep the sentence appropriate for someone who just finished learning the alphabet — simple, common words, nothing obscure."""
+
 
 def _generate_unit(gemini_client, supabase_client, language, unit_index, known_symbols):
     cached = _get_cached_unit(supabase_client, language, unit_index)
     if cached:
         return {
             "has_positional_forms": cached.get("has_positional_forms", False),
+            "total_alphabet_size": cached.get("total_alphabet_size"),
             "unit": cached.get("unit_data"),
         }
 
@@ -482,13 +526,45 @@ def _generate_unit(gemini_client, supabase_client, language, unit_index, known_s
         supabase_client, language, unit_index,
         result.get("has_positional_forms", False),
         result.get("unit"),
+        total_alphabet_size=result.get("total_alphabet_size"),
     )
+
+    return result
+
+
+def _generate_sentence_unit(gemini_client, supabase_client, language, native_language, unit_index, known_symbols):
+    # Same cache table/key as alphabet units — a sentence unit is still
+    # shared curriculum content, just a different shape once phase flips.
+    cached = _get_cached_unit(supabase_client, language, unit_index)
+    if cached and cached.get("unit_data", {}).get("phase") == "words_sentences":
+        return {"unit": cached.get("unit_data")}
+
+    if gemini_client is None:
+        logger.error("Gemini client not configured (missing GEMINI_API_KEY)")
+        return None
+
+    prompt = SENTENCE_UNIT_PROMPT.format(
+        language=language, native_language=native_language, unit_index=unit_index,
+        known_symbols=", ".join(known_symbols) if known_symbols else "the full alphabet",
+    )
+    try:
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        result = json.loads(resp.text)
+    except Exception as e:
+        logger.error("Sentence unit generation error: %s", e)
+        return None
+
+    _save_cached_unit(supabase_client, language, unit_index, False, result.get("unit"))
     return result
 
 
 def _check_answer(gemini_client, language, native_language, context, user_answer):
     if gemini_client is None:
-        return {"correct": False, "feedback": "Checking is unavailable right now."}
+        return {"correct": False, "checked": False, "feedback": "Checking is unavailable right now."}
     prompt = (f"A native {native_language} speaker learning {language} was asked about: {context}. "
               f"They answered: \"{user_answer}\". "
               f"Return ONLY JSON: {{\"correct\": boolean, \"feedback\": \"one short sentence, "
@@ -499,10 +575,18 @@ def _check_answer(gemini_client, language, native_language, context, user_answer
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        return json.loads(resp.text)
+        result = json.loads(resp.text)
+        result["checked"] = True
+        return result
     except Exception as e:
-        logger.error("Answer check error: %s", e)
-        return {"correct": False, "feedback": "I couldn't check that just now — let's continue."}
+        if _is_quota_error(e):
+            logger.error("Answer check QUOTA error: %s", e)
+            feedback = "AIM has hit its request limit for the moment — try checking this again in a bit."
+        else:
+            logger.error("Answer check error: %s", e)
+            feedback = "AIM couldn't check that just now — try again in a moment."
+        # correct=None (not False!) — a failed check is NOT a wrong answer.
+        return {"correct": None, "checked": False, "feedback": feedback}
 
 
 def _chat_reply(gemini_client, language, native_language, unit_title, unit_content, user_message, auto_intro=False):
@@ -542,8 +626,11 @@ def _chat_reply(gemini_client, language, native_language, unit_title, unit_conte
         resp = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         return resp.text
     except Exception as e:
+        if _is_quota_error(e):
+            logger.error("Chat reply QUOTA error: %s", e)
+            return "AIM has hit its request limit for the moment — give it a bit and try again."
         logger.error("Chat reply error: %s", e)
-        return "Let's keep going — what would you like to know?"
+        return "AIM couldn't respond just now — try again in a moment."
 
 
 QUIZ_GENERATION_PROMPT = """You are creating a short quiz for a learner of {language} (native language: {native_language}) covering ONLY what they've been taught so far. Do not introduce anything new. Difficulty level: {level}.
@@ -610,10 +697,10 @@ def _grade_quiz_answer(gemini_client, native_language, question, user_answer):
     if not question.get("expects_free_text"):
         is_correct = user_answer.strip().lower() == correct_answer.strip().lower()
         feedback = "Correct!" if is_correct else f"Not quite — the answer was {correct_answer}."
-        return {"correct": is_correct, "feedback": feedback}
+        return {"correct": is_correct, "checked": True, "feedback": feedback}
 
     if gemini_client is None:
-        return {"correct": False, "feedback": "Grading is unavailable right now."}
+        return {"correct": None, "checked": False, "feedback": "Grading is unavailable right now."}
 
     prompt = (f"A quiz question was: \"{question.get('prompt')}\". "
               f"Reference answer: \"{correct_answer}\". "
@@ -627,7 +714,14 @@ def _grade_quiz_answer(gemini_client, native_language, question, user_answer):
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        return json.loads(resp.text)
+        result = json.loads(resp.text)
+        result["checked"] = True
+        return result
     except Exception as e:
-        logger.error("Quiz grading error: %s", e)
-        return {"correct": False, "feedback": "I couldn't check that just now."}
+        if _is_quota_error(e):
+            logger.error("Quiz grading QUOTA error: %s", e)
+            feedback = "AIM has hit its request limit — try this question again shortly."
+        else:
+            logger.error("Quiz grading error: %s", e)
+            feedback = "AIM couldn't check that just now — try again."
+        return {"correct": None, "checked": False, "feedback": feedback}
