@@ -85,7 +85,7 @@ from google.genai import types
 
 # ── Module imports (deduplicated) ──────────────────────────
 from core import BASE_SYSTEM_PROMPT, build_enhanced_prompt, WAT
-from modes import apply_mode, get_generation_overrides, disables_web_search, requires_deepsearch
+from modes import apply_mode, get_generation_overrides, disables_web_search, requires_deepsearch, forces_search
 from capabilities import is_search_query, SEARCH_TRIGGER_PHRASES, trigger_embeddings, semantic_model
 # Import START_TIME from admin so both files share the SAME start reference.
 # This is what fixes the stale uptime bug — admin.py sets it at import time
@@ -3035,10 +3035,29 @@ async def web_chat():
         user_id = str(data.get("user_id") or "").strip()
         conversation_id = (data.get("conversation_id") or "").strip() or None
 
+        # Which mode is active (Attach/Search/DeepThink/Medical/DeepSearch/
+        # Sandbox from the Plus-button menu), and — for Sandbox — the
+        # document text the frontend should send alongside the message.
+        # Unrecognized mode values are treated as "no mode" rather than
+        # erroring, so an outdated frontend never breaks the endpoint.
+        from modes import MODES as _KNOWN_MODES
+        mode = (data.get("mode") or "").strip().lower() or None
+        if mode not in _KNOWN_MODES:
+            mode = None
+        document_content = (data.get("document_content") or data.get("document_text") or "").strip()
+
         if not user_text:
             return jsonify({"error": "message is required"}), 400
         if not user_id:
             return jsonify({"error": "user_id is required"}), 400
+
+        # Sandbox mode has nothing to answer from without a document — ask
+        # for one instead of silently calling the AI with empty context.
+        if mode == "sandbox" and not document_content:
+            return jsonify({
+                "reply": "📄 Sandbox Mode needs a document to work from — attach one and I'll answer strictly from its content.",
+                "conversation_id": conversation_id,
+            })
 
         memory_enabled = True
         if supabase:
@@ -3072,7 +3091,18 @@ async def web_chat():
         )
 
         web_context = ""
-        if is_search_query(user_text):
+        if mode == "sandbox":
+            # Strictly document-only — never touch the web, per modes.py's
+            # disables_web_search(). The document becomes the entire
+            # "web_context" the AI is given.
+            web_context = f"--- PROVIDED DOCUMENT (Sandbox Mode — answer ONLY from this) ---\n{document_content[:12000]}\n--- END DOCUMENT ---"
+        elif mode == "deepsearch":
+            # User explicitly asked for a deeper look — always fetch and
+            # visit pages, not just when is_search_query() would trigger.
+            sr = aim_deepsearch(user_text)
+            if sr and "found no results" not in sr:
+                web_context = sr
+        elif is_search_query(user_text) or forces_search(mode):
             tl = user_text.lower()
             if "news" in tl or "latest" in tl or "today" in tl:
                 sr = get_latest_news(user_text)
@@ -3088,7 +3118,8 @@ async def web_chat():
             iteration += 1
             answer = await get_ai_response(
                 user_text, user_id, "web", profile, session_summary,
-                recent_history, older_context, web_context, tool_status, gap_seconds
+                recent_history, older_context, web_context, tool_status, gap_seconds,
+                mode=mode
             )
             if not answer:
                 final_answer = "🔥 High demand right now — please try again."
@@ -3096,6 +3127,12 @@ async def web_chat():
             answer = answer.strip()
 
             if "SEARCH_TRIGGER:" in answer:
+                if disables_web_search(mode):
+                    # Sandbox mode: never actually search — strip the tag
+                    # and use whatever text remains as the final answer.
+                    answer = re.sub(r'SEARCH_TRIGGER:\s*.+', '', answer, flags=re.IGNORECASE).strip()
+                    final_answer = answer or "I can't find that in the document you provided."
+                    break
                 m = re.search(r'SEARCH_TRIGGER:\s*(.+)', answer, re.IGNORECASE)
                 if m:
                     sq = m.group(1).strip()

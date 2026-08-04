@@ -1,6 +1,12 @@
 """
 AIM Language Engine — Type 1 (alphabet-first) language template.
 
+Model routing: every AI call tries DeepSeek first, falls back to Gemini
+only if DeepSeek fails or is unavailable — mirrors aimbot.py's own
+_route_to_model fallback chain pattern (same idea, same "log which link
+answered" behavior), just adapted here to also support JSON-mode calls
+for structured content generation.
+
 Caches (shared across all learners, never personal):
   language_classifications — decided ONCE per language.
   language_unit_cache — decided ONCE per (language, unit_index).
@@ -23,15 +29,8 @@ from google.genai import types
 
 logger = logging.getLogger("language_engine")
 
-GEMINI_MODEL = "gemini-2.5-flash-lite"  # matches the model used elsewhere in aimbot.py
-
-
-def _is_quota_error(e):
-    """Detects Gemini quota/rate-limit failures specifically, so they can
-    be logged and surfaced honestly instead of masquerading as a normal
-    (and possibly wrong-looking) answer."""
-    msg = str(e).lower()
-    return any(s in msg for s in ("429", "resource_exhausted", "quota", "rate limit", "rate_limit"))
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
 
 VALID_TEMPLATE_TYPES = {"type1_alphabet", "type2_grammar_translation", "type3_speech_conversation"}
 
@@ -48,10 +47,82 @@ def _normalize_language(language):
     return language.strip().title()
 
 
-def register_language_routes(flask_app, supabase_client, gemini_client):
+def _is_quota_error(e):
+    """Detects a quota/rate-limit failure specifically, so the final
+    honest message (after BOTH providers have failed) can name the
+    real cause instead of a generic 'something went wrong'."""
+    msg = str(e).lower()
+    return any(s in msg for s in ("429", "resource_exhausted", "quota", "rate limit", "rate_limit"))
+
+
+# ── Shared model-routing helpers: DeepSeek first, Gemini fallback ──
+
+async def _generate_text(deepseek_client, gemini_client, prompt, temperature=0.7, max_tokens=1024):
+    """Plain-text generation. Tries DeepSeek, falls back to Gemini.
+    Raises the last exception if both fail — callers decide how to
+    present that to the user."""
+    last_err = None
+    if deepseek_client:
+        try:
+            r = await deepseek_client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature, max_tokens=max_tokens,
+            )
+            text = r.choices[0].message.content if r.choices else None
+            if text:
+                return text
+        except Exception as e:
+            logger.warning("Language engine: DeepSeek text call failed (%s), falling back to Gemini", e)
+            last_err = e
+    if gemini_client:
+        try:
+            resp = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            if resp and resp.text:
+                return resp.text
+        except Exception as e:
+            logger.warning("Language engine: Gemini text call also failed (%s)", e)
+            last_err = e
+    raise last_err or RuntimeError("No AI provider configured")
+
+
+async def _generate_json(deepseek_client, gemini_client, prompt, temperature=0.7, max_tokens=1024):
+    """JSON-mode generation. Tries DeepSeek (OpenAI-compatible json_object
+    mode), falls back to Gemini (response_mime_type=application/json).
+    Raises the last exception if both fail."""
+    last_err = None
+    if deepseek_client:
+        try:
+            r = await deepseek_client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature, max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+            text = r.choices[0].message.content if r.choices else None
+            if text:
+                return json.loads(text)
+        except Exception as e:
+            logger.warning("Language engine: DeepSeek JSON call failed (%s), falling back to Gemini", e)
+            last_err = e
+    if gemini_client:
+        try:
+            resp = gemini_client.models.generate_content(
+                model=GEMINI_MODEL, contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            if resp and resp.text:
+                return json.loads(resp.text)
+        except Exception as e:
+            logger.warning("Language engine: Gemini JSON call also failed (%s)", e)
+            last_err = e
+    raise last_err or RuntimeError("No AI provider configured")
+
+
+def register_language_routes(flask_app, supabase_client, gemini_client, deepseek_client=None):
 
     @flask_app.route("/api/language/start", methods=["POST"])
-    def language_start():
+    async def language_start():
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         empire_id = data.get("empire_id", "unknown")
@@ -71,7 +142,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
                 "session_state": existing["session_state"],
             })
 
-        classification = _classify_language(gemini_client, supabase_client, language)
+        classification = await _classify_language(deepseek_client, gemini_client, supabase_client, language)
         chosen_type = preferred_type if preferred_type in VALID_TEMPLATE_TYPES else classification["template_type"]
 
         if chosen_type != "type1_alphabet":
@@ -82,7 +153,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
                 "classification": classification,
             }), 501
 
-        unit_zero = _generate_unit(gemini_client, supabase_client, language, unit_index=0, known_symbols=[])
+        unit_zero = await _generate_unit(deepseek_client, gemini_client, supabase_client, language, unit_index=0, known_symbols=[])
         if unit_zero is None:
             return jsonify({"error": "Failed to generate lesson content"}), 500
 
@@ -113,7 +184,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         })
 
     @flask_app.route("/api/language/next-unit", methods=["POST"])
-    def language_next_unit():
+    async def language_next_unit():
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         empire_id = data.get("empire_id", "unknown")
@@ -130,17 +201,18 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         known_symbols = []
         for u in static_content["units"]:
             if u.get("phase") == "words_sentences":
-                continue  # only alphabet-phase units count toward "known symbols"
+                continue
             known_symbols.extend([s["symbol"] for s in u.get("introduces", [])])
 
         total_alphabet_size = static_content.get("total_alphabet_size", 30)
         next_index = len(static_content["units"])
 
         if len(known_symbols) >= total_alphabet_size:
-            new_unit = _generate_sentence_unit(gemini_client, supabase_client, language, native_language,
-                                                unit_index=next_index, known_symbols=known_symbols)
+            new_unit = await _generate_sentence_unit(deepseek_client, gemini_client, supabase_client, language,
+                                                       native_language, unit_index=next_index, known_symbols=known_symbols)
         else:
-            new_unit = _generate_unit(gemini_client, supabase_client, language, unit_index=next_index, known_symbols=known_symbols)
+            new_unit = await _generate_unit(deepseek_client, gemini_client, supabase_client, language,
+                                             unit_index=next_index, known_symbols=known_symbols)
 
         if new_unit is None:
             return jsonify({"error": "Failed to generate next unit"}), 500
@@ -155,7 +227,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         return jsonify({"static_content": static_content, "session_state": session_state})
 
     @flask_app.route("/api/language/answer", methods=["POST"])
-    def language_answer():
+    async def language_answer():
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         empire_id = data.get("empire_id", "unknown")
@@ -168,7 +240,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
             return jsonify({"error": "No active session"}), 404
 
         native_language = session.get("native_language", "English")
-        verdict = _check_answer(gemini_client, language, native_language, expected_context, user_answer)
+        verdict = await _check_answer(deepseek_client, gemini_client, language, native_language, expected_context, user_answer)
 
         session_state = session["session_state"]
         if verdict.get("checked", True) and not verdict.get("correct", False):
@@ -180,26 +252,21 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         return jsonify(verdict)
 
     @flask_app.route("/api/language/chat", methods=["POST"])
-    def language_chat():
+    async def language_chat():
         data = request.get_json() or {}
         language = _normalize_language(data.get("language", ""))
         native_language = data.get("native_language", "English")
         user_message = data.get("message", "")
         unit_title = data.get("unit_title", "")
-        # Full current unit (symbols, sounds, practice words) so AIM is
-        # grounded in what's actually on screen, not just guessing from
-        # the title.
         unit_content = data.get("unit_content") or {}
-        # True when this call fires automatically on unit load, rather
-        # than in response to something the learner typed.
         auto_intro = bool(data.get("auto_intro", False))
 
-        reply = _chat_reply(gemini_client, language, native_language, unit_title,
-                             unit_content, user_message, auto_intro)
+        reply = await _chat_reply(deepseek_client, gemini_client, language, native_language, unit_title,
+                                   unit_content, user_message, auto_intro)
         return jsonify({"response": reply})
 
     @flask_app.route("/api/language/quiz/start", methods=["POST"])
-    def language_quiz_start():
+    async def language_quiz_start():
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         language = _normalize_language(data.get("language", ""))
@@ -216,13 +283,13 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         if not units:
             return jsonify({"error": "Nothing learned yet to quiz on"}), 400
 
-        questions = _generate_quiz(gemini_client, language, native_language, units, level)
+        questions = await _generate_quiz(deepseek_client, gemini_client, language, native_language, units, level)
         if not questions:
             return jsonify({"error": "Failed to generate quiz"}), 500
 
         session_state = session["session_state"]
         session_state["active_quiz"] = {
-            "questions": questions,  # includes correct_answer — never sent to frontend as-is
+            "questions": questions,
             "answered": {},
             "score": 0,
             "total": len(questions),
@@ -231,14 +298,13 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         _save_session(supabase_client, user_id, session.get("empire_id", "unknown"), language,
                       native_language, session["static_content"], session_state)
 
-        # Strip correct_answer before sending to the client.
         safe_questions = [
             {k: v for k, v in q.items() if k != "correct_answer"} for q in questions
         ]
         return jsonify({"questions": safe_questions, "total": len(questions)})
 
     @flask_app.route("/api/language/quiz/answer", methods=["POST"])
-    def language_quiz_answer():
+    async def language_quiz_answer():
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         language = _normalize_language(data.get("language", ""))
@@ -260,12 +326,11 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
             return jsonify({"error": "Unknown question_id for this quiz"}), 400
 
         if question_id in active_quiz["answered"]:
-            # Already graded — return the stored result instead of re-scoring.
             return jsonify(active_quiz["answered"][question_id])
 
-        verdict = _grade_quiz_answer(gemini_client, native_language, question, user_answer)
+        verdict = await _grade_quiz_answer(deepseek_client, gemini_client, native_language, question, user_answer)
 
-        if verdict.get("checked", True):  # only lock it in on a real result
+        if verdict.get("checked", True):
             active_quiz["answered"][question_id] = verdict
             if verdict.get("correct"):
                 active_quiz["score"] += 1
@@ -281,7 +346,7 @@ def register_language_routes(flask_app, supabase_client, gemini_client):
         })
 
     @flask_app.route("/api/language/quiz/finish", methods=["POST"])
-    def language_quiz_finish():
+    async def language_quiz_finish():
         data = request.get_json() or {}
         user_id = data.get("user_id", "unknown")
         language = _normalize_language(data.get("language", ""))
@@ -317,12 +382,6 @@ def _get_active_session(supabase, user_id, language):
     if supabase is None:
         return None
     try:
-        # .limit(1) instead of .single(): single() throws if it finds
-        # zero rows OR more than one, which made this silently fail
-        # (returning None -> "No active session") whenever duplicate
-        # active rows existed for a user+language, even though a real
-        # session was sitting right there. This just takes the most
-        # recent one instead of erroring out.
         resp = (supabase.table("language_sessions")
                 .select("*")
                 .eq("user_id", user_id)
@@ -391,27 +450,19 @@ Return ONLY valid JSON, no markdown, no commentary:
 {{"template_type": "type1_alphabet" | "type2_grammar_translation" | "type3_speech_conversation", "reasoning": "one short sentence"}}"""
 
 
-def _classify_language(gemini_client, supabase_client, language):
+async def _classify_language(deepseek_client, gemini_client, supabase_client, language):
     cached = _get_cached_classification(supabase_client, language)
     if cached:
         return cached
 
-    if gemini_client is None:
-        return {"template_type": "type1_alphabet", "reasoning": "Gemini unavailable — defaulted."}
-
     try:
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=CLASSIFICATION_PROMPT.format(language=language),
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        result = json.loads(resp.text)
+        result = await _generate_json(deepseek_client, gemini_client, CLASSIFICATION_PROMPT.format(language=language))
         template_type = result.get("template_type", "type1_alphabet")
         if template_type not in VALID_TEMPLATE_TYPES:
             template_type = "type1_alphabet"
         reasoning = result.get("reasoning", "")
     except Exception as e:
-        logger.error("Language classification error: %s", e)
+        logger.error("Language classification error (both providers failed): %s", e)
         template_type, reasoning = "type1_alphabet", "Classification failed — defaulted."
 
     _save_classification(supabase_client, language, template_type, reasoning)
@@ -494,7 +545,7 @@ Return ONLY valid JSON (no markdown, no commentary) matching exactly this shape:
 Keep the sentence appropriate for someone who just finished learning the alphabet — simple, common words, nothing obscure."""
 
 
-def _generate_unit(gemini_client, supabase_client, language, unit_index, known_symbols):
+async def _generate_unit(deepseek_client, gemini_client, supabase_client, language, unit_index, known_symbols):
     cached = _get_cached_unit(supabase_client, language, unit_index)
     if cached:
         return {
@@ -503,23 +554,14 @@ def _generate_unit(gemini_client, supabase_client, language, unit_index, known_s
             "unit": cached.get("unit_data"),
         }
 
-    if gemini_client is None:
-        logger.error("Gemini client not configured (missing GEMINI_API_KEY)")
-        return None
-
     prompt = UNIT_SCHEMA_PROMPT.format(
         language=language, unit_index=unit_index,
         known_symbols=", ".join(known_symbols) if known_symbols else "none yet",
     )
     try:
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        result = json.loads(resp.text)
+        result = await _generate_json(deepseek_client, gemini_client, prompt)
     except Exception as e:
-        logger.error("Unit generation error: %s", e)
+        logger.error("Unit generation error (both providers failed): %s", e)
         return None
 
     _save_cached_unit(
@@ -528,71 +570,48 @@ def _generate_unit(gemini_client, supabase_client, language, unit_index, known_s
         result.get("unit"),
         total_alphabet_size=result.get("total_alphabet_size"),
     )
-
     return result
 
 
-def _generate_sentence_unit(gemini_client, supabase_client, language, native_language, unit_index, known_symbols):
-    # Same cache table/key as alphabet units — a sentence unit is still
-    # shared curriculum content, just a different shape once phase flips.
+async def _generate_sentence_unit(deepseek_client, gemini_client, supabase_client, language, native_language, unit_index, known_symbols):
     cached = _get_cached_unit(supabase_client, language, unit_index)
     if cached and cached.get("unit_data", {}).get("phase") == "words_sentences":
         return {"unit": cached.get("unit_data")}
-
-    if gemini_client is None:
-        logger.error("Gemini client not configured (missing GEMINI_API_KEY)")
-        return None
 
     prompt = SENTENCE_UNIT_PROMPT.format(
         language=language, native_language=native_language, unit_index=unit_index,
         known_symbols=", ".join(known_symbols) if known_symbols else "the full alphabet",
     )
     try:
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        result = json.loads(resp.text)
+        result = await _generate_json(deepseek_client, gemini_client, prompt)
     except Exception as e:
-        logger.error("Sentence unit generation error: %s", e)
+        logger.error("Sentence unit generation error (both providers failed): %s", e)
         return None
 
     _save_cached_unit(supabase_client, language, unit_index, False, result.get("unit"))
     return result
 
 
-def _check_answer(gemini_client, language, native_language, context, user_answer):
-    if gemini_client is None:
-        return {"correct": False, "checked": False, "feedback": "Checking is unavailable right now."}
+async def _check_answer(deepseek_client, gemini_client, language, native_language, context, user_answer):
     prompt = (f"A native {native_language} speaker learning {language} was asked about: {context}. "
               f"They answered: \"{user_answer}\". "
               f"Return ONLY JSON: {{\"correct\": boolean, \"feedback\": \"one short sentence, "
               f"encouraging, in plain {native_language}, correcting if wrong\"}}")
     try:
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        result = json.loads(resp.text)
+        result = await _generate_json(deepseek_client, gemini_client, prompt)
         result["checked"] = True
         return result
     except Exception as e:
         if _is_quota_error(e):
-            logger.error("Answer check QUOTA error: %s", e)
+            logger.error("Answer check QUOTA error (both providers): %s", e)
             feedback = "AIM has hit its request limit for the moment — try checking this again in a bit."
         else:
-            logger.error("Answer check error: %s", e)
+            logger.error("Answer check error (both providers failed): %s", e)
             feedback = "AIM couldn't check that just now — try again in a moment."
-        # correct=None (not False!) — a failed check is NOT a wrong answer.
         return {"correct": None, "checked": False, "feedback": feedback}
 
 
-def _chat_reply(gemini_client, language, native_language, unit_title, unit_content, user_message, auto_intro=False):
-    if gemini_client is None:
-        return "I'm here to help, but my brain's offline right now — try again in a moment."
-
+async def _chat_reply(deepseek_client, gemini_client, language, native_language, unit_title, unit_content, user_message, auto_intro=False):
     on_screen = ""
     introduces = unit_content.get("introduces") if isinstance(unit_content, dict) else None
     if introduces:
@@ -623,13 +642,12 @@ def _chat_reply(gemini_client, language, native_language, unit_title, unit_conte
                   f"mixing in a word or two of {language} they've likely learned if natural, "
                   f"but explain in plain {native_language}.")
     try:
-        resp = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        return resp.text
+        return await _generate_text(deepseek_client, gemini_client, prompt)
     except Exception as e:
         if _is_quota_error(e):
-            logger.error("Chat reply QUOTA error: %s", e)
+            logger.error("Chat reply QUOTA error (both providers): %s", e)
             return "AIM has hit its request limit for the moment — give it a bit and try again."
-        logger.error("Chat reply error: %s", e)
+        logger.error("Chat reply error (both providers failed): %s", e)
         return "AIM couldn't respond just now — try again in a moment."
 
 
@@ -660,10 +678,7 @@ INTERMEDIATE_CHOICES_INSTRUCTION = (
 )
 
 
-def _generate_quiz(gemini_client, language, native_language, units, level="intermediate"):
-    if gemini_client is None:
-        return None
-
+async def _generate_quiz(deepseek_client, gemini_client, language, native_language, units, level="intermediate"):
     symbols, words = [], []
     for u in units:
         for s in u.get("introduces", []):
@@ -678,29 +693,20 @@ def _generate_quiz(gemini_client, language, native_language, units, level="inter
         choices_instruction=BEGINNER_CHOICES_INSTRUCTION if level == "beginner" else INTERMEDIATE_CHOICES_INSTRUCTION,
     )
     try:
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-
-        )
-        questions = json.loads(resp.text)
+        questions = await _generate_json(deepseek_client, gemini_client, prompt)
         return questions if isinstance(questions, list) else None
     except Exception as e:
-        logger.error("Quiz generation error: %s", e)
+        logger.error("Quiz generation error (both providers failed): %s", e)
         return None
 
 
-def _grade_quiz_answer(gemini_client, native_language, question, user_answer):
+async def _grade_quiz_answer(deepseek_client, gemini_client, native_language, question, user_answer):
     correct_answer = question.get("correct_answer", "")
 
     if not question.get("expects_free_text"):
         is_correct = user_answer.strip().lower() == correct_answer.strip().lower()
         feedback = "Correct!" if is_correct else f"Not quite — the answer was {correct_answer}."
         return {"correct": is_correct, "checked": True, "feedback": feedback}
-
-    if gemini_client is None:
-        return {"correct": None, "checked": False, "feedback": "Grading is unavailable right now."}
 
     prompt = (f"A quiz question was: \"{question.get('prompt')}\". "
               f"Reference answer: \"{correct_answer}\". "
@@ -709,19 +715,14 @@ def _grade_quiz_answer(gemini_client, native_language, question, user_answer):
               f"Return ONLY JSON: {{\"correct\": boolean, \"feedback\": \"one short encouraging sentence "
               f"in plain {native_language}\"}}")
     try:
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        result = json.loads(resp.text)
+        result = await _generate_json(deepseek_client, gemini_client, prompt)
         result["checked"] = True
         return result
     except Exception as e:
         if _is_quota_error(e):
-            logger.error("Quiz grading QUOTA error: %s", e)
+            logger.error("Quiz grading QUOTA error (both providers): %s", e)
             feedback = "AIM has hit its request limit — try this question again shortly."
         else:
-            logger.error("Quiz grading error: %s", e)
+            logger.error("Quiz grading error (both providers failed): %s", e)
             feedback = "AIM couldn't check that just now — try again."
         return {"correct": None, "checked": False, "feedback": feedback}

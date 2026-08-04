@@ -72,6 +72,20 @@ MODES = {
         # lives in aim_deepsearch() below — it must be called by aimbot.py
         # BEFORE the AI call, with its output passed in as web_context.
     },
+    "search": {
+        "label": "Search",
+        "prompt": (
+            "\n\n--- SEARCH MODE ACTIVE ---\n"
+            "The user explicitly asked you to search rather than answer "
+            "from memory. Web search has already been run for this message "
+            "regardless of whether it looked search-worthy — see WEB SEARCH "
+            "RESULTS below and base your answer on it.\n"
+            "--- END SEARCH MODE ---\n"
+        ),
+        # Behavior: forces a normal (snippet-level) search every time,
+        # bypassing the usual is_search_query() judgment call — enforced
+        # in aimbot.py via forces_search() below.
+    },
     "sandbox": {
         "label": "Sandbox Mode",
         "prompt": (
@@ -123,3 +137,9 @@ def requires_deepsearch(mode: Optional[str]) -> bool:
     """DeepSearch mode needs the fuller fetch-and-visit search pipeline
     instead of the normal snippet-only search."""
     return mode == "deepsearch"
+
+
+def forces_search(mode: Optional[str]) -> bool:
+    """Search mode always searches, bypassing the normal is_search_query()
+    judgment call — the user explicitly asked for it."""
+    return mode == "search"
