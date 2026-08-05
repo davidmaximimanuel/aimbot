@@ -3210,7 +3210,7 @@ def privacy_policy():
 
 # Register chess API routes
 register_chess_routes(app, supabase)
-register_language_routes(app, supabase, gemini_client)
+register_language_routes(app, supabase, gemini_client, deepseek_client)
 register_last_activity_route(app, supabase)
 
 if __name__ == "__main__":
